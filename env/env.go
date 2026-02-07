@@ -10,7 +10,7 @@ var (
 	Env_TracingServiceName = os.Getenv("TRACING_SERVICE_NAME")
 	Env_OLTPEndpoint       = os.Getenv("OLTP_ENDPOINT")
 
-	HTTPAddress = GetEnvOrDefault("HTTP_ADDRESS", ":8080")
+	HTTPListenAddress = GetEnvOrDefault("HTTP_ADDRESS", ":8080")
 )
 
 func GetEnvOrDefault(key, defaultValue string) string {
