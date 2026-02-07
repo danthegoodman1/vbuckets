@@ -187,7 +187,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 
 	return &e2eEnv{
 		ProxyClient: s3.New(s3.Options{
-			Region: "us-east-1",
+			Region: "anystringyouwant",
 			Credentials: credentials.NewStaticCredentialsProvider(
 				e2eVirtualAccessKey, e2eVirtualSecretKey, "",
 			),
