@@ -1,12 +1,19 @@
 package http_server
 
+// IAMPolicy defines what actions a virtual access key is allowed to perform.
+// Evaluated after bucket resolution so the policy can reference bucket names
+// and key prefixes.
+//
+// TODO: Define the real policy structure (e.g. a list of statements with
+// effect/action/resource matching, similar to AWS IAM policies).
+type IAMPolicy struct{}
+
 // TODO: Implement real IAM permission checking.
-// This should verify that the virtual credentials have permissions for the
-// requested action (e.g. s3:GetObject, s3:PutObject, s3:ListBucket, etc.)
-// against the resolved bucket and object key.
+// This should evaluate the policy statements against the requested action,
+// bucket, and object key.
 //
 // For now this unconditionally allows all actions.
-func checkIAMPermissions(accessKeyID, bucket, objectKey, action string) error {
+func checkIAMPermissions(policy IAMPolicy, bucket, objectKey, action string) error {
 	return nil
 }
 

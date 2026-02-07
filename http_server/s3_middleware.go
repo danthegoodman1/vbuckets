@@ -98,7 +98,7 @@ func S3Auth(next http.Handler) http.Handler {
 		}
 
 		action := s3ActionFromRequest(r.Method)
-		if err := checkIAMPermissions(authInfo.AccessKeyID, bucket, objectKey, action); err != nil {
+		if err := checkIAMPermissions(virtualCreds.IAMPolicy, bucket, objectKey, action); err != nil {
 			logger.Warn().Err(err).Str("action", action).Msg("IAM permission check failed")
 			writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 			return

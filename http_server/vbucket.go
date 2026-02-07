@@ -8,10 +8,13 @@ import (
 	"github.com/danthegoodman1/vbuckets/env"
 )
 
-// VirtualCredentials holds the secret key for a virtual access key ID.
+// VirtualCredentials holds the secret key and IAM policy for a virtual access key ID.
 // Looked up before signature verification so auth is checked first.
+// The IAM policy travels with the identity -- the key defines what you can do,
+// the vbucket defines where things go.
 type VirtualCredentials struct {
 	SecretKey string
+	IAMPolicy IAMPolicy
 }
 
 // VBucketConfig holds the mapping from a virtual bucket to a real S3 backend.
