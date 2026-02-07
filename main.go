@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/danthegoodman1/vbuckets/gologger"
 	"github.com/danthegoodman1/vbuckets/http_server"
 )
@@ -18,7 +19,7 @@ var logger = gologger.NewLogger()
 func main() {
 	logger.Info().Msg("Starting vbuckets server")
 
-	server := http_server.NewServer(":8080", nil, nil)
+	server := http_server.NewServer(env.HTTPAddress, nil, nil)
 
 	go func() {
 		logger.Info().Str("addr", server.Addr()).Msg("starting HTTP server")
