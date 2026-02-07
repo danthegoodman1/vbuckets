@@ -1,6 +1,10 @@
 # vbuckets
 
-An S3-compatible reverse proxy that maps virtual buckets and credentials to real S3 backends. Designed for whitelabeling -- give tenants their own bucket names, access keys, and IAM policies without exposing your underlying storage.
+Infinite virtual S3 buckets - Serve unlimited S3 buckets and credentials on top of one or more physical S3 buckets.
+
+Implemented as an S3-compatible reverse proxy that maps virtual buckets and credentials to real S3 backends.
+
+Designed for whitelabeling -- give tenants their own bucket names, access keys, and IAM policies without exposing your underlying storage.
 
 ```
 +-----------+     +----------+     +-----------+
