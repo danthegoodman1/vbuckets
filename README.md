@@ -74,7 +74,7 @@ Each delta also carries a `ttl` so the control plane controls per-entry cache li
 
 ### Caching
 
-Lookup results and deltas are cached locally, going to the control plane as needed. Three independent caches (credentials, base hosts, vbuckets) each use per-entry TTLs from the control plane. Cache misses trigger the unary gRPC lookup; concurrent requests for the same key are deduplicated automatically.
+Lookup results and deltas are cached locally, going to the control plane as needed. Three independent caches (credentials, base hosts, vbuckets) each use per-entry TTLs from the control plane. Cache misses trigger the unary gRPC lookup; concurrent requests for the same key are deduplicated automatically to protect the control plane from thundering herds.
 
 ### Configuration
 
