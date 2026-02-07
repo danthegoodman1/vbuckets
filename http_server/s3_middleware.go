@@ -1,10 +1,8 @@
 package http_server
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
-	"io"
 	"net/http"
 
 	"github.com/danthegoodman1/vbuckets/env"
@@ -18,7 +16,6 @@ const (
 	ctxAuthInfo      contextKey = "authInfo"
 	ctxBucketName    contextKey = "bucketName"
 	ctxObjectKey     contextKey = "objectKey"
-	ctxBodyBytes     contextKey = "bodyBytes"
 	ctxIsVHost       contextKey = "isVHost"
 )
 
@@ -42,11 +39,6 @@ func getObjectKey(ctx context.Context) string {
 	return v
 }
 
-func getBodyBytes(ctx context.Context) []byte {
-	v, _ := ctx.Value(ctxBodyBytes).([]byte)
-	return v
-}
-
 func getIsVHost(ctx context.Context) bool {
 	v, _ := ctx.Value(ctxIsVHost).(bool)
 	return v
@@ -55,9 +47,15 @@ func getIsVHost(ctx context.Context) bool {
 // S3Auth is middleware that handles AWS SigV4 verification and virtual bucket
 // resolution. On success it stores the resolved VBucketConfig, AuthInfo,
 // bucket name, object key, and buffered body in the request context.
+//
+// The ordering is intentional: credentials are looked up and the signature is
+// verified before any bucket resolution or config lookup. This keeps the two
+// concerns independent so they can be cached with different strategies later.
 func S3Auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logger := zerolog.Ctx(r.Context())
+
+		// --- Phase 1: authenticate the request ---
 
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
@@ -72,6 +70,21 @@ func S3Auth(next http.Handler) http.Handler {
 			return
 		}
 
+		virtualCreds, err := lookupCredentials(authInfo.AccessKeyID)
+		if err != nil {
+			logger.Warn().Err(err).Str("accessKeyID", authInfo.AccessKeyID).Msg("credential lookup failed")
+			writeS3Error(w, http.StatusForbidden, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
+			return
+		}
+
+		if err := verifySignature(r, authInfo, virtualCreds.SecretKey); err != nil {
+			logger.Warn().Err(err).Msg("signature verification failed")
+			writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
+			return
+		}
+
+		// --- Phase 2: resolve bucket and authorize the action ---
+
 		bucket, objectKey, isVHost := resolveBucket(r, env.S3BaseHost)
 		if bucket == "" {
 			writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Could not determine bucket name")
@@ -81,22 +94,7 @@ func S3Auth(next http.Handler) http.Handler {
 		vbConfig, err := lookupVBucket(authInfo.AccessKeyID, bucket)
 		if err != nil {
 			logger.Warn().Err(err).Str("accessKeyID", authInfo.AccessKeyID).Str("bucket", bucket).Msg("vbucket lookup failed")
-			writeS3Error(w, http.StatusForbidden, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
-			return
-		}
-
-		// Buffer the body for signature verification (will be replayed by the proxy handler)
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to read request body")
-			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to read request body")
-			return
-		}
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-		if err := verifySignature(r, authInfo, vbConfig.VirtualSecretKey, bodyBytes); err != nil {
-			logger.Warn().Err(err).Msg("signature verification failed")
-			writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
+			writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 			return
 		}
 
@@ -112,7 +110,6 @@ func S3Auth(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, ctxAuthInfo, authInfo)
 		ctx = context.WithValue(ctx, ctxBucketName, bucket)
 		ctx = context.WithValue(ctx, ctxObjectKey, objectKey)
-		ctx = context.WithValue(ctx, ctxBodyBytes, bodyBytes)
 		ctx = context.WithValue(ctx, ctxIsVHost, isVHost)
 
 		next.ServeHTTP(w, r.WithContext(ctx))

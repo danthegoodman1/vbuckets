@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const unsignedPayload = "UNSIGNED-PAYLOAD"
+
 type AuthInfo struct {
 	AccessKeyID   string
 	Date          string // YYYYMMDD
@@ -72,7 +74,11 @@ func parseAuthorizationHeader(header string) (*AuthInfo, error) {
 
 // buildCanonicalRequest constructs the canonical request string per the AWS SigV4 spec.
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#create-canonical-request
-func buildCanonicalRequest(r *http.Request, signedHeaders []string, bodyBytes []byte) string {
+//
+// The payload hash is taken from the x-amz-content-sha256 header, which must
+// be present. The body is never read -- the header value (whether a real hash
+// or "UNSIGNED-PAYLOAD") is itself covered by the signature.
+func buildCanonicalRequest(r *http.Request, signedHeaders []string) string {
 	var b strings.Builder
 
 	b.WriteString(r.Method)
@@ -111,12 +117,7 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string, bodyBytes []
 	b.WriteString(strings.Join(sorted, ";"))
 	b.WriteByte('\n')
 
-	// Payload hash: use the x-amz-content-sha256 header if present, otherwise compute
-	payloadHash := r.Header.Get("x-amz-content-sha256")
-	if payloadHash == "" {
-		payloadHash = fmt.Sprintf("%x", sha256Sum(bodyBytes))
-	}
-	b.WriteString(payloadHash)
+	b.WriteString(r.Header.Get("x-amz-content-sha256"))
 
 	return b.String()
 }
@@ -157,10 +158,11 @@ func awsURIEncode(s string) string {
 }
 
 func buildStringToSign(datetime, scope, canonicalRequest string) string {
+	hash := sha256.Sum256([]byte(canonicalRequest))
 	return "AWS4-HMAC-SHA256\n" +
 		datetime + "\n" +
 		scope + "\n" +
-		fmt.Sprintf("%x", sha256Sum([]byte(canonicalRequest)))
+		fmt.Sprintf("%x", hash)
 }
 
 func computeSigningKey(secret, date, region, service string) []byte {
@@ -171,9 +173,14 @@ func computeSigningKey(secret, date, region, service string) []byte {
 }
 
 // verifySignature checks that the request's SigV4 signature matches the expected
-// signature derived from the provided secret key.
-func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string, bodyBytes []byte) error {
-	canonicalRequest := buildCanonicalRequest(r, authInfo.SignedHeaders, bodyBytes)
+// signature derived from the provided secret key. The request body is never
+// read -- the x-amz-content-sha256 header value is used as the payload hash.
+func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string) error {
+	if r.Header.Get("x-amz-content-sha256") == "" {
+		return fmt.Errorf("missing x-amz-content-sha256 header")
+	}
+
+	canonicalRequest := buildCanonicalRequest(r, authInfo.SignedHeaders)
 
 	datetime := r.Header.Get("X-Amz-Date")
 	if datetime == "" {
@@ -192,21 +199,18 @@ func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string, body
 }
 
 // signRequest signs an outbound HTTP request using AWS SigV4.
-// It sets the Authorization and X-Amz-Date headers on the request.
-func signRequest(r *http.Request, accessKey, secretKey, region string, bodyBytes []byte) {
+// It sets the Authorization, X-Amz-Date, and x-amz-content-sha256 headers.
+// The payload hash is always UNSIGNED-PAYLOAD since we're a trusted proxy
+// forwarding over HTTPS and never buffer the body.
+func signRequest(r *http.Request, accessKey, secretKey, region string) {
 	now := time.Now().UTC()
 	datetime := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
 
 	r.Header.Set("X-Amz-Date", datetime)
+	r.Header.Set("x-amz-content-sha256", unsignedPayload)
 
-	payloadHash := r.Header.Get("x-amz-content-sha256")
-	if payloadHash == "" {
-		payloadHash = fmt.Sprintf("%x", sha256Sum(bodyBytes))
-		r.Header.Set("x-amz-content-sha256", payloadHash)
-	}
-
-	// Sign all headers that are present on the request (standard set for S3)
+	// Sign all headers that are present on the request
 	signedHeaders := []string{"host"}
 	for h := range r.Header {
 		lower := strings.ToLower(h)
@@ -219,7 +223,7 @@ func signRequest(r *http.Request, accessKey, secretKey, region string, bodyBytes
 
 	scope := date + "/" + region + "/s3/aws4_request"
 
-	canonicalRequest := buildCanonicalRequest(r, signedHeaders, bodyBytes)
+	canonicalRequest := buildCanonicalRequest(r, signedHeaders)
 	stringToSign := buildStringToSign(datetime, scope, canonicalRequest)
 	signingKey := computeSigningKey(secretKey, date, region, "s3")
 	signature := fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
@@ -232,12 +236,6 @@ func signRequest(r *http.Request, accessKey, secretKey, region string, bodyBytes
 
 func hmacSHA256(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
-	h.Write(data)
-	return h.Sum(nil)
-}
-
-func sha256Sum(data []byte) []byte {
-	h := sha256.New()
 	h.Write(data)
 	return h.Sum(nil)
 }

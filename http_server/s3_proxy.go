@@ -1,7 +1,6 @@
 package http_server
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,7 +31,6 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	vbConfig := getVBucketConfig(r.Context())
 	objectKey := getObjectKey(r.Context())
-	bodyBytes := getBodyBytes(r.Context())
 	isVHost := getIsVHost(r.Context())
 
 	if vbConfig.PathPrefix != "" {
@@ -41,12 +39,13 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	outboundURL := buildOutboundURL(vbConfig, objectKey, isVHost, r)
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outboundURL, bytes.NewReader(bodyBytes))
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outboundURL, r.Body)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create outbound request")
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to construct upstream request")
 		return
 	}
+	outReq.ContentLength = r.ContentLength
 
 	copyHeaders(r.Header, outReq.Header)
 
@@ -56,8 +55,9 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	// Remove the original authorization -- we'll re-sign below
 	outReq.Header.Del("Authorization")
 	outReq.Header.Del("X-Amz-Date")
+	outReq.Header.Del("x-amz-content-sha256")
 
-	signRequest(outReq, vbConfig.RealAccessKey, vbConfig.RealSecretKey, vbConfig.RealRegion, bodyBytes)
+	signRequest(outReq, vbConfig.RealAccessKey, vbConfig.RealSecretKey, vbConfig.RealRegion)
 
 	logger.Debug().
 		Str("method", outReq.Method).
