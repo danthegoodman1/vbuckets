@@ -15,7 +15,6 @@ import (
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,35 +26,47 @@ const (
 	testRegion    = "us-east-1"
 )
 
-// setupTestEnv configures the env package vars for testing and returns a
-// cleanup function that restores originals.
-func setupTestEnv(t *testing.T) {
-	t.Helper()
+type testResolver struct {
+	credentials func(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
+	baseHost    func(ctx context.Context, hostname string) (string, bool, error)
+	vbucket     func(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
+}
 
-	origAccessKey := env.VirtualAccessKeyID
-	origSecretKey := env.VirtualSecretAccessKey
-	origBucket := env.VirtualBucketName
-	origBaseHost := env.S3BaseHost
+func (r *testResolver) LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error) {
+	return r.credentials(ctx, accessKeyID)
+}
 
-	env.VirtualAccessKeyID = testAccessKey
-	env.VirtualSecretAccessKey = testSecretKey
-	env.VirtualBucketName = testBucket
-	env.S3BaseHost = ""
+func (r *testResolver) LookupBaseHost(ctx context.Context, hostname string) (string, bool, error) {
+	return r.baseHost(ctx, hostname)
+}
 
-	t.Cleanup(func() {
-		env.VirtualAccessKeyID = origAccessKey
-		env.VirtualSecretAccessKey = origSecretKey
-		env.VirtualBucketName = origBucket
-		env.S3BaseHost = origBaseHost
-	})
+func (r *testResolver) LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
+	return r.vbucket(ctx, accessKeyID, bucketName)
+}
+
+func newTestResolver() *testResolver {
+	return &testResolver{
+		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+			if accessKeyID != testAccessKey {
+				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+			}
+			return &VirtualCredentials{SecretKey: testSecretKey}, nil
+		},
+		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
+			return "", false, nil
+		},
+		vbucket: func(_ context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
+			return &VBucketConfig{}, nil
+		},
+	}
 }
 
 // newTestServer returns an httptest.Server with S3Auth middleware wrapping
 // a handler that returns minimal valid responses based on the HTTP method.
-func newTestServer(t *testing.T) *httptest.Server {
+func newTestServer(t *testing.T, resolver Resolver) *httptest.Server {
 	t.Helper()
 
-	handler := S3Auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			w.Header().Set("ETag", `"d41d8cd98f00b204e9800998ecf8427e"`)
@@ -114,8 +125,8 @@ var validCreds = aws.Credentials{
 }
 
 func TestSigV4_RawSigner_GET(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/my-key.txt", nil, emptyPayloadHash(), validCreds)
 
@@ -127,8 +138,8 @@ func TestSigV4_RawSigner_GET(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_PUT_WithBody(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	body := []byte("hello world, this is a test upload")
 	payloadHash := fmt.Sprintf("%x", sha256.Sum256(body))
@@ -144,8 +155,8 @@ func TestSigV4_RawSigner_PUT_WithBody(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_UnsignedPayload(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	body := []byte("unsigned payload body")
 	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/unsigned.bin", body, "UNSIGNED-PAYLOAD", validCreds)
@@ -158,8 +169,8 @@ func TestSigV4_RawSigner_UnsignedPayload(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_WithQueryParams(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"?list-type=2&prefix=photos/&max-keys=100", nil, emptyPayloadHash(), validCreds)
 
@@ -171,8 +182,8 @@ func TestSigV4_RawSigner_WithQueryParams(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_InvalidCredentials(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	badCreds := aws.Credentials{
 		AccessKeyID:     testAccessKey,
@@ -188,8 +199,8 @@ func TestSigV4_RawSigner_InvalidCredentials(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_UnknownAccessKey(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	unknownCreds := aws.Credentials{
 		AccessKeyID:     "AKIAI_UNKNOWN_KEY",
@@ -205,8 +216,8 @@ func TestSigV4_RawSigner_UnknownAccessKey(t *testing.T) {
 }
 
 func TestSigV4_S3Client_PutObject(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	client := s3.New(s3.Options{
 		Region: testRegion,
@@ -235,8 +246,8 @@ func TestSigV4_S3Client_PutObject(t *testing.T) {
 }
 
 func TestSigV4_S3Client_HeadObject(t *testing.T) {
-	setupTestEnv(t)
-	ts := newTestServer(t)
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
 
 	client := s3.New(s3.Options{
 		Region: testRegion,
@@ -262,10 +273,15 @@ func TestSigV4_S3Client_HeadObject(t *testing.T) {
 }
 
 func TestSigV4_VHostStyle(t *testing.T) {
-	setupTestEnv(t)
-	env.S3BaseHost = "s3.test.local"
+	resolver := newTestResolver()
+	resolver.baseHost = func(_ context.Context, hostname string) (string, bool, error) {
+		if hostname == "s3.test.local" || strings.HasSuffix(hostname, ".s3.test.local") {
+			return "s3.test.local", true, nil
+		}
+		return "", false, nil
+	}
 
-	handler := S3Auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.True(t, getIsVHost(r.Context()), "expected vhost-style request")
 		assert.Equal(t, testBucket, getBucketName(r.Context()))
 		assert.Equal(t, "my-key.txt", getObjectKey(r.Context()))

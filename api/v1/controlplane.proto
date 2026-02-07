@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package vbuckets.v1;
+
+option go_package = "github.com/danthegoodman1/vbuckets/api/v1;apiv1";
+
+import "google/protobuf/duration.proto";
+
+// ControlPlane is the service that users implement on their control plane
+// server. The vbuckets proxy connects to this service to resolve virtual
+// credentials and bucket mappings.
+service ControlPlane {
+  rpc LookupCredentials(LookupCredentialsRequest) returns (LookupCredentialsResponse);
+  rpc LookupBaseHost(LookupBaseHostRequest) returns (LookupBaseHostResponse);
+  rpc LookupVBucket(LookupVBucketRequest) returns (LookupVBucketResponse);
+
+  // ListenForDeltas opens a server-streaming RPC that pushes cache updates
+  // to the proxy. The control plane sends deltas whenever credentials, base
+  // hosts, or vbucket mappings change, allowing the proxy to maintain
+  // long-lived caches with fast invalidation.
+  rpc ListenForDeltas(ListenForDeltasRequest) returns (stream Delta);
+}
+
+message LookupCredentialsRequest {
+  string access_key_id = 1;
+}
+
+message LookupCredentialsResponse {
+  string secret_key = 1;
+  // Opaque IAM policy blob. Interpretation is up to the proxy.
+  bytes iam_policy = 2;
+  google.protobuf.Duration ttl = 3;
+}
+
+message LookupBaseHostRequest {
+  string hostname = 1;
+}
+
+message LookupBaseHostResponse {
+  string base_host = 1;
+  bool found = 2;
+  google.protobuf.Duration ttl = 3;
+}
+
+message LookupVBucketRequest {
+  string access_key_id = 1;
+  string bucket_name = 2;
+}
+
+message LookupVBucketResponse {
+  string real_endpoint = 1;
+  string real_bucket = 2;
+  string real_access_key = 3;
+  string real_secret_key = 4;
+  string real_region = 5;
+  string path_prefix = 6;
+  bool real_use_path_style = 7;
+  google.protobuf.Duration ttl = 8;
+}
+
+message ListenForDeltasRequest {}
+
+message Delta {
+  oneof delta {
+    CredentialsDelta credentials = 1;
+    BaseHostDelta base_host = 2;
+    VBucketDelta vbucket = 3;
+  }
+}
+
+// CredentialsDelta pushes a credential cache update.
+// If remove is true, the entry should be evicted. Otherwise it is an upsert.
+message CredentialsDelta {
+  string access_key_id = 1;
+  bool remove = 2;
+
+  // Fields below are only set on upsert (remove == false).
+  string secret_key = 3;
+  bytes iam_policy = 4;
+  google.protobuf.Duration ttl = 5;
+}
+
+// BaseHostDelta pushes a base host cache update.
+// If remove is true, the entry should be evicted. Otherwise it is an upsert.
+message BaseHostDelta {
+  string hostname = 1;
+  bool remove = 2;
+
+  // Fields below are only set on upsert (remove == false).
+  string base_host = 3;
+  bool found = 4;
+  google.protobuf.Duration ttl = 5;
+}
+
+// VBucketDelta pushes a vbucket mapping cache update.
+// If remove is true, the entry should be evicted. Otherwise it is an upsert.
+message VBucketDelta {
+  string access_key_id = 1;
+  string bucket_name = 2;
+  bool remove = 3;
+
+  // Fields below are only set on upsert (remove == false).
+  string real_endpoint = 4;
+  string real_bucket = 5;
+  string real_access_key = 6;
+  string real_secret_key = 7;
+  string real_region = 8;
+  string path_prefix = 9;
+  bool real_use_path_style = 10;
+  google.protobuf.Duration ttl = 11;
+}

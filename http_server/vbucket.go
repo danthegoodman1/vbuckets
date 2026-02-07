@@ -1,12 +1,19 @@
 package http_server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
-
-	"github.com/danthegoodman1/vbuckets/env"
 )
+
+// Resolver provides the three lookups the proxy needs. Implemented by
+// controlplane.Client; tests can supply a lightweight stub.
+type Resolver interface {
+	LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
+	LookupBaseHost(ctx context.Context, hostname string) (string, bool, error)
+	LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
+}
 
 // VirtualCredentials holds the secret key and IAM policy for a virtual access key ID.
 // Looked up before signature verification so auth is checked first.
@@ -29,82 +36,26 @@ type VBucketConfig struct {
 	RealUsePathStyle bool   // when true, use path-style addressing to the real backend
 }
 
-// TODO: replace with control plane lookup (database, API call, etc.)
-// Currently returns static credentials from environment variables.
-func lookupCredentials(accessKeyID string) (*VirtualCredentials, error) {
-	if env.VirtualAccessKeyID == "" {
-		return nil, fmt.Errorf("VIRTUAL_ACCESS_KEY_ID not configured")
-	}
-
-	if accessKeyID != env.VirtualAccessKeyID {
-		return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
-	}
-
-	return &VirtualCredentials{
-		SecretKey: env.VirtualSecretAccessKey,
-	}, nil
-}
-
-// TODO: replace with control plane lookup (database, API call, etc.)
-// Currently returns static config from environment variables.
-func lookupVBucket(accessKeyID, bucketName string) (*VBucketConfig, error) {
-	if env.VirtualBucketName != "" && bucketName != env.VirtualBucketName {
-		return nil, fmt.Errorf("unknown bucket: %s", bucketName)
-	}
-
-	return &VBucketConfig{
-		RealEndpoint:     env.RealS3Endpoint,
-		RealBucket:       env.RealBucket,
-		RealAccessKey:    env.RealAccessKeyID,
-		RealSecretKey:    env.RealSecretAccessKey,
-		RealRegion:       env.RealRegion,
-		PathPrefix:       env.RealPathPrefix,
-		RealUsePathStyle: env.RealUsePathStyle,
-	}, nil
-}
-
-// lookupBaseHost takes the full hostname from the request and returns the
-// matching base domain, if any. This determines whether the request is
-// using vhost-style addressing (hostname has a subdomain prefix before the
-// base domain) or path-style (hostname IS the base domain).
-//
-// TODO: replace with control plane lookup that walks the domain parts
-// right-to-left until it finds a registered base domain in its DB.
-// Currently returns the static S3_BASE_HOST env var if it matches.
-func lookupBaseHost(hostname string) (baseHost string, found bool) {
-	if env.S3BaseHost == "" {
-		return "", false
-	}
-
-	// Exact match means path-style (host is the base domain itself)
-	if hostname == env.S3BaseHost {
-		return env.S3BaseHost, true
-	}
-
-	// Subdomain match means vhost-style
-	if strings.HasSuffix(hostname, "."+env.S3BaseHost) {
-		return env.S3BaseHost, true
-	}
-
-	return "", false
-}
-
 // resolveBucket determines the bucket name and object key from the request,
 // detecting whether the client is using virtual-hosted style or path style.
 //
 // Virtual-hosted style: bucket.BASE_HOST/key
 // Path style:           BASE_HOST/bucket/key (or unknown host)
-func resolveBucket(r *http.Request) (bucket, objectKey string, isVHost bool) {
+func resolveBucket(resolver Resolver, r *http.Request) (bucket, objectKey string, isVHost bool, err error) {
 	host := r.Host
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
 		host = host[:idx]
 	}
 
-	if baseHost, found := lookupBaseHost(host); found && host != baseHost {
-		// vhost-style: host is a subdomain of the base domain
+	baseHost, found, err := resolver.LookupBaseHost(r.Context(), host)
+	if err != nil {
+		return "", "", false, fmt.Errorf("base host lookup: %w", err)
+	}
+
+	if found && host != baseHost {
 		bucket = strings.TrimSuffix(host, "."+baseHost)
 		objectKey = strings.TrimPrefix(r.URL.Path, "/")
-		return bucket, objectKey, true
+		return bucket, objectKey, true, nil
 	}
 
 	// Path style: first path segment is the bucket
@@ -114,5 +65,5 @@ func resolveBucket(r *http.Request) (bucket, objectKey string, isVHost bool) {
 	if len(parts) > 1 {
 		objectKey = parts[1]
 	}
-	return bucket, objectKey, false
+	return bucket, objectKey, false, nil
 }

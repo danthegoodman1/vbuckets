@@ -2,6 +2,7 @@ package http_server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"regexp"
@@ -13,7 +14,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,50 +74,6 @@ func nodeIDFromStatus(status string) string {
 	return hexIDPattern.FindString(status)
 }
 
-type envSnapshot struct {
-	VirtualAccessKeyID     string
-	VirtualSecretAccessKey string
-	VirtualBucketName      string
-	RealS3Endpoint         string
-	RealBucket             string
-	RealAccessKeyID        string
-	RealSecretAccessKey    string
-	RealRegion             string
-	RealUsePathStyle       bool
-	RealPathPrefix         string
-	S3BaseHost             string
-}
-
-func snapshotEnv() envSnapshot {
-	return envSnapshot{
-		VirtualAccessKeyID:     env.VirtualAccessKeyID,
-		VirtualSecretAccessKey: env.VirtualSecretAccessKey,
-		VirtualBucketName:      env.VirtualBucketName,
-		RealS3Endpoint:         env.RealS3Endpoint,
-		RealBucket:             env.RealBucket,
-		RealAccessKeyID:        env.RealAccessKeyID,
-		RealSecretAccessKey:    env.RealSecretAccessKey,
-		RealRegion:             env.RealRegion,
-		RealUsePathStyle:       env.RealUsePathStyle,
-		RealPathPrefix:         env.RealPathPrefix,
-		S3BaseHost:             env.S3BaseHost,
-	}
-}
-
-func restoreEnv(s envSnapshot) {
-	env.VirtualAccessKeyID = s.VirtualAccessKeyID
-	env.VirtualSecretAccessKey = s.VirtualSecretAccessKey
-	env.VirtualBucketName = s.VirtualBucketName
-	env.RealS3Endpoint = s.RealS3Endpoint
-	env.RealBucket = s.RealBucket
-	env.RealAccessKeyID = s.RealAccessKeyID
-	env.RealSecretAccessKey = s.RealSecretAccessKey
-	env.RealRegion = s.RealRegion
-	env.RealUsePathStyle = s.RealUsePathStyle
-	env.RealPathPrefix = s.RealPathPrefix
-	env.S3BaseHost = s.S3BaseHost
-}
-
 type e2eEnv struct {
 	ProxyClient  *s3.Client
 	DirectClient *s3.Client
@@ -163,25 +119,36 @@ func setupE2E(t *testing.T) *e2eEnv {
 	mappedPort, err := ctr.MappedPort(ctx, "3900")
 	require.NoError(t, err)
 
-	saved := snapshotEnv()
-	t.Cleanup(func() { restoreEnv(saved) })
-
 	garageEndpoint := "http://" + host + ":" + mappedPort.Port()
 
-	env.VirtualAccessKeyID = e2eVirtualAccessKey
-	env.VirtualSecretAccessKey = e2eVirtualSecretKey
-	env.VirtualBucketName = e2eVirtualBucket
-	env.RealS3Endpoint = garageEndpoint
-	env.RealBucket = garageBucket
-	env.RealAccessKeyID = garageAccessKey
-	env.RealSecretAccessKey = garageSecretKey
-	env.RealRegion = "us-east-1"
-	env.RealUsePathStyle = true
-	env.RealPathPrefix = "tenant-abc"
-	env.S3BaseHost = ""
+	resolver := &testResolver{
+		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+			if accessKeyID != e2eVirtualAccessKey {
+				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+			}
+			return &VirtualCredentials{SecretKey: e2eVirtualSecretKey}, nil
+		},
+		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
+			return "", false, nil
+		},
+		vbucket: func(_ context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
+			if bucketName != e2eVirtualBucket {
+				return nil, fmt.Errorf("unknown bucket: %s", bucketName)
+			}
+			return &VBucketConfig{
+				RealEndpoint:     garageEndpoint,
+				RealBucket:       garageBucket,
+				RealAccessKey:    garageAccessKey,
+				RealSecretKey:    garageSecretKey,
+				RealRegion:       "us-east-1",
+				PathPrefix:       "tenant-abc",
+				RealUsePathStyle: true,
+			}, nil
+		},
+	}
 
 	r := chi.NewRouter()
-	RegisterS3Routes(r)
+	RegisterS3Routes(resolver)(r)
 	ts := httptest.NewServer(r)
 	t.Cleanup(ts.Close)
 

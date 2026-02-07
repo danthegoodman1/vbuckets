@@ -20,11 +20,13 @@ var proxyClient = &http.Client{
 	Timeout: 5 * time.Minute,
 }
 
-func RegisterS3Routes(r chi.Router) {
-	r.Group(func(r chi.Router) {
-		r.Use(S3Auth)
-		r.HandleFunc("/*", handleS3Request)
-	})
+func RegisterS3Routes(resolver Resolver) RegisterRoutes {
+	return func(r chi.Router) {
+		r.Group(func(r chi.Router) {
+			r.Use(S3Auth(resolver))
+			r.HandleFunc("/*", handleS3Request)
+		})
+	}
 }
 
 func handleS3Request(w http.ResponseWriter, r *http.Request) {
