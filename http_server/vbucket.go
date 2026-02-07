@@ -17,12 +17,13 @@ type VirtualCredentials struct {
 // VBucketConfig holds the mapping from a virtual bucket to a real S3 backend.
 // Looked up after signature verification.
 type VBucketConfig struct {
-	RealEndpoint  string // e.g. "s3.us-east-1.amazonaws.com"
-	RealBucket    string
-	RealAccessKey string
-	RealSecretKey string
-	RealRegion    string
-	PathPrefix    string // optional prefix prepended to object keys
+	RealEndpoint     string // e.g. "s3.us-east-1.amazonaws.com"
+	RealBucket       string
+	RealAccessKey    string
+	RealSecretKey    string
+	RealRegion       string
+	PathPrefix       string // optional prefix prepended to object keys
+	RealUsePathStyle bool   // when true, use path-style addressing to the real backend
 }
 
 // TODO: replace with control plane lookup (database, API call, etc.)
@@ -49,12 +50,13 @@ func lookupVBucket(accessKeyID, bucketName string) (*VBucketConfig, error) {
 	}
 
 	return &VBucketConfig{
-		RealEndpoint:  env.RealS3Endpoint,
-		RealBucket:    env.RealBucket,
-		RealAccessKey: env.RealAccessKeyID,
-		RealSecretKey: env.RealSecretAccessKey,
-		RealRegion:    env.RealRegion,
-		PathPrefix:    env.RealPathPrefix,
+		RealEndpoint:     env.RealS3Endpoint,
+		RealBucket:       env.RealBucket,
+		RealAccessKey:    env.RealAccessKeyID,
+		RealSecretKey:    env.RealSecretAccessKey,
+		RealRegion:       env.RealRegion,
+		PathPrefix:       env.RealPathPrefix,
+		RealUsePathStyle: env.RealUsePathStyle,
 	}, nil
 }
 

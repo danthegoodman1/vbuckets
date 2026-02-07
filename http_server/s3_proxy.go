@@ -1,7 +1,6 @@
 package http_server
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -31,13 +30,12 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	vbConfig := getVBucketConfig(r.Context())
 	objectKey := getObjectKey(r.Context())
-	isVHost := getIsVHost(r.Context())
 
 	if vbConfig.PathPrefix != "" {
 		objectKey = strings.TrimSuffix(vbConfig.PathPrefix, "/") + "/" + objectKey
 	}
 
-	outboundURL := buildOutboundURL(vbConfig, objectKey, isVHost, r)
+	outboundURL := buildOutboundURL(vbConfig, objectKey, r)
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outboundURL, r.Body)
 	if err != nil {
@@ -49,8 +47,12 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	copyHeaders(r.Header, outReq.Header)
 
-	// Overwrite the host header to match the real endpoint
-	outReq.Host = vbConfig.RealEndpoint
+	// Set the host to match how we're addressing the real backend
+	if vbConfig.RealUsePathStyle {
+		outReq.Host = vbConfig.RealEndpoint
+	} else {
+		outReq.Host = vbConfig.RealBucket + "." + vbConfig.RealEndpoint
+	}
 
 	// Remove the original authorization -- we'll re-sign below
 	outReq.Header.Del("Authorization")
@@ -81,25 +83,29 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildOutboundURL constructs the full URL for the real S3 request.
-// Always uses path-style addressing to the real backend for simplicity.
-func buildOutboundURL(cfg *VBucketConfig, objectKey string, isVHost bool, r *http.Request) string {
-	scheme := "https"
+// Uses vhost-style by default (bucket in host), or path-style if configured.
+func buildOutboundURL(cfg *VBucketConfig, objectKey string, r *http.Request) string {
+	var host, path string
 
-	path := "/" + cfg.RealBucket
-	if objectKey != "" {
-		path += "/" + objectKey
+	if cfg.RealUsePathStyle {
+		host = cfg.RealEndpoint
+		path = "/" + cfg.RealBucket
+		if objectKey != "" {
+			path += "/" + objectKey
+		}
+	} else {
+		host = cfg.RealBucket + "." + cfg.RealEndpoint
+		path = "/"
+		if objectKey != "" {
+			path += objectKey
+		}
 	}
-
-	// If the original request was path-style, the URL path included the virtual
-	// bucket as the first segment. We've already extracted the objectKey, so we
-	// reconstruct the path with the real bucket. If it was vhost-style, the path
-	// is just the key -- we still need to prepend the real bucket.
 
 	query := r.URL.RawQuery
 	if query != "" {
-		return fmt.Sprintf("%s://%s%s?%s", scheme, cfg.RealEndpoint, path, query)
+		return "https://" + host + path + "?" + query
 	}
-	return fmt.Sprintf("%s://%s%s", scheme, cfg.RealEndpoint, path)
+	return "https://" + host + path
 }
 
 // copyHeaders copies all headers from src to dst, excluding hop-by-hop headers.

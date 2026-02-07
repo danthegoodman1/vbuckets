@@ -23,7 +23,8 @@ var (
 	RealAccessKeyID      = os.Getenv("REAL_ACCESS_KEY_ID")
 	RealSecretAccessKey  = os.Getenv("REAL_SECRET_ACCESS_KEY")
 	RealRegion           = GetEnvOrDefault("REAL_REGION", "us-east-1")
-	RealPathPrefix       = os.Getenv("REAL_PATH_PREFIX") // optional prefix to prepend to object keys
+	RealPathPrefix       = os.Getenv("REAL_PATH_PREFIX")                  // optional prefix to prepend to object keys
+	RealUsePathStyle     = os.Getenv("REAL_USE_PATH_STYLE") == "true" // default false (vhost-style)
 )
 
 func GetEnvOrDefault(key, defaultValue string) string {
