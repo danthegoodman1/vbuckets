@@ -60,19 +60,45 @@ func lookupVBucket(accessKeyID, bucketName string) (*VBucketConfig, error) {
 	}, nil
 }
 
+// lookupBaseHost takes the full hostname from the request and returns the
+// matching base domain, if any. This determines whether the request is
+// using vhost-style addressing (hostname has a subdomain prefix before the
+// base domain) or path-style (hostname IS the base domain).
+//
+// TODO: replace with control plane lookup that walks the domain parts
+// right-to-left until it finds a registered base domain in its DB.
+// Currently returns the static S3_BASE_HOST env var if it matches.
+func lookupBaseHost(hostname string) (baseHost string, found bool) {
+	if env.S3BaseHost == "" {
+		return "", false
+	}
+
+	// Exact match means path-style (host is the base domain itself)
+	if hostname == env.S3BaseHost {
+		return env.S3BaseHost, true
+	}
+
+	// Subdomain match means vhost-style
+	if strings.HasSuffix(hostname, "."+env.S3BaseHost) {
+		return env.S3BaseHost, true
+	}
+
+	return "", false
+}
+
 // resolveBucket determines the bucket name and object key from the request,
 // detecting whether the client is using virtual-hosted style or path style.
 //
 // Virtual-hosted style: bucket.BASE_HOST/key
-// Path style:           BASE_HOST/bucket/key
-func resolveBucket(r *http.Request, baseHost string) (bucket, objectKey string, isVHost bool) {
+// Path style:           BASE_HOST/bucket/key (or unknown host)
+func resolveBucket(r *http.Request) (bucket, objectKey string, isVHost bool) {
 	host := r.Host
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
 		host = host[:idx]
 	}
 
-	// Check for virtual-hosted style: host is a subdomain of baseHost
-	if baseHost != "" && strings.HasSuffix(host, "."+baseHost) {
+	if baseHost, found := lookupBaseHost(host); found && host != baseHost {
+		// vhost-style: host is a subdomain of the base domain
 		bucket = strings.TrimSuffix(host, "."+baseHost)
 		objectKey = strings.TrimPrefix(r.URL.Path, "/")
 		return bucket, objectKey, true

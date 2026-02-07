@@ -5,7 +5,6 @@ import (
 	"encoding/xml"
 	"net/http"
 
-	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/rs/zerolog"
 )
 
@@ -85,7 +84,7 @@ func S3Auth(next http.Handler) http.Handler {
 
 		// --- Phase 2: resolve bucket and authorize the action ---
 
-		bucket, objectKey, isVHost := resolveBucket(r, env.S3BaseHost)
+		bucket, objectKey, isVHost := resolveBucket(r)
 		if bucket == "" {
 			writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Could not determine bucket name")
 			return
