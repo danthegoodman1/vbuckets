@@ -37,6 +37,10 @@ When a vbucket mapping includes a path prefix, all object keys are transparently
 
 ## IAM
 
+> [!IMPORTANT]
+> This is not yet implemented.
+> Currently, all vcredentials keys have full access to their vbuckets
+
 Credentials use the same IAM as AWS.
 
 Each proxied request is checked against the virtual IAM credentials before forwarding to the real bucket.
