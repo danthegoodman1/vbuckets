@@ -18,13 +18,13 @@ var (
 	VirtualSecretAccessKey = os.Getenv("VIRTUAL_SECRET_ACCESS_KEY")
 	VirtualBucketName      = os.Getenv("VIRTUAL_BUCKET_NAME")
 
-	RealS3Endpoint      = os.Getenv("REAL_S3_ENDPOINT") // e.g. "s3.us-east-1.amazonaws.com"
-	RealBucket           = os.Getenv("REAL_BUCKET")
-	RealAccessKeyID      = os.Getenv("REAL_ACCESS_KEY_ID")
-	RealSecretAccessKey  = os.Getenv("REAL_SECRET_ACCESS_KEY")
-	RealRegion           = GetEnvOrDefault("REAL_REGION", "us-east-1")
-	RealPathPrefix       = os.Getenv("REAL_PATH_PREFIX")                  // optional prefix to prepend to object keys
-	RealUsePathStyle     = os.Getenv("REAL_USE_PATH_STYLE") == "true" // default false (vhost-style)
+	RealS3Endpoint     = os.Getenv("REAL_S3_ENDPOINT") // e.g. "https://s3.us-east-1.amazonaws.com" or "http://localhost:3900"
+	RealBucket         = os.Getenv("REAL_BUCKET")
+	RealAccessKeyID    = os.Getenv("REAL_ACCESS_KEY_ID")
+	RealSecretAccessKey = os.Getenv("REAL_SECRET_ACCESS_KEY")
+	RealRegion         = GetEnvOrDefault("REAL_REGION", "us-east-1")
+	RealPathPrefix     = os.Getenv("REAL_PATH_PREFIX")                // optional prefix to prepend to object keys
+	RealUsePathStyle   = os.Getenv("REAL_USE_PATH_STYLE") == "true"   // default false (vhost-style)
 )
 
 func GetEnvOrDefault(key, defaultValue string) string {

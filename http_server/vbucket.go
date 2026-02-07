@@ -20,7 +20,7 @@ type VirtualCredentials struct {
 // VBucketConfig holds the mapping from a virtual bucket to a real S3 backend.
 // Looked up after signature verification.
 type VBucketConfig struct {
-	RealEndpoint     string // e.g. "s3.us-east-1.amazonaws.com"
+	RealEndpoint     string // full URL, e.g. "https://s3.us-east-1.amazonaws.com" or "http://localhost:3900"
 	RealBucket       string
 	RealAccessKey    string
 	RealSecretKey    string

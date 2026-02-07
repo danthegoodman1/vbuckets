@@ -3,6 +3,7 @@ package http_server
 import (
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -48,10 +49,11 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	copyHeaders(r.Header, outReq.Header)
 
 	// Set the host to match how we're addressing the real backend
+	endpointHost := parseEndpoint(vbConfig.RealEndpoint).Host
 	if vbConfig.RealUsePathStyle {
-		outReq.Host = vbConfig.RealEndpoint
+		outReq.Host = endpointHost
 	} else {
-		outReq.Host = vbConfig.RealBucket + "." + vbConfig.RealEndpoint
+		outReq.Host = vbConfig.RealBucket + "." + endpointHost
 	}
 
 	// Remove the original authorization -- we'll re-sign below
@@ -82,30 +84,35 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// parseEndpoint parses a RealEndpoint URL. Defaults to https if no scheme is present.
+func parseEndpoint(endpoint string) *url.URL {
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	u, _ := url.Parse(endpoint)
+	return u
+}
+
 // buildOutboundURL constructs the full URL for the real S3 request.
 // Uses vhost-style by default (bucket in host), or path-style if configured.
 func buildOutboundURL(cfg *VBucketConfig, objectKey string, r *http.Request) string {
-	var host, path string
+	u := parseEndpoint(cfg.RealEndpoint)
 
 	if cfg.RealUsePathStyle {
-		host = cfg.RealEndpoint
-		path = "/" + cfg.RealBucket
+		u.Path = "/" + cfg.RealBucket
 		if objectKey != "" {
-			path += "/" + objectKey
+			u.Path += "/" + objectKey
 		}
 	} else {
-		host = cfg.RealBucket + "." + cfg.RealEndpoint
-		path = "/"
+		u.Host = cfg.RealBucket + "." + u.Host
+		u.Path = "/"
 		if objectKey != "" {
-			path += objectKey
+			u.Path += objectKey
 		}
 	}
 
-	query := r.URL.RawQuery
-	if query != "" {
-		return "https://" + host + path + "?" + query
-	}
-	return "https://" + host + path
+	u.RawQuery = r.URL.RawQuery
+	return u.String()
 }
 
 // copyHeaders copies all headers from src to dst, excluding hop-by-hop headers.
