@@ -31,6 +31,10 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 **Phase 1 (authentication)** runs `lookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the bucket via `lookupBaseHost` + `lookupVBucket`, then checks IAM permissions. This separation means credential caches don't need to be invalidated when bucket mappings change and vice versa.
 
+## Path prefix rewriting
+
+When a vbucket mapping includes a path prefix, all object keys are transparently scoped under that prefix in the real bucket. For single-object operations (GET, PUT, DELETE, etc.) the prefix is prepended to the key in the URL path. For ListObjects V1/V2 the proxy rewrites the `prefix`, `start-after`, and `marker` query parameters on the way out, and strips the prefix from keys, common prefixes, and other echoed fields in the XML response on the way back. This ensures tenants only see their own objects and never encounter the internal prefix in returned keys.
+
 ## IAM
 
 Credentials use the same IAM as AWS.

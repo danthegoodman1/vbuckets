@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -67,7 +68,6 @@ func garageCmd(t *testing.T, ctx context.Context, ctr testcontainers.Container, 
 	return string(out)
 }
 
-// nodeIDFromStatus extracts the first hex node ID from `garage status` output.
 var hexIDPattern = regexp.MustCompile(`[0-9a-f]{16,}`)
 
 func nodeIDFromStatus(status string) string {
@@ -118,10 +118,16 @@ func restoreEnv(s envSnapshot) {
 	env.S3BaseHost = s.S3BaseHost
 }
 
-func TestE2E_PutAndGetObject(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping e2e test in short mode")
-	}
+type e2eEnv struct {
+	ProxyClient  *s3.Client
+	DirectClient *s3.Client
+}
+
+// setupE2E starts a Garage container, configures the vbuckets env vars, starts
+// the proxy httptest server, and returns S3 clients for both the proxy and
+// the real backend. Registers all cleanup on t.
+func setupE2E(t *testing.T) *e2eEnv {
+	t.Helper()
 
 	ctx := context.Background()
 
@@ -140,11 +146,8 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 		Started: true,
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, ctr.Terminate(ctx))
-	})
+	t.Cleanup(func() { require.NoError(t, ctr.Terminate(ctx)) })
 
-	// Configure Garage: layout, key, bucket
 	status := garageCmd(t, ctx, ctr, "status")
 	nodeID := nodeIDFromStatus(status)
 	require.NotEmpty(t, nodeID, "could not find node ID in garage status output:\n%s", status)
@@ -160,14 +163,15 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	mappedPort, err := ctr.MappedPort(ctx, "3900")
 	require.NoError(t, err)
 
-	// Point vbuckets at the Garage backend
 	saved := snapshotEnv()
 	t.Cleanup(func() { restoreEnv(saved) })
+
+	garageEndpoint := "http://" + host + ":" + mappedPort.Port()
 
 	env.VirtualAccessKeyID = e2eVirtualAccessKey
 	env.VirtualSecretAccessKey = e2eVirtualSecretKey
 	env.VirtualBucketName = e2eVirtualBucket
-	env.RealS3Endpoint = "http://" + host + ":" + mappedPort.Port()
+	env.RealS3Endpoint = garageEndpoint
 	env.RealBucket = garageBucket
 	env.RealAccessKeyID = garageAccessKey
 	env.RealSecretAccessKey = garageSecretKey
@@ -176,47 +180,50 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	env.RealPathPrefix = "tenant-abc"
 	env.S3BaseHost = ""
 
-	garageEndpoint := "http://" + host + ":" + mappedPort.Port()
-
-	// Start vbuckets proxy
 	r := chi.NewRouter()
 	RegisterS3Routes(r)
 	ts := httptest.NewServer(r)
 	t.Cleanup(ts.Close)
 
-	// S3 client with virtual credentials pointed at the proxy
-	proxyClient := s3.New(s3.Options{
-		Region: "us-east-1",
-		Credentials: credentials.NewStaticCredentialsProvider(
-			e2eVirtualAccessKey, e2eVirtualSecretKey, "",
-		),
-		BaseEndpoint: aws.String(ts.URL),
-		UsePathStyle: true,
-	})
+	return &e2eEnv{
+		ProxyClient: s3.New(s3.Options{
+			Region: "us-east-1",
+			Credentials: credentials.NewStaticCredentialsProvider(
+				e2eVirtualAccessKey, e2eVirtualSecretKey, "",
+			),
+			BaseEndpoint: aws.String(ts.URL),
+			UsePathStyle: true,
+		}),
+		DirectClient: s3.New(s3.Options{
+			Region: "us-east-1",
+			Credentials: credentials.NewStaticCredentialsProvider(
+				garageAccessKey, garageSecretKey, "",
+			),
+			BaseEndpoint: aws.String(garageEndpoint),
+			UsePathStyle: true,
+		}),
+	}
+}
 
-	// Direct client with real credentials pointed at Garage
-	directClient := s3.New(s3.Options{
-		Region: "us-east-1",
-		Credentials: credentials.NewStaticCredentialsProvider(
-			garageAccessKey, garageSecretKey, "",
-		),
-		BaseEndpoint: aws.String(garageEndpoint),
-		UsePathStyle: true,
-	})
+func TestE2E_PutAndGetObject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	ctx := context.Background()
+	e := setupE2E(t)
 
 	testKey := "e2e/round-trip.txt"
 	testBody := "hello from the e2e test"
 
-	// Write through the proxy
-	_, err = proxyClient.PutObject(ctx, &s3.PutObjectInput{
+	_, err := e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(e2eVirtualBucket),
 		Key:    aws.String(testKey),
 		Body:   strings.NewReader(testBody),
 	})
 	require.NoError(t, err)
 
-	// Read back through the proxy
-	getResult, err := proxyClient.GetObject(ctx, &s3.GetObjectInput{
+	getResult, err := e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(e2eVirtualBucket),
 		Key:    aws.String(testKey),
 	})
@@ -227,8 +234,7 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, testBody, string(body))
 
-	// Verify the object landed at the prefixed path in the real bucket
-	directResult, err := directClient.GetObject(ctx, &s3.GetObjectInput{
+	directResult, err := e.DirectClient.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(garageBucket),
 		Key:    aws.String("tenant-abc/" + testKey),
 	})
@@ -238,4 +244,86 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	directBody, err := io.ReadAll(directResult.Body)
 	require.NoError(t, err)
 	assert.Equal(t, testBody, string(directBody))
+}
+
+func TestE2E_ListObjectsPrefixIsolation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+
+	ctx := context.Background()
+	e := setupE2E(t)
+
+	// Put two objects through the proxy (they land under tenant-abc/ in the real bucket)
+	for _, obj := range []struct{ key, body string }{
+		{"a.txt", "content-a"},
+		{"dir/b.txt", "content-b"},
+	} {
+		_, err := e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(e2eVirtualBucket),
+			Key:    aws.String(obj.key),
+			Body:   strings.NewReader(obj.body),
+		})
+		require.NoError(t, err)
+	}
+
+	// Put a foreign object directly in the real bucket (outside the tenant prefix)
+	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(garageBucket),
+		Key:    aws.String("other-tenant/secret.txt"),
+		Body:   strings.NewReader("should not be visible"),
+	})
+	require.NoError(t, err)
+
+	// Sanity check: listing the real bucket directly (no prefix) returns all 3
+	// objects. This proves the foreign object exists and the proxy is the thing
+	// providing isolation, not an accident of test setup.
+	directList, err := e.DirectClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(garageBucket),
+	})
+	require.NoError(t, err)
+
+	var allKeys []string
+	for _, obj := range directList.Contents {
+		allKeys = append(allKeys, *obj.Key)
+	}
+	sort.Strings(allKeys)
+	assert.Equal(t, []string{
+		"other-tenant/secret.txt",
+		"tenant-abc/a.txt",
+		"tenant-abc/dir/b.txt",
+	}, allKeys)
+
+	// List through the proxy -- should only see the tenant's objects, with clean keys
+	listResult, err := e.ProxyClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(e2eVirtualBucket),
+	})
+	require.NoError(t, err)
+
+	var keys []string
+	for _, obj := range listResult.Contents {
+		keys = append(keys, *obj.Key)
+	}
+	sort.Strings(keys)
+
+	assert.Equal(t, []string{"a.txt", "dir/b.txt"}, keys)
+
+	// No key should contain the internal prefix or the foreign tenant's path
+	for _, key := range keys {
+		assert.NotContains(t, key, "tenant-abc")
+		assert.NotContains(t, key, "other-tenant")
+	}
+
+	// List with a sub-prefix through the proxy
+	listResult, err = e.ProxyClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(e2eVirtualBucket),
+		Prefix: aws.String("dir/"),
+	})
+	require.NoError(t, err)
+
+	keys = nil
+	for _, obj := range listResult.Contents {
+		keys = append(keys, *obj.Key)
+	}
+	assert.Equal(t, []string{"dir/b.txt"}, keys)
 }

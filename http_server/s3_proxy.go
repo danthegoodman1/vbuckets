@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,11 +33,25 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	vbConfig := getVBucketConfig(r.Context())
 	objectKey := getObjectKey(r.Context())
 
+	var normalizedPrefix string
 	if vbConfig.PathPrefix != "" {
-		objectKey = strings.TrimSuffix(vbConfig.PathPrefix, "/") + "/" + objectKey
+		normalizedPrefix = strings.TrimSuffix(vbConfig.PathPrefix, "/") + "/"
 	}
 
-	outboundURL := buildOutboundURL(vbConfig, objectKey, r)
+	listRewrite := normalizedPrefix != "" && isListObjectsRequest(r.Method, objectKey, r.URL.RawQuery)
+
+	// For non-list requests, prepend the prefix to the object key in the path.
+	// For list requests, the prefix goes into the query parameters instead.
+	if normalizedPrefix != "" && !listRewrite {
+		objectKey = normalizedPrefix + objectKey
+	}
+
+	rawQuery := r.URL.RawQuery
+	if listRewrite {
+		rawQuery = rewriteListQueryForPrefix(rawQuery, normalizedPrefix)
+	}
+
+	outboundURL := buildOutboundURL(vbConfig, objectKey, rawQuery)
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outboundURL, r.Body)
 	if err != nil {
@@ -48,7 +63,6 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 
 	copyHeaders(r.Header, outReq.Header)
 
-	// Set the host to match how we're addressing the real backend
 	endpointHost := parseEndpoint(vbConfig.RealEndpoint).Host
 	if vbConfig.RealUsePathStyle {
 		outReq.Host = endpointHost
@@ -56,7 +70,6 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 		outReq.Host = vbConfig.RealBucket + "." + endpointHost
 	}
 
-	// Remove the original authorization -- we'll re-sign below
 	outReq.Header.Del("Authorization")
 	outReq.Header.Del("X-Amz-Date")
 	outReq.Header.Del("x-amz-content-sha256")
@@ -77,6 +90,30 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// For list responses, rewrite the XML body to strip the path prefix
+	// from keys and replace the real bucket name with the virtual one.
+	if listRewrite && resp.StatusCode == http.StatusOK {
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to read list response body")
+			writeS3Error(w, http.StatusBadGateway, "InternalError", "Failed to read upstream response")
+			return
+		}
+
+		rewritten, err := rewriteListResponseBody(respBody, normalizedPrefix, getBucketName(r.Context()))
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to rewrite list response")
+			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to process list response")
+			return
+		}
+
+		copyHeaders(resp.Header, w.Header())
+		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+		w.WriteHeader(resp.StatusCode)
+		w.Write(rewritten)
+		return
+	}
+
 	copyHeaders(resp.Header, w.Header())
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
@@ -95,7 +132,7 @@ func parseEndpoint(endpoint string) *url.URL {
 
 // buildOutboundURL constructs the full URL for the real S3 request.
 // Uses vhost-style by default (bucket in host), or path-style if configured.
-func buildOutboundURL(cfg *VBucketConfig, objectKey string, r *http.Request) string {
+func buildOutboundURL(cfg *VBucketConfig, objectKey string, rawQuery string) string {
 	u := parseEndpoint(cfg.RealEndpoint)
 
 	if cfg.RealUsePathStyle {
@@ -111,7 +148,7 @@ func buildOutboundURL(cfg *VBucketConfig, objectKey string, r *http.Request) str
 		}
 	}
 
-	u.RawQuery = r.URL.RawQuery
+	u.RawQuery = rawQuery
 	return u.String()
 }
 
