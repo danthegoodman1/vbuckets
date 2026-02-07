@@ -19,7 +19,7 @@ var logger = gologger.NewLogger()
 func main() {
 	logger.Info().Msg("Starting vbuckets server")
 
-	server := http_server.NewServer(env.HTTPListenAddress, nil, nil)
+	server := http_server.NewServer(env.HTTPListenAddress, nil, http_server.RegisterS3Routes)
 
 	go func() {
 		logger.Info().Str("addr", server.Addr()).Msg("starting HTTP server")
