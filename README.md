@@ -23,13 +23,13 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 | Lookup | Input | Returns |
 |---|---|---|
-| `lookupCredentials` | access key ID | secret key, IAM policy |
-| `lookupBaseHost` | request hostname | base domain (if registered) |
-| `lookupVBucket` | access key ID + bucket name | real endpoint, bucket, region, path prefix, addressing style |
+| `LookupCredentials` | access key ID | secret key, IAM policy, TTL |
+| `LookupBaseHost` | request hostname | base domain (if registered), TTL |
+| `LookupVBucket` | access key ID + bucket name | real endpoint, bucket, region, path prefix, addressing style, TTL |
 
-`lookupBaseHost` determines whether an incoming request is virtual-hosted style (`bucket.s3.example.com`) or path style (`s3.example.com/bucket`) by checking if the hostname is (or is a subdomain of) a registered base domain. The set of base domains changes extremely rarely, so this is aggressively cacheable.
+`LookupBaseHost` determines whether an incoming request is virtual-hosted style (`bucket.s3.example.com`) or path style (`s3.example.com/bucket`) by checking if the hostname is (or is a subdomain of) a registered base domain. The set of base domains changes extremely rarely, so this is aggressively cacheable.
 
-**Phase 1 (authentication)** runs `lookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the bucket via `lookupBaseHost` + `lookupVBucket`, then checks IAM permissions. This separation means credential caches don't need to be invalidated when bucket mappings change and vice versa.
+**Phase 1 (authentication)** runs `LookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the bucket via `LookupBaseHost` + `LookupVBucket`, then checks IAM permissions. This separation means credential caches don't need to be invalidated when bucket mappings change and vice versa.
 
 ## Path prefix rewriting
 
@@ -41,11 +41,39 @@ Credentials use the same IAM as AWS.
 
 Each proxied request is checked against the virtual IAM credentials before forwarding to the real bucket.
 
-
 ## Control plane
 
-All three lookup functions currently read from environment variables (single-tenant). In production these will call out to a control plane service that manages credentials, bucket mappings, and IAM policies.
+vbuckets connects to a user-provided gRPC control plane service to resolve credentials, bucket mappings, and base hosts. The proto definition is in `api/v1/controlplane.proto`.
 
-The control plane API is not yet implemented. It will likely be gRPC (the server already multiplexes gRPC alongside HTTP on the same port via h2c) but may end up as an HTTP JSON API instead. The interface is intentionally narrow -- vbuckets only needs the three lookups above -- so swapping transports is trivial.
+You implement the `ControlPlane` service:
 
-The benefit of gRPC is an Envoy xDS-like behavior where you can have long/indefinite caching, and push cache invalidations very quickly (e.g. delete keys, change permissions)
+```protobuf
+service ControlPlane {
+  rpc LookupCredentials(LookupCredentialsRequest) returns (LookupCredentialsResponse);
+  rpc LookupBaseHost(LookupBaseHostRequest) returns (LookupBaseHostResponse);
+  rpc LookupVBucket(LookupVBucketRequest) returns (LookupVBucketResponse);
+  rpc ListenForDeltas(ListenForDeltasRequest) returns (stream Delta);
+}
+```
+
+The three unary RPCs handle on-demand lookups. Each response includes a `ttl` field that controls how long the proxy caches that entry.
+
+### Delta stream
+
+`ListenForDeltas` is a server-streaming RPC that pushes cache updates to the proxy. When credentials are revoked, bucket mappings change, or base hosts are added/removed, the control plane sends a `Delta` message with the full updated value (upsert) or a removal flag. This gives an Envoy xDS-like pattern: long-lived caches with fast, precise invalidation -- no polling, no stale windows.
+
+Each delta also carries a `ttl` so the control plane controls per-entry cache lifetimes even for pushed data.
+
+### Caching
+
+Lookup results and deltas are cached locally using [otter](https://github.com/maypok86/otter) (a high-performance concurrent cache). Three independent caches (credentials, base hosts, vbuckets) each use per-entry TTLs from the control plane. Cache misses trigger the unary gRPC lookup; concurrent requests for the same key are deduplicated automatically.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONTROL_PLANE_URL` | (required) | gRPC address of the control plane (e.g. `localhost:9090`) |
+| `HTTP_ADDRESS` | `:8080` | Listen address for the HTTP/S3 proxy |
+| `CACHE_MAX_CREDENTIALS` | `10000` | Max entries in the credentials cache |
+| `CACHE_MAX_BASE_HOSTS` | `10000` | Max entries in the base host cache |
+| `CACHE_MAX_VBUCKETS` | `10000` | Max entries in the vbucket cache |
