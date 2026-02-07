@@ -44,4 +44,4 @@ All three lookup functions currently read from environment variables (single-ten
 
 The control plane API is not yet implemented. It will likely be gRPC (the server already multiplexes gRPC alongside HTTP on the same port via h2c) but may end up as an HTTP JSON API instead. The interface is intentionally narrow -- vbuckets only needs the three lookups above -- so swapping transports is trivial.
 
-The benefit of gRPC is an Envoy xDS-like behavior where you can push cache invalidations very quickly (e.g. delete keys, change permissions)
+The benefit of gRPC is an Envoy xDS-like behavior where you can have long/indefinite caching, and push cache invalidations very quickly (e.g. delete keys, change permissions)
