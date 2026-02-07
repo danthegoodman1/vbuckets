@@ -173,8 +173,10 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	env.RealSecretAccessKey = garageSecretKey
 	env.RealRegion = "us-east-1"
 	env.RealUsePathStyle = true
-	env.RealPathPrefix = ""
+	env.RealPathPrefix = "tenant-abc"
 	env.S3BaseHost = ""
+
+	garageEndpoint := "http://" + host + ":" + mappedPort.Port()
 
 	// Start vbuckets proxy
 	r := chi.NewRouter()
@@ -183,7 +185,7 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// S3 client with virtual credentials pointed at the proxy
-	client := s3.New(s3.Options{
+	proxyClient := s3.New(s3.Options{
 		Region: "us-east-1",
 		Credentials: credentials.NewStaticCredentialsProvider(
 			e2eVirtualAccessKey, e2eVirtualSecretKey, "",
@@ -192,17 +194,29 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 		UsePathStyle: true,
 	})
 
+	// Direct client with real credentials pointed at Garage
+	directClient := s3.New(s3.Options{
+		Region: "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider(
+			garageAccessKey, garageSecretKey, "",
+		),
+		BaseEndpoint: aws.String(garageEndpoint),
+		UsePathStyle: true,
+	})
+
 	testKey := "e2e/round-trip.txt"
 	testBody := "hello from the e2e test"
 
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+	// Write through the proxy
+	_, err = proxyClient.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(e2eVirtualBucket),
 		Key:    aws.String(testKey),
 		Body:   strings.NewReader(testBody),
 	})
 	require.NoError(t, err)
 
-	getResult, err := client.GetObject(ctx, &s3.GetObjectInput{
+	// Read back through the proxy
+	getResult, err := proxyClient.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(e2eVirtualBucket),
 		Key:    aws.String(testKey),
 	})
@@ -212,4 +226,16 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	body, err := io.ReadAll(getResult.Body)
 	require.NoError(t, err)
 	assert.Equal(t, testBody, string(body))
+
+	// Verify the object landed at the prefixed path in the real bucket
+	directResult, err := directClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(garageBucket),
+		Key:    aws.String("tenant-abc/" + testKey),
+	})
+	require.NoError(t, err)
+	defer directResult.Body.Close()
+
+	directBody, err := io.ReadAll(directResult.Body)
+	require.NoError(t, err)
+	assert.Equal(t, testBody, string(directBody))
 }
