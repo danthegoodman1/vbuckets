@@ -33,9 +33,10 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 ## IAM
 
-Each proxied request is mapped to an S3 action (`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`) and checked against the virtual credentials before forwarding. This allows per-key restrictions -- e.g. read-only keys, upload-only keys, or keys scoped to specific prefixes.
+Credentials use the same IAM as AWS.
 
-> IAM policy evaluation is stubbed out today (all actions allowed). The `checkIAMPermissions` function is the integration point.
+Each proxied request is checked against the virtual IAM credentials before forwarding to the real bucket.
+
 
 ## Control plane
 
