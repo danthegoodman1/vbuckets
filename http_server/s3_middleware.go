@@ -3,6 +3,7 @@ package http_server
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"net/http"
 
 	"github.com/rs/zerolog"
@@ -79,6 +80,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 
 			if err := verifySignature(r, authInfo, virtualCreds.SecretKey); err != nil {
 				logger.Warn().Err(err).Msg("signature verification failed")
+				if errors.Is(err, errRequestTimeTooSkewed) {
+					writeS3Error(w, http.StatusForbidden, "RequestTimeTooSkewed", "The difference between the request time and server time is too large.")
+					return
+				}
 				writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 				return
 			}

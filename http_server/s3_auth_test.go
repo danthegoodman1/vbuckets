@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -99,6 +101,10 @@ func emptyPayloadHash() string {
 }
 
 func signedRequest(t *testing.T, method, url string, body []byte, payloadHash string, creds aws.Credentials) *http.Request {
+	return signedRequestAtTime(t, method, url, body, payloadHash, creds, time.Now().UTC())
+}
+
+func signedRequestAtTime(t *testing.T, method, url string, body []byte, payloadHash string, creds aws.Credentials, signedAt time.Time) *http.Request {
 	t.Helper()
 
 	var bodyReader *bytes.Reader
@@ -114,7 +120,7 @@ func signedRequest(t *testing.T, method, url string, body []byte, payloadHash st
 	req.Header.Set("x-amz-content-sha256", payloadHash)
 
 	signer := awsv4.NewSigner()
-	require.NoError(t, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", testRegion, time.Now()))
+	require.NoError(t, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", testRegion, signedAt))
 
 	return req
 }
@@ -213,6 +219,48 @@ func TestSigV4_RawSigner_UnknownAccessKey(t *testing.T) {
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func TestSigV4_RawSigner_RequestTimeTooSkewed(t *testing.T) {
+	oldSkew := env.SigV4MaxClockSkew
+	env.SigV4MaxClockSkew = 15 * time.Minute
+	t.Cleanup(func() {
+		env.SigV4MaxClockSkew = oldSkew
+	})
+
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
+
+	req := signedRequestAtTime(t, http.MethodGet, ts.URL+"/"+testBucket+"/old-object.txt", nil, emptyPayloadHash(), validCreds, time.Now().UTC().Add(-16*time.Minute))
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>RequestTimeTooSkewed</Code>")
+}
+
+func TestSigV4_RawSigner_ConfigurableClockSkew(t *testing.T) {
+	oldSkew := env.SigV4MaxClockSkew
+	env.SigV4MaxClockSkew = time.Hour
+	t.Cleanup(func() {
+		env.SigV4MaxClockSkew = oldSkew
+	})
+
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
+
+	req := signedRequestAtTime(t, http.MethodGet, ts.URL+"/"+testBucket+"/old-but-accepted.txt", nil, emptyPayloadHash(), validCreds, time.Now().UTC().Add(-30*time.Minute))
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 func TestSigV4_S3Client_PutObject(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
@@ -53,8 +54,12 @@ func NewServer(addr string, grpcServer *grpc.Server, registerRoutes RegisterRout
 		router:     r,
 		grpcServer: grpcServer,
 		server: &http.Server{
-			Addr:    addr,
-			Handler: h2cHandler,
+			Addr:              addr,
+			Handler:           h2cHandler,
+			ReadHeaderTimeout: env.HTTPReadHeaderTimeout,
+			IdleTimeout:       env.HTTPIdleTimeout,
+			ReadTimeout:       env.HTTPReadTimeout,
+			WriteTimeout:      env.HTTPWriteTimeout,
 			BaseContext: func(l net.Listener) context.Context {
 				return context.Background()
 			},

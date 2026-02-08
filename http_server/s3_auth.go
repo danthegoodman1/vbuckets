@@ -3,15 +3,20 @@ package http_server
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/danthegoodman1/vbuckets/env"
 )
 
 const unsignedPayload = "UNSIGNED-PAYLOAD"
+
+var errRequestTimeTooSkewed = errors.New("request time too skewed")
 
 type AuthInfo struct {
 	AccessKeyID   string
@@ -176,16 +181,33 @@ func computeSigningKey(secret, date, region, service string) []byte {
 // signature derived from the provided secret key. The request body is never
 // read -- the x-amz-content-sha256 header value is used as the payload hash.
 func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string) error {
+	return verifySignatureAtTime(r, authInfo, secretKey, time.Now().UTC(), env.SigV4MaxClockSkew)
+}
+
+func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string, now time.Time, maxSkew time.Duration) error {
 	if r.Header.Get("x-amz-content-sha256") == "" {
 		return fmt.Errorf("missing x-amz-content-sha256 header")
 	}
-
-	canonicalRequest := buildCanonicalRequest(r, authInfo.SignedHeaders)
 
 	datetime := r.Header.Get("X-Amz-Date")
 	if datetime == "" {
 		return fmt.Errorf("missing X-Amz-Date header")
 	}
+	requestTime, err := time.Parse("20060102T150405Z", datetime)
+	if err != nil {
+		return fmt.Errorf("invalid X-Amz-Date header: %w", err)
+	}
+	if maxSkew > 0 {
+		skew := now.Sub(requestTime)
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > maxSkew {
+			return fmt.Errorf("%w", errRequestTimeTooSkewed)
+		}
+	}
+
+	canonicalRequest := buildCanonicalRequest(r, authInfo.SignedHeaders)
 
 	stringToSign := buildStringToSign(datetime, authInfo.Scope, canonicalRequest)
 	signingKey := computeSigningKey(secretKey, authInfo.Date, authInfo.Region, authInfo.Service)

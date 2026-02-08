@@ -19,7 +19,7 @@ Designed for whitelabeling -- give tenants their own bucket names, access keys, 
                  +------------+
 ```
 
-Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature, resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
+Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
 
 ## Lookup functions
 
@@ -37,7 +37,7 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 ## Path prefix rewriting
 
-When a vbucket mapping includes a path prefix, all object keys are transparently scoped under that prefix in the real bucket. For single-object operations (GET, PUT, DELETE, etc.) the prefix is prepended to the key in the URL path. For ListObjects V1/V2 the proxy rewrites the `prefix`, `start-after`, and `marker` query parameters on the way out, and strips the prefix from keys, common prefixes, and other echoed fields in the XML response on the way back. This ensures tenants only see their own objects and never encounter the internal prefix in returned keys.
+When a vbucket mapping includes a path prefix, all object keys are transparently scoped under that prefix in the real bucket. For single-object operations (GET, PUT, DELETE, etc.) the prefix is prepended to the key in the URL path. For ListObjects V1/V2 the proxy rewrites the `prefix`, `start-after`, and `marker` query parameters on the way out, and strips the prefix from keys, common prefixes, and other echoed fields in the XML response on the way back.
 
 ## IAM
 
@@ -82,6 +82,32 @@ Lookup results and deltas are cached locally, going to the control plane as need
 |---|---|---|
 | `CONTROL_PLANE_URL` | (required) | gRPC address of the control plane (e.g. `localhost:9090`) |
 | `HTTP_ADDRESS` | `:8080` | Listen address for the HTTP/S3 proxy |
+| `SIGV4_MAX_CLOCK_SKEW` | `15m` | Max allowed absolute skew for `X-Amz-Date` before returning `RequestTimeTooSkewed` |
 | `CACHE_MAX_CREDENTIALS` | `10000` | Max entries in the credentials cache |
 | `CACHE_MAX_BASE_HOSTS` | `10000` | Max entries in the base host cache |
 | `CACHE_MAX_VBUCKETS` | `10000` | Max entries in the vbucket cache |
+
+### Control plane security
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONTROL_PLANE_SECURITY_MODE` | `insecure` | Transport mode: `insecure`, `tls`, or `mtls` |
+| `CONTROL_PLANE_TLS_CA_FILE` | (unset) | Optional CA bundle for control plane TLS |
+| `CONTROL_PLANE_TLS_SERVER_NAME` | (unset) | Optional TLS server name override |
+| `CONTROL_PLANE_TLS_CERT_FILE` | (unset) | Client cert file for `mtls` |
+| `CONTROL_PLANE_TLS_KEY_FILE` | (unset) | Client key file for `mtls` |
+| `CONTROL_PLANE_AUTH_BEARER_TOKEN` | (unset) | Optional bearer token sent as gRPC `authorization` metadata |
+
+### HTTP and upstream timeouts
+
+| Variable | Default | Description |
+|---|---|---|
+| `HTTP_READ_HEADER_TIMEOUT` | `10s` | Max time to read incoming request headers |
+| `HTTP_IDLE_TIMEOUT` | `2m` | Max keep-alive idle time |
+| `HTTP_READ_TIMEOUT` | `0s` | Total request read timeout (`0s` disables hard cap for streaming) |
+| `HTTP_WRITE_TIMEOUT` | `0s` | Total response write timeout (`0s` disables hard cap for streaming) |
+| `UPSTREAM_DIAL_TIMEOUT` | `30s` | Upstream TCP dial timeout |
+| `UPSTREAM_TLS_HANDSHAKE_TIMEOUT` | `10s` | Upstream TLS handshake timeout |
+| `UPSTREAM_RESPONSE_HEADER_TIMEOUT` | `30s` | Upstream response header timeout |
+| `UPSTREAM_EXPECT_CONTINUE_TIMEOUT` | `1s` | Upstream `100-continue` wait timeout |
+| `UPSTREAM_IDLE_CONN_TIMEOUT` | `90s` | Upstream idle connection timeout |

@@ -1,7 +1,6 @@
 package http_server
 
 import (
-	"bytes"
 	"encoding/xml"
 	"io"
 	"net/url"
@@ -54,15 +53,14 @@ func rewriteListQueryForPrefix(rawQuery string, pathPrefix string) string {
 	return q.Encode()
 }
 
-// rewriteListResponseBody rewrites a ListObjects V1/V2 XML response:
+// rewriteListResponse rewrites a ListObjects V1/V2 XML response:
 //   - strips pathPrefix from object keys, prefix echo, and common prefixes
 //   - replaces the echoed bucket name with the virtual bucket name
 //
 // Uses streaming XML token rewriting so unknown elements are preserved.
-func rewriteListResponseBody(body []byte, pathPrefix, virtualBucket string) ([]byte, error) {
-	decoder := xml.NewDecoder(bytes.NewReader(body))
-	var buf bytes.Buffer
-	encoder := xml.NewEncoder(&buf)
+func rewriteListResponse(in io.Reader, out io.Writer, pathPrefix, virtualBucket string) error {
+	decoder := xml.NewDecoder(in)
+	encoder := xml.NewEncoder(out)
 	var stack []string
 
 	for {
@@ -71,18 +69,22 @@ func rewriteListResponseBody(body []byte, pathPrefix, virtualBucket string) ([]b
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		switch t := token.(type) {
 		case xml.StartElement:
 			stack = append(stack, t.Name.Local)
-			encoder.EncodeToken(t)
+			if err := encoder.EncodeToken(t); err != nil {
+				return err
+			}
 		case xml.EndElement:
 			if len(stack) > 0 {
 				stack = stack[:len(stack)-1]
 			}
-			encoder.EncodeToken(t)
+			if err := encoder.EncodeToken(t); err != nil {
+				return err
+			}
 		case xml.CharData:
 			path := strings.Join(stack, "/")
 			text := string(t)
@@ -97,14 +99,15 @@ func rewriteListResponseBody(body []byte, pathPrefix, virtualBucket string) ([]b
 				"ListBucketResult/Contents/Key":
 				text = strings.TrimPrefix(text, pathPrefix)
 			}
-			encoder.EncodeToken(xml.CharData(text))
+			if err := encoder.EncodeToken(xml.CharData(text)); err != nil {
+				return err
+			}
 		default:
-			encoder.EncodeToken(t)
+			if err := encoder.EncodeToken(t); err != nil {
+				return err
+			}
 		}
 	}
 
-	if err := encoder.Flush(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return encoder.Flush()
 }

@@ -220,6 +220,7 @@ func TestE2E_ControlPlane_PutAndGetObject(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+	t.Parallel()
 
 	ctx := context.Background()
 	e := setupE2E(t)
@@ -261,6 +262,7 @@ func TestE2E_ControlPlane_ListObjectsPrefixIsolation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+	t.Parallel()
 
 	ctx := context.Background()
 	e := setupE2E(t)

@@ -2,12 +2,13 @@ package http_server
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 )
@@ -17,7 +18,19 @@ var proxyClient = &http.Client{
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
-	Timeout: 5 * time.Minute,
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   env.UpstreamDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       env.UpstreamIdleConnTimeout,
+		TLSHandshakeTimeout:   env.UpstreamTLSHandshakeTimeout,
+		ExpectContinueTimeout: env.UpstreamExpectContinueTimeout,
+		ResponseHeaderTimeout: env.UpstreamResponseHeaderTimeout,
+	},
 }
 
 func RegisterS3Routes(resolver Resolver) RegisterRoutes {
@@ -95,24 +108,12 @@ func handleS3Request(w http.ResponseWriter, r *http.Request) {
 	// For list responses, rewrite the XML body to strip the path prefix
 	// from keys and replace the real bucket name with the virtual one.
 	if listRewrite && resp.StatusCode == http.StatusOK {
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to read list response body")
-			writeS3Error(w, http.StatusBadGateway, "InternalError", "Failed to read upstream response")
-			return
-		}
-
-		rewritten, err := rewriteListResponseBody(respBody, normalizedPrefix, getBucketName(r.Context()))
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to rewrite list response")
-			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to process list response")
-			return
-		}
-
 		copyHeaders(resp.Header, w.Header())
-		w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		w.Write(rewritten)
+		if err := rewriteListResponse(resp.Body, w, normalizedPrefix, getBucketName(r.Context())); err != nil {
+			logger.Error().Err(err).Msg("failed to rewrite list response")
+		}
 		return
 	}
 
