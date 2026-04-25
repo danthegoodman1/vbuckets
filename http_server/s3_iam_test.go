@@ -173,6 +173,20 @@ func TestBuildS3IAMRequests_Context(t *testing.T) {
 	assert.Equal(t, []string{fmt.Sprintf("%d", now.Unix())}, ctx["aws:epochtime"])
 }
 
+func TestBuildS3IAMRequests_ListBucketsDoesNotSetListObjectConditions(t *testing.T) {
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	req := httptest.NewRequest(http.MethodGet, "/?x-id=ListBuckets", nil)
+
+	checks, err := buildS3IAMRequests(req, "", "", "", &AuthInfo{}, now)
+	require.NoError(t, err)
+	require.Len(t, checks, 1)
+
+	assert.Equal(t, "s3:ListAllMyBuckets", checks[0].Action)
+	assert.NotContains(t, checks[0].Context, "s3:prefix")
+	assert.NotContains(t, checks[0].Context, "s3:delimiter")
+	assert.NotContains(t, checks[0].Context, "s3:max-keys")
+}
+
 func TestBuildS3IAMRequests_CreateBucketLocationConstraintContext(t *testing.T) {
 	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	req := httptest.NewRequest(http.MethodPut, "/test-bucket", nil)
@@ -192,6 +206,16 @@ func TestBuildS3IAMRequests_CreateBucketLocationConstraintContext(t *testing.T) 
 		}
 	}`)
 	require.NoError(t, policy.Authorize(checks[0]))
+}
+
+func TestParseCreateBucketLocationConstraintRejectsUnexpectedRoot(t *testing.T) {
+	location, err := parseCreateBucketLocationConstraint(io.NopCloser(strings.NewReader(`<NotCreateBucketConfiguration><LocationConstraint>us-west-2</LocationConstraint></NotCreateBucketConfiguration>`)))
+	require.Error(t, err)
+	assert.Empty(t, location)
+}
+
+func TestFormatS3CreationDateUsesEpochForZeroValue(t *testing.T) {
+	assert.Equal(t, "1970-01-01T00:00:00Z", formatS3CreationDate(time.Time{}))
 }
 
 func TestS3Auth_IAMDenyDoesNotCallHandler(t *testing.T) {

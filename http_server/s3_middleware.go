@@ -208,7 +208,8 @@ func isCreateBucketRequest(r *http.Request, objectKey string) bool {
 const maxCreateBucketConfigBytes = 1 << 20
 
 type createBucketConfiguration struct {
-	LocationConstraint string `xml:"LocationConstraint"`
+	XMLName            xml.Name `xml:"CreateBucketConfiguration"`
+	LocationConstraint string   `xml:"LocationConstraint"`
 }
 
 func parseCreateBucketLocationConstraint(body io.ReadCloser) (string, error) {
@@ -231,6 +232,9 @@ func parseCreateBucketLocationConstraint(body io.ReadCloser) (string, error) {
 	var cfg createBucketConfiguration
 	if err := xml.Unmarshal(data, &cfg); err != nil {
 		return "", err
+	}
+	if cfg.XMLName.Local != "CreateBucketConfiguration" {
+		return "", fmt.Errorf("unexpected CreateBucketConfiguration root %q", cfg.XMLName.Local)
 	}
 	return strings.TrimSpace(cfg.LocationConstraint), nil
 }

@@ -57,6 +57,8 @@ the incoming request:
 - Supported policy elements: `Version`, `Statement`, `Sid`, `Effect`,
   `Action`/`NotAction`, `Resource`/`NotResource`, and conditions for string,
   bool, null, numeric, and date comparisons.
+- CreateBucket policies may use `s3:LocationConstraint` when the request body
+  includes a location constraint.
 - Supported S3 actions:
   - `s3:ListAllMyBuckets`
   - `s3:CreateBucket`

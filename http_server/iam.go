@@ -78,7 +78,7 @@ func buildS3IAMRequests(r *http.Request, bucket, objectKey, locationConstraint s
 	if err != nil {
 		return nil, err
 	}
-	ctx := buildS3IAMContext(r, authInfo, objectKey, locationConstraint, now)
+	ctx := buildS3IAMContext(r, authInfo, bucket, objectKey, locationConstraint, now)
 	for i := range checks {
 		checks[i].Context = ctx
 	}
@@ -180,7 +180,7 @@ func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, e
 	}
 }
 
-func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, objectKey, locationConstraint string, now time.Time) iam.Context {
+func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, bucket, objectKey, locationConstraint string, now time.Time) iam.Context {
 	ctx := iam.Context{
 		"s3:authtype":         []string{"REST-HEADER"},
 		"s3:signatureversion": []string{"AWS4-HMAC-SHA256"},
@@ -193,7 +193,7 @@ func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, objectKey, locationC
 	if locationConstraint != "" {
 		ctx["s3:locationconstraint"] = []string{locationConstraint}
 	}
-	if isBucketListLikeRequest(r.Method, objectKey, r.URL.RawQuery) {
+	if bucket != "" && isBucketListLikeRequest(r.Method, objectKey, r.URL.RawQuery) {
 		ctx["s3:prefix"] = queryValuesOrDefault(query, "prefix", "")
 		if values, ok := query["delimiter"]; ok {
 			ctx["s3:delimiter"] = values

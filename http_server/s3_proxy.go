@@ -94,7 +94,7 @@ func handleListVBuckets(resolver Resolver, w http.ResponseWriter, r *http.Reques
 	for _, bucket := range buckets {
 		result.Buckets.Buckets = append(result.Buckets.Buckets, listBucketEntry{
 			Name:         bucket.Name,
-			CreationDate: bucket.CreationDate.UTC().Format(time.RFC3339),
+			CreationDate: formatS3CreationDate(bucket.CreationDate),
 		})
 	}
 
@@ -130,6 +130,13 @@ type listBucketsWrapper struct {
 type listBucketEntry struct {
 	Name         string `xml:"Name"`
 	CreationDate string `xml:"CreationDate"`
+}
+
+func formatS3CreationDate(t time.Time) string {
+	if t.IsZero() {
+		t = time.Unix(0, 0).UTC()
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func writeCreateVBucketError(w http.ResponseWriter, err error) {
