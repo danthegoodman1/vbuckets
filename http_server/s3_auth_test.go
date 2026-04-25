@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/danthegoodman1/vbuckets/env"
+	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +28,18 @@ const (
 	testBucket    = "test-bucket"
 	testRegion    = "us-east-1"
 )
+
+const allowAllS3PolicyJSON = `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}`
+
+var testAllowAllPolicy = mustParseTestPolicy(allowAllS3PolicyJSON)
+
+func mustParseTestPolicy(policyJSON string) *iam.Policy {
+	policy, err := ParseS3IAMPolicyJSON(policyJSON)
+	if err != nil {
+		panic(err)
+	}
+	return policy
+}
 
 type testResolver struct {
 	credentials func(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
@@ -52,7 +65,7 @@ func newTestResolver() *testResolver {
 			if accessKeyID != testAccessKey {
 				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
 			}
-			return &VirtualCredentials{SecretKey: testSecretKey}, nil
+			return &VirtualCredentials{SecretKey: testSecretKey, IAMPolicy: testAllowAllPolicy}, nil
 		},
 		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
 			return "", false, nil

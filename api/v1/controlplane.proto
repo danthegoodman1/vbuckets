@@ -27,8 +27,8 @@ message LookupCredentialsRequest {
 
 message LookupCredentialsResponse {
   string secret_key = 1;
-  // Opaque IAM policy blob. Interpretation is up to the proxy.
-  bytes iam_policy = 2;
+  // Required AWS IAM JSON identity policy for this virtual access key.
+  string iam_policy_json = 2;
   google.protobuf.Duration ttl = 3;
 }
 
@@ -76,7 +76,7 @@ message CredentialsDelta {
 
   // Fields below are only set on upsert (remove == false).
   string secret_key = 3;
-  bytes iam_policy = 4;
+  string iam_policy_json = 4;
   google.protobuf.Duration ttl = 5;
 }
 

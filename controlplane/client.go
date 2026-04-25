@@ -221,9 +221,16 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 			c.caches.credentials.Invalidate(cd.AccessKeyId)
 			c.logger.Debug().Str("accessKeyID", cd.AccessKeyId).Msg("credential removed via delta")
 		} else {
+			policy, err := http_server.ParseS3IAMPolicyJSON(cd.IamPolicyJson)
+			if err != nil {
+				c.caches.credentials.Invalidate(cd.AccessKeyId)
+				c.logger.Error().Err(err).Str("accessKeyID", cd.AccessKeyId).Msg("invalid credential IAM policy in delta")
+				return
+			}
 			c.caches.credentials.Set(cd.AccessKeyId, cachedCredentials{
 				VirtualCredentials: &http_server.VirtualCredentials{
 					SecretKey: cd.SecretKey,
+					IAMPolicy: policy,
 				},
 				TTL: cd.Ttl.AsDuration(),
 			})
@@ -289,9 +296,14 @@ func (c *Client) LookupCredentials(ctx context.Context, accessKeyID string) (*ht
 		if err != nil {
 			return cachedCredentials{}, err
 		}
+		policy, err := http_server.ParseS3IAMPolicyJSON(resp.IamPolicyJson)
+		if err != nil {
+			return cachedCredentials{}, err
+		}
 		return cachedCredentials{
 			VirtualCredentials: &http_server.VirtualCredentials{
 				SecretKey: resp.SecretKey,
+				IAMPolicy: policy,
 			},
 			TTL: resp.Ttl.AsDuration(),
 		}, nil

@@ -69,8 +69,8 @@ func (x *LookupCredentialsRequest) GetAccessKeyId() string {
 type LookupCredentialsResponse struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SecretKey string                 `protobuf:"bytes,1,opt,name=secret_key,json=secretKey,proto3" json:"secret_key,omitempty"`
-	// Opaque IAM policy blob. Interpretation is up to the proxy.
-	IamPolicy     []byte               `protobuf:"bytes,2,opt,name=iam_policy,json=iamPolicy,proto3" json:"iam_policy,omitempty"`
+	// Required AWS IAM JSON identity policy for this virtual access key.
+	IamPolicyJson string               `protobuf:"bytes,2,opt,name=iam_policy_json,json=iamPolicyJson,proto3" json:"iam_policy_json,omitempty"`
 	Ttl           *durationpb.Duration `protobuf:"bytes,3,opt,name=ttl,proto3" json:"ttl,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -113,11 +113,11 @@ func (x *LookupCredentialsResponse) GetSecretKey() string {
 	return ""
 }
 
-func (x *LookupCredentialsResponse) GetIamPolicy() []byte {
+func (x *LookupCredentialsResponse) GetIamPolicyJson() string {
 	if x != nil {
-		return x.IamPolicy
+		return x.IamPolicyJson
 	}
-	return nil
+	return ""
 }
 
 func (x *LookupCredentialsResponse) GetTtl() *durationpb.Duration {
@@ -525,7 +525,7 @@ type CredentialsDelta struct {
 	Remove      bool                   `protobuf:"varint,2,opt,name=remove,proto3" json:"remove,omitempty"`
 	// Fields below are only set on upsert (remove == false).
 	SecretKey     string               `protobuf:"bytes,3,opt,name=secret_key,json=secretKey,proto3" json:"secret_key,omitempty"`
-	IamPolicy     []byte               `protobuf:"bytes,4,opt,name=iam_policy,json=iamPolicy,proto3" json:"iam_policy,omitempty"`
+	IamPolicyJson string               `protobuf:"bytes,4,opt,name=iam_policy_json,json=iamPolicyJson,proto3" json:"iam_policy_json,omitempty"`
 	Ttl           *durationpb.Duration `protobuf:"bytes,5,opt,name=ttl,proto3" json:"ttl,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -582,11 +582,11 @@ func (x *CredentialsDelta) GetSecretKey() string {
 	return ""
 }
 
-func (x *CredentialsDelta) GetIamPolicy() []byte {
+func (x *CredentialsDelta) GetIamPolicyJson() string {
 	if x != nil {
-		return x.IamPolicy
+		return x.IamPolicyJson
 	}
-	return nil
+	return ""
 }
 
 func (x *CredentialsDelta) GetTtl() *durationpb.Duration {
@@ -808,12 +808,11 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\n" +
 	"\x15v1/controlplane.proto\x12\vvbuckets.v1\x1a\x1egoogle/protobuf/duration.proto\">\n" +
 	"\x18LookupCredentialsRequest\x12\"\n" +
-	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\"\x86\x01\n" +
+	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\"\x8f\x01\n" +
 	"\x19LookupCredentialsResponse\x12\x1d\n" +
 	"\n" +
-	"secret_key\x18\x01 \x01(\tR\tsecretKey\x12\x1d\n" +
-	"\n" +
-	"iam_policy\x18\x02 \x01(\fR\tiamPolicy\x12+\n" +
+	"secret_key\x18\x01 \x01(\tR\tsecretKey\x12&\n" +
+	"\x0fiam_policy_json\x18\x02 \x01(\tR\riamPolicyJson\x12+\n" +
 	"\x03ttl\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"3\n" +
 	"\x15LookupBaseHostRequest\x12\x1a\n" +
 	"\bhostname\x18\x01 \x01(\tR\bhostname\"x\n" +
@@ -842,14 +841,13 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\vcredentials\x18\x01 \x01(\v2\x1d.vbuckets.v1.CredentialsDeltaH\x00R\vcredentials\x129\n" +
 	"\tbase_host\x18\x02 \x01(\v2\x1a.vbuckets.v1.BaseHostDeltaH\x00R\bbaseHost\x125\n" +
 	"\avbucket\x18\x03 \x01(\v2\x19.vbuckets.v1.VBucketDeltaH\x00R\avbucketB\a\n" +
-	"\x05delta\"\xb9\x01\n" +
+	"\x05delta\"\xc2\x01\n" +
 	"\x10CredentialsDelta\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\x12\x16\n" +
 	"\x06remove\x18\x02 \x01(\bR\x06remove\x12\x1d\n" +
 	"\n" +
-	"secret_key\x18\x03 \x01(\tR\tsecretKey\x12\x1d\n" +
-	"\n" +
-	"iam_policy\x18\x04 \x01(\fR\tiamPolicy\x12+\n" +
+	"secret_key\x18\x03 \x01(\tR\tsecretKey\x12&\n" +
+	"\x0fiam_policy_json\x18\x04 \x01(\tR\riamPolicyJson\x12+\n" +
 	"\x03ttl\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\xa3\x01\n" +
 	"\rBaseHostDelta\x12\x1a\n" +
 	"\bhostname\x18\x01 \x01(\tR\bhostname\x12\x16\n" +

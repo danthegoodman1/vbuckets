@@ -41,13 +41,37 @@ When a vbucket mapping includes a path prefix, all object keys are transparently
 
 ## IAM
 
-> [!IMPORTANT]
-> This is not yet implemented.
-> Currently, all vcredentials keys have full access to their vbuckets
+Credentials carry a required AWS IAM JSON identity policy. Each proxied
+request is evaluated against that policy before forwarding to the real bucket.
+Evaluation is fail-closed: implicit deny is the default, explicit `Deny`
+overrides `Allow`, malformed policies are rejected, and unsupported IAM/S3
+features are denied instead of ignored.
 
-Credentials use the same IAM as AWS.
+The supported surface is the S3 data-plane core that vbuckets can enforce from
+the incoming request:
 
-Each proxied request is checked against the virtual IAM credentials before forwarding to the real bucket.
+- Bucket resources use `arn:aws:s3:::bucket`; object resources use
+  `arn:aws:s3:::bucket/key`.
+- Supported policy elements: `Version`, `Statement`, `Sid`, `Effect`,
+  `Action`/`NotAction`, `Resource`/`NotResource`, and conditions for string,
+  bool, null, numeric, and date comparisons.
+- Supported S3 actions:
+  - `s3:ListBucket`
+  - `s3:ListBucketMultipartUploads`
+  - `s3:GetObject`
+  - `s3:GetObjectVersion`
+  - `s3:PutObject`
+  - `s3:PutObjectAcl`
+  - `s3:PutObjectTagging`
+  - `s3:DeleteObject`
+  - `s3:DeleteObjectVersion`
+  - `s3:AbortMultipartUpload`
+  - `s3:ListMultipartUploadParts`
+- Requests that map to unsupported S3 actions or unsupported subresources are
+  denied before proxying.
+- Unsupported identity-policy features such as `Principal`, policy variables,
+  resource policies, session policies, object-tag condition keys, and KMS
+  enforcement are rejected or denied.
 
 ## Control plane
 

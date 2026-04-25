@@ -67,11 +67,14 @@ const (
 	e2eVirtualBucket    = "my-virtual-bucket"
 )
 
+const e2eAllowAllPolicyJSON = `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}`
+
 var hexIDPattern = regexp.MustCompile(`[0-9a-f]{16,}`)
 
 type testControlPlane struct {
 	apiv1.UnimplementedControlPlaneServer
 	garageEndpoint string
+	policyJSON     string
 }
 
 func (s *testControlPlane) LookupCredentials(_ context.Context, req *apiv1.LookupCredentialsRequest) (*apiv1.LookupCredentialsResponse, error) {
@@ -79,8 +82,9 @@ func (s *testControlPlane) LookupCredentials(_ context.Context, req *apiv1.Looku
 		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
 	}
 	return &apiv1.LookupCredentialsResponse{
-		SecretKey: e2eVirtualSecretKey,
-		Ttl:       durationpb.New(5 * time.Minute),
+		SecretKey:     e2eVirtualSecretKey,
+		IamPolicyJson: s.policyJSON,
+		Ttl:           durationpb.New(5 * time.Minute),
 	}, nil
 }
 
@@ -132,6 +136,10 @@ type e2eEnv struct {
 // controlplane.Client, and the proxy HTTP server -- exercising the full
 // production code path.
 func setupE2E(t *testing.T) *e2eEnv {
+	return setupE2EWithPolicyJSON(t, e2eAllowAllPolicyJSON)
+}
+
+func setupE2EWithPolicyJSON(t *testing.T, policyJSON string) *e2eEnv {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -173,7 +181,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 	require.NoError(t, err)
 
 	grpcServer := grpc.NewServer()
-	apiv1.RegisterControlPlaneServer(grpcServer, &testControlPlane{garageEndpoint: garageEndpoint})
+	apiv1.RegisterControlPlaneServer(grpcServer, &testControlPlane{garageEndpoint: garageEndpoint, policyJSON: policyJSON})
 	go grpcServer.Serve(lis)
 	t.Cleanup(func() {
 		// Cancel context first so the ListenForDeltas stream unblocks,
@@ -330,4 +338,70 @@ func TestE2E_ControlPlane_ListObjectsPrefixIsolation(t *testing.T) {
 		keys = append(keys, *obj.Key)
 	}
 	assert.Equal(t, []string{"dir/b.txt"}, keys)
+}
+
+func TestE2E_ControlPlane_IAMPolicyEnforcedBeforeProxy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	t.Parallel()
+
+	policyJSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": "s3:GetObject",
+				"Resource": "arn:aws:s3:::my-virtual-bucket/read/*"
+			},
+			{
+				"Effect": "Allow",
+				"Action": "s3:PutObject",
+				"Resource": "arn:aws:s3:::my-virtual-bucket/write/*"
+			}
+		]
+	}`
+
+	ctx := context.Background()
+	e := setupE2EWithPolicyJSON(t, policyJSON)
+
+	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(garageBucket),
+		Key:    aws.String("tenant-abc/read/existing.txt"),
+		Body:   strings.NewReader("readable"),
+	})
+	require.NoError(t, err)
+
+	getResult, err := e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("read/existing.txt"),
+	})
+	require.NoError(t, err)
+	defer getResult.Body.Close()
+
+	body, err := io.ReadAll(getResult.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "readable", string(body))
+
+	_, err = e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("read/denied.txt"),
+		Body:   strings.NewReader("should be denied"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+
+	_, err = e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("write/allowed.txt"),
+		Body:   strings.NewReader("written"),
+	})
+	require.NoError(t, err)
+
+	_, err = e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("write/allowed.txt"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
 }

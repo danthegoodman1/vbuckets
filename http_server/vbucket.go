@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/danthegoodman1/vbuckets/iam"
 )
 
 // Resolver provides the three lookups the proxy needs. Implemented by
@@ -21,7 +23,7 @@ type Resolver interface {
 // the vbucket defines where things go.
 type VirtualCredentials struct {
 	SecretKey string
-	IAMPolicy IAMPolicy
+	IAMPolicy *iam.Policy
 }
 
 // VBucketConfig holds the mapping from a virtual bucket to a real S3 backend.

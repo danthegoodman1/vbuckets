@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -83,6 +84,10 @@ type e2eEnv struct {
 // the proxy httptest server, and returns S3 clients for both the proxy and
 // the real backend. Registers all cleanup on t.
 func setupE2E(t *testing.T) *e2eEnv {
+	return setupE2EWithPolicy(t, testAllowAllPolicy)
+}
+
+func setupE2EWithPolicy(t *testing.T, policy *iam.Policy) *e2eEnv {
 	t.Helper()
 
 	ctx := context.Background()
@@ -126,7 +131,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 			if accessKeyID != e2eVirtualAccessKey {
 				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
 			}
-			return &VirtualCredentials{SecretKey: e2eVirtualSecretKey}, nil
+			return &VirtualCredentials{SecretKey: e2eVirtualSecretKey, IAMPolicy: policy}, nil
 		},
 		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
 			return "", false, nil
@@ -295,4 +300,78 @@ func TestE2E_ListObjectsPrefixIsolation(t *testing.T) {
 		keys = append(keys, *obj.Key)
 	}
 	assert.Equal(t, []string{"dir/b.txt"}, keys)
+}
+
+func TestE2E_IAMPolicyEnforcedBeforeProxy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	t.Parallel()
+
+	policy := mustParseTestPolicy(`{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": "s3:GetObject",
+				"Resource": "arn:aws:s3:::my-virtual-bucket/read/*"
+			},
+			{
+				"Effect": "Allow",
+				"Action": "s3:PutObject",
+				"Resource": "arn:aws:s3:::my-virtual-bucket/write/*"
+			}
+		]
+	}`)
+
+	ctx := context.Background()
+	e := setupE2EWithPolicy(t, policy)
+
+	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(garageBucket),
+		Key:    aws.String("tenant-abc/read/existing.txt"),
+		Body:   strings.NewReader("readable"),
+	})
+	require.NoError(t, err)
+
+	getResult, err := e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("read/existing.txt"),
+	})
+	require.NoError(t, err)
+	defer getResult.Body.Close()
+
+	body, err := io.ReadAll(getResult.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "readable", string(body))
+
+	_, err = e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("read/denied.txt"),
+		Body:   strings.NewReader("should be denied"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+
+	_, err = e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("write/allowed.txt"),
+		Body:   strings.NewReader("written"),
+	})
+	require.NoError(t, err)
+
+	_, err = e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("write/allowed.txt"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+
+	_, err = e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String("outside/denied.txt"),
+		Body:   strings.NewReader("should be denied"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
 }

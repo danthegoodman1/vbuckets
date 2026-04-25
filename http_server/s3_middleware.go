@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/rs/zerolog"
 )
 
@@ -74,6 +75,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 			virtualCreds, err := resolver.LookupCredentials(r.Context(), authInfo.AccessKeyID)
 			if err != nil {
 				logger.Warn().Err(err).Str("accessKeyID", authInfo.AccessKeyID).Msg("credential lookup failed")
+				if errors.Is(err, iam.ErrInvalidPolicy) {
+					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+					return
+				}
 				writeS3Error(w, http.StatusForbidden, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
 				return
 			}
@@ -108,9 +113,8 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				return
 			}
 
-			action := s3ActionFromRequest(r.Method)
-			if err := checkIAMPermissions(virtualCreds.IAMPolicy, bucket, objectKey, action); err != nil {
-				logger.Warn().Err(err).Str("action", action).Msg("IAM permission check failed")
+			if err := AuthorizeS3Request(virtualCreds.IAMPolicy, r, authInfo, bucket, objectKey); err != nil {
+				logger.Warn().Err(err).Msg("IAM permission check failed")
 				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}

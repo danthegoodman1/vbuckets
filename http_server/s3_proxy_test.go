@@ -34,7 +34,7 @@ func TestHandleS3Request_ListRewriteStreaming_RemovesStaleContentLength(t *testi
 			if accessKeyID != testAccessKey {
 				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
 			}
-			return &VirtualCredentials{SecretKey: testSecretKey}, nil
+			return &VirtualCredentials{SecretKey: testSecretKey, IAMPolicy: testAllowAllPolicy}, nil
 		},
 		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
 			return "", false, nil
