@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/danthegoodman1/vbuckets/controlplane"
 	"github.com/danthegoodman1/vbuckets/http_server"
@@ -75,6 +77,8 @@ type testControlPlane struct {
 	apiv1.UnimplementedControlPlaneServer
 	garageEndpoint string
 	policyJSON     string
+	mu             sync.Mutex
+	createdBuckets map[string]time.Time
 }
 
 func (s *testControlPlane) LookupCredentials(_ context.Context, req *apiv1.LookupCredentialsRequest) (*apiv1.LookupCredentialsResponse, error) {
@@ -96,19 +100,89 @@ func (s *testControlPlane) LookupBaseHost(_ context.Context, _ *apiv1.LookupBase
 }
 
 func (s *testControlPlane) LookupVBucket(_ context.Context, req *apiv1.LookupVBucketRequest) (*apiv1.LookupVBucketResponse, error) {
-	if req.BucketName != e2eVirtualBucket {
+	if req.AccessKeyId != e2eVirtualAccessKey {
+		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
+	}
+	if req.BucketName == e2eVirtualBucket {
+		return s.vbucketResponse("tenant-abc"), nil
+	}
+
+	s.mu.Lock()
+	_, found := s.createdBuckets[req.BucketName]
+	s.mu.Unlock()
+	if !found {
 		return nil, status.Errorf(codes.NotFound, "unknown bucket: %s", req.BucketName)
 	}
+	return s.vbucketResponse("created/" + req.BucketName), nil
+}
+
+func (s *testControlPlane) CreateVBucket(_ context.Context, req *apiv1.CreateVBucketRequest) (*apiv1.CreateVBucketResponse, error) {
+	if req.AccessKeyId != e2eVirtualAccessKey {
+		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if req.BucketName == e2eVirtualBucket {
+		return nil, status.Errorf(codes.AlreadyExists, "bucket already owned: %s", req.BucketName)
+	}
+	if _, exists := s.createdBuckets[req.BucketName]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "bucket already owned: %s", req.BucketName)
+	}
+	s.createdBuckets[req.BucketName] = time.Now().UTC()
+
+	resp := s.vbucketResponse("created/" + req.BucketName)
+	return &apiv1.CreateVBucketResponse{
+		RealEndpoint:     resp.RealEndpoint,
+		RealBucket:       resp.RealBucket,
+		RealAccessKey:    resp.RealAccessKey,
+		RealSecretKey:    resp.RealSecretKey,
+		RealRegion:       resp.RealRegion,
+		PathPrefix:       resp.PathPrefix,
+		RealUsePathStyle: resp.RealUsePathStyle,
+		Ttl:              resp.Ttl,
+	}, nil
+}
+
+func (s *testControlPlane) ListVBuckets(_ context.Context, req *apiv1.ListVBucketsRequest) (*apiv1.ListVBucketsResponse, error) {
+	if req.AccessKeyId != e2eVirtualAccessKey {
+		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	resp := &apiv1.ListVBucketsResponse{
+		Buckets: []*apiv1.VBucketSummary{{
+			BucketName:   e2eVirtualBucket,
+			CreationDate: timestamppb.New(time.Unix(0, 0).UTC()),
+		}},
+	}
+	var names []string
+	for name := range s.createdBuckets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		resp.Buckets = append(resp.Buckets, &apiv1.VBucketSummary{
+			BucketName:   name,
+			CreationDate: timestamppb.New(s.createdBuckets[name]),
+		})
+	}
+	return resp, nil
+}
+
+func (s *testControlPlane) vbucketResponse(pathPrefix string) *apiv1.LookupVBucketResponse {
 	return &apiv1.LookupVBucketResponse{
 		RealEndpoint:     s.garageEndpoint,
 		RealBucket:       garageBucket,
 		RealAccessKey:    garageAccessKey,
 		RealSecretKey:    garageSecretKey,
 		RealRegion:       "us-east-1",
-		PathPrefix:       "tenant-abc",
+		PathPrefix:       pathPrefix,
 		RealUsePathStyle: true,
 		Ttl:              durationpb.New(5 * time.Minute),
-	}, nil
+	}
 }
 
 func (s *testControlPlane) ListenForDeltas(_ *apiv1.ListenForDeltasRequest, stream apiv1.ControlPlane_ListenForDeltasServer) error {
@@ -181,7 +255,11 @@ func setupE2EWithPolicyJSON(t *testing.T, policyJSON string) *e2eEnv {
 	require.NoError(t, err)
 
 	grpcServer := grpc.NewServer()
-	apiv1.RegisterControlPlaneServer(grpcServer, &testControlPlane{garageEndpoint: garageEndpoint, policyJSON: policyJSON})
+	apiv1.RegisterControlPlaneServer(grpcServer, &testControlPlane{
+		garageEndpoint: garageEndpoint,
+		policyJSON:     policyJSON,
+		createdBuckets: make(map[string]time.Time),
+	})
 	go grpcServer.Serve(lis)
 	t.Cleanup(func() {
 		// Cancel context first so the ListenForDeltas stream unblocks,
@@ -404,4 +482,119 @@ func TestE2E_ControlPlane_IAMPolicyEnforcedBeforeProxy(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "AccessDenied")
+}
+
+func TestE2E_ControlPlane_CreateAndListVBuckets(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	t.Parallel()
+
+	policyJSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{"Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*"},
+			{"Effect": "Allow", "Action": "s3:CreateBucket", "Resource": "arn:aws:s3:::created-vbucket"},
+			{"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"], "Resource": "arn:aws:s3:::created-vbucket/*"}
+		]
+	}`
+
+	ctx := context.Background()
+	e := setupE2EWithPolicyJSON(t, policyJSON)
+
+	_, err := e.ProxyClient.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String("created-vbucket"),
+	})
+	require.NoError(t, err)
+
+	listResult, err := e.ProxyClient.ListBuckets(ctx, &s3.ListBucketsInput{})
+	require.NoError(t, err)
+	assert.Contains(t, bucketNames(listResult), "created-vbucket")
+
+	_, err = e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("created-vbucket"),
+		Key:    aws.String("hello.txt"),
+		Body:   strings.NewReader("created bucket body"),
+	})
+	require.NoError(t, err)
+
+	getResult, err := e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String("created-vbucket"),
+		Key:    aws.String("hello.txt"),
+	})
+	require.NoError(t, err)
+	defer getResult.Body.Close()
+
+	body, err := io.ReadAll(getResult.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "created bucket body", string(body))
+
+	_, err = e.ProxyClient.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String("created-vbucket"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "BucketAlreadyOwnedByYou")
+}
+
+func TestE2E_ControlPlane_CreateBucketDeniedDoesNotMutate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	t.Parallel()
+
+	policyJSON := `{
+		"Version": "2012-10-17",
+		"Statement": {
+			"Effect": "Allow",
+			"Action": "s3:ListAllMyBuckets",
+			"Resource": "*"
+		}
+	}`
+
+	ctx := context.Background()
+	e := setupE2EWithPolicyJSON(t, policyJSON)
+
+	_, err := e.ProxyClient.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String("denied-vbucket"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+
+	listResult, err := e.ProxyClient.ListBuckets(ctx, &s3.ListBucketsInput{})
+	require.NoError(t, err)
+	assert.NotContains(t, bucketNames(listResult), "denied-vbucket")
+}
+
+func TestE2E_ControlPlane_ListBucketsDenied(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	t.Parallel()
+
+	policyJSON := `{
+		"Version": "2012-10-17",
+		"Statement": {
+			"Effect": "Allow",
+			"Action": "s3:CreateBucket",
+			"Resource": "arn:aws:s3:::list-denied-vbucket"
+		}
+	}`
+
+	ctx := context.Background()
+	e := setupE2EWithPolicyJSON(t, policyJSON)
+
+	_, err := e.ProxyClient.ListBuckets(ctx, &s3.ListBucketsInput{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+}
+
+func bucketNames(result *s3.ListBucketsOutput) []string {
+	var names []string
+	for _, bucket := range result.Buckets {
+		if bucket.Name != nil {
+			names = append(names, *bucket.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

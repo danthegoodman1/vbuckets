@@ -18,6 +18,7 @@ var s3AllowedConditionKeys = map[string]bool{
 	"s3:prefix":                       true,
 	"s3:delimiter":                    true,
 	"s3:max-keys":                     true,
+	"s3:locationconstraint":           true,
 	"s3:authtype":                     true,
 	"s3:signatureversion":             true,
 	"s3:signatureage":                 true,
@@ -59,8 +60,8 @@ func ParseS3IAMPolicyJSON(policyJSON string) (*iam.Policy, error) {
 	})
 }
 
-func AuthorizeS3Request(policy *iam.Policy, r *http.Request, authInfo *AuthInfo, bucket, objectKey string) error {
-	checks, err := buildS3IAMRequests(r, bucket, objectKey, authInfo, time.Now().UTC())
+func AuthorizeS3Request(policy *iam.Policy, r *http.Request, authInfo *AuthInfo, bucket, objectKey, locationConstraint string) error {
+	checks, err := buildS3IAMRequests(r, bucket, objectKey, locationConstraint, authInfo, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -72,12 +73,12 @@ func AuthorizeS3Request(policy *iam.Policy, r *http.Request, authInfo *AuthInfo,
 	return nil
 }
 
-func buildS3IAMRequests(r *http.Request, bucket, objectKey string, authInfo *AuthInfo, now time.Time) ([]iam.Request, error) {
+func buildS3IAMRequests(r *http.Request, bucket, objectKey, locationConstraint string, authInfo *AuthInfo, now time.Time) ([]iam.Request, error) {
 	checks, err := mapS3IAMChecks(r, bucket, objectKey)
 	if err != nil {
 		return nil, err
 	}
-	ctx := buildS3IAMContext(r, authInfo, objectKey, now)
+	ctx := buildS3IAMContext(r, authInfo, objectKey, locationConstraint, now)
 	for i := range checks {
 		checks[i].Context = ctx
 	}
@@ -89,8 +90,20 @@ func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, e
 	bucketResource := s3BucketARN(bucket)
 	objectResource := s3ObjectARN(bucket, objectKey)
 
+	if bucket == "" && objectKey == "" {
+		if r.Method == http.MethodGet && queryHasOnlyIgnoredKeys(query) {
+			return []iam.Request{newIAMRequest("s3:ListAllMyBuckets", "*")}, nil
+		}
+		return nil, unsupportedS3Operation(r)
+	}
+
 	if objectKey == "" {
 		switch r.Method {
+		case http.MethodPut:
+			if queryHasOnlyIgnoredKeys(query) {
+				return []iam.Request{newIAMRequest("s3:CreateBucket", bucketResource)}, nil
+			}
+			return nil, unsupportedS3Operation(r)
 		case http.MethodGet:
 			if hasQueryKey(query, "uploads") {
 				return []iam.Request{newIAMRequest("s3:ListBucketMultipartUploads", bucketResource)}, nil
@@ -167,7 +180,7 @@ func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, e
 	}
 }
 
-func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, objectKey string, now time.Time) iam.Context {
+func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, objectKey, locationConstraint string, now time.Time) iam.Context {
 	ctx := iam.Context{
 		"s3:authtype":         []string{"REST-HEADER"},
 		"s3:signatureversion": []string{"AWS4-HMAC-SHA256"},
@@ -177,6 +190,9 @@ func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, objectKey string, no
 	}
 
 	query := r.URL.Query()
+	if locationConstraint != "" {
+		ctx["s3:locationconstraint"] = []string{locationConstraint}
+	}
 	if isBucketListLikeRequest(r.Method, objectKey, r.URL.RawQuery) {
 		ctx["s3:prefix"] = queryValuesOrDefault(query, "prefix", "")
 		if values, ok := query["delimiter"]; ok {

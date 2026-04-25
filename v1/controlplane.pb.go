@@ -10,6 +10,7 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -383,6 +384,306 @@ func (x *LookupVBucketResponse) GetTtl() *durationpb.Duration {
 	return nil
 }
 
+type CreateVBucketRequest struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	AccessKeyId        string                 `protobuf:"bytes,1,opt,name=access_key_id,json=accessKeyId,proto3" json:"access_key_id,omitempty"`
+	BucketName         string                 `protobuf:"bytes,2,opt,name=bucket_name,json=bucketName,proto3" json:"bucket_name,omitempty"`
+	LocationConstraint string                 `protobuf:"bytes,3,opt,name=location_constraint,json=locationConstraint,proto3" json:"location_constraint,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *CreateVBucketRequest) Reset() {
+	*x = CreateVBucketRequest{}
+	mi := &file_v1_controlplane_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateVBucketRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateVBucketRequest) ProtoMessage() {}
+
+func (x *CreateVBucketRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_controlplane_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateVBucketRequest.ProtoReflect.Descriptor instead.
+func (*CreateVBucketRequest) Descriptor() ([]byte, []int) {
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *CreateVBucketRequest) GetAccessKeyId() string {
+	if x != nil {
+		return x.AccessKeyId
+	}
+	return ""
+}
+
+func (x *CreateVBucketRequest) GetBucketName() string {
+	if x != nil {
+		return x.BucketName
+	}
+	return ""
+}
+
+func (x *CreateVBucketRequest) GetLocationConstraint() string {
+	if x != nil {
+		return x.LocationConstraint
+	}
+	return ""
+}
+
+type CreateVBucketResponse struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	RealEndpoint     string                 `protobuf:"bytes,1,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
+	RealBucket       string                 `protobuf:"bytes,2,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
+	RealAccessKey    string                 `protobuf:"bytes,3,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
+	RealSecretKey    string                 `protobuf:"bytes,4,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
+	RealRegion       string                 `protobuf:"bytes,5,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
+	PathPrefix       string                 `protobuf:"bytes,6,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
+	RealUsePathStyle bool                   `protobuf:"varint,7,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
+	Ttl              *durationpb.Duration   `protobuf:"bytes,8,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *CreateVBucketResponse) Reset() {
+	*x = CreateVBucketResponse{}
+	mi := &file_v1_controlplane_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateVBucketResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateVBucketResponse) ProtoMessage() {}
+
+func (x *CreateVBucketResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_controlplane_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateVBucketResponse.ProtoReflect.Descriptor instead.
+func (*CreateVBucketResponse) Descriptor() ([]byte, []int) {
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *CreateVBucketResponse) GetRealEndpoint() string {
+	if x != nil {
+		return x.RealEndpoint
+	}
+	return ""
+}
+
+func (x *CreateVBucketResponse) GetRealBucket() string {
+	if x != nil {
+		return x.RealBucket
+	}
+	return ""
+}
+
+func (x *CreateVBucketResponse) GetRealAccessKey() string {
+	if x != nil {
+		return x.RealAccessKey
+	}
+	return ""
+}
+
+func (x *CreateVBucketResponse) GetRealSecretKey() string {
+	if x != nil {
+		return x.RealSecretKey
+	}
+	return ""
+}
+
+func (x *CreateVBucketResponse) GetRealRegion() string {
+	if x != nil {
+		return x.RealRegion
+	}
+	return ""
+}
+
+func (x *CreateVBucketResponse) GetPathPrefix() string {
+	if x != nil {
+		return x.PathPrefix
+	}
+	return ""
+}
+
+func (x *CreateVBucketResponse) GetRealUsePathStyle() bool {
+	if x != nil {
+		return x.RealUsePathStyle
+	}
+	return false
+}
+
+func (x *CreateVBucketResponse) GetTtl() *durationpb.Duration {
+	if x != nil {
+		return x.Ttl
+	}
+	return nil
+}
+
+type ListVBucketsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AccessKeyId   string                 `protobuf:"bytes,1,opt,name=access_key_id,json=accessKeyId,proto3" json:"access_key_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListVBucketsRequest) Reset() {
+	*x = ListVBucketsRequest{}
+	mi := &file_v1_controlplane_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListVBucketsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListVBucketsRequest) ProtoMessage() {}
+
+func (x *ListVBucketsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_controlplane_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListVBucketsRequest.ProtoReflect.Descriptor instead.
+func (*ListVBucketsRequest) Descriptor() ([]byte, []int) {
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ListVBucketsRequest) GetAccessKeyId() string {
+	if x != nil {
+		return x.AccessKeyId
+	}
+	return ""
+}
+
+type VBucketSummary struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BucketName    string                 `protobuf:"bytes,1,opt,name=bucket_name,json=bucketName,proto3" json:"bucket_name,omitempty"`
+	CreationDate  *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=creation_date,json=creationDate,proto3" json:"creation_date,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VBucketSummary) Reset() {
+	*x = VBucketSummary{}
+	mi := &file_v1_controlplane_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VBucketSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VBucketSummary) ProtoMessage() {}
+
+func (x *VBucketSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_controlplane_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VBucketSummary.ProtoReflect.Descriptor instead.
+func (*VBucketSummary) Descriptor() ([]byte, []int) {
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *VBucketSummary) GetBucketName() string {
+	if x != nil {
+		return x.BucketName
+	}
+	return ""
+}
+
+func (x *VBucketSummary) GetCreationDate() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreationDate
+	}
+	return nil
+}
+
+type ListVBucketsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Buckets       []*VBucketSummary      `protobuf:"bytes,1,rep,name=buckets,proto3" json:"buckets,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListVBucketsResponse) Reset() {
+	*x = ListVBucketsResponse{}
+	mi := &file_v1_controlplane_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListVBucketsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListVBucketsResponse) ProtoMessage() {}
+
+func (x *ListVBucketsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_v1_controlplane_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListVBucketsResponse.ProtoReflect.Descriptor instead.
+func (*ListVBucketsResponse) Descriptor() ([]byte, []int) {
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ListVBucketsResponse) GetBuckets() []*VBucketSummary {
+	if x != nil {
+		return x.Buckets
+	}
+	return nil
+}
+
 type ListenForDeltasRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -391,7 +692,7 @@ type ListenForDeltasRequest struct {
 
 func (x *ListenForDeltasRequest) Reset() {
 	*x = ListenForDeltasRequest{}
-	mi := &file_v1_controlplane_proto_msgTypes[6]
+	mi := &file_v1_controlplane_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -403,7 +704,7 @@ func (x *ListenForDeltasRequest) String() string {
 func (*ListenForDeltasRequest) ProtoMessage() {}
 
 func (x *ListenForDeltasRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_controlplane_proto_msgTypes[6]
+	mi := &file_v1_controlplane_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -416,7 +717,7 @@ func (x *ListenForDeltasRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListenForDeltasRequest.ProtoReflect.Descriptor instead.
 func (*ListenForDeltasRequest) Descriptor() ([]byte, []int) {
-	return file_v1_controlplane_proto_rawDescGZIP(), []int{6}
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{11}
 }
 
 type Delta struct {
@@ -433,7 +734,7 @@ type Delta struct {
 
 func (x *Delta) Reset() {
 	*x = Delta{}
-	mi := &file_v1_controlplane_proto_msgTypes[7]
+	mi := &file_v1_controlplane_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -445,7 +746,7 @@ func (x *Delta) String() string {
 func (*Delta) ProtoMessage() {}
 
 func (x *Delta) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_controlplane_proto_msgTypes[7]
+	mi := &file_v1_controlplane_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -458,7 +759,7 @@ func (x *Delta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Delta.ProtoReflect.Descriptor instead.
 func (*Delta) Descriptor() ([]byte, []int) {
-	return file_v1_controlplane_proto_rawDescGZIP(), []int{7}
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Delta) GetDelta() isDelta_Delta {
@@ -533,7 +834,7 @@ type CredentialsDelta struct {
 
 func (x *CredentialsDelta) Reset() {
 	*x = CredentialsDelta{}
-	mi := &file_v1_controlplane_proto_msgTypes[8]
+	mi := &file_v1_controlplane_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -545,7 +846,7 @@ func (x *CredentialsDelta) String() string {
 func (*CredentialsDelta) ProtoMessage() {}
 
 func (x *CredentialsDelta) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_controlplane_proto_msgTypes[8]
+	mi := &file_v1_controlplane_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -558,7 +859,7 @@ func (x *CredentialsDelta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialsDelta.ProtoReflect.Descriptor instead.
 func (*CredentialsDelta) Descriptor() ([]byte, []int) {
-	return file_v1_controlplane_proto_rawDescGZIP(), []int{8}
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CredentialsDelta) GetAccessKeyId() string {
@@ -612,7 +913,7 @@ type BaseHostDelta struct {
 
 func (x *BaseHostDelta) Reset() {
 	*x = BaseHostDelta{}
-	mi := &file_v1_controlplane_proto_msgTypes[9]
+	mi := &file_v1_controlplane_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -624,7 +925,7 @@ func (x *BaseHostDelta) String() string {
 func (*BaseHostDelta) ProtoMessage() {}
 
 func (x *BaseHostDelta) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_controlplane_proto_msgTypes[9]
+	mi := &file_v1_controlplane_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -637,7 +938,7 @@ func (x *BaseHostDelta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BaseHostDelta.ProtoReflect.Descriptor instead.
 func (*BaseHostDelta) Descriptor() ([]byte, []int) {
-	return file_v1_controlplane_proto_rawDescGZIP(), []int{9}
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *BaseHostDelta) GetHostname() string {
@@ -697,7 +998,7 @@ type VBucketDelta struct {
 
 func (x *VBucketDelta) Reset() {
 	*x = VBucketDelta{}
-	mi := &file_v1_controlplane_proto_msgTypes[10]
+	mi := &file_v1_controlplane_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -709,7 +1010,7 @@ func (x *VBucketDelta) String() string {
 func (*VBucketDelta) ProtoMessage() {}
 
 func (x *VBucketDelta) ProtoReflect() protoreflect.Message {
-	mi := &file_v1_controlplane_proto_msgTypes[10]
+	mi := &file_v1_controlplane_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -722,7 +1023,7 @@ func (x *VBucketDelta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VBucketDelta.ProtoReflect.Descriptor instead.
 func (*VBucketDelta) Descriptor() ([]byte, []int) {
-	return file_v1_controlplane_proto_rawDescGZIP(), []int{10}
+	return file_v1_controlplane_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *VBucketDelta) GetAccessKeyId() string {
@@ -806,7 +1107,7 @@ var File_v1_controlplane_proto protoreflect.FileDescriptor
 
 const file_v1_controlplane_proto_rawDesc = "" +
 	"\n" +
-	"\x15v1/controlplane.proto\x12\vvbuckets.v1\x1a\x1egoogle/protobuf/duration.proto\">\n" +
+	"\x15v1/controlplane.proto\x12\vvbuckets.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\">\n" +
 	"\x18LookupCredentialsRequest\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\"\x8f\x01\n" +
 	"\x19LookupCredentialsResponse\x12\x1d\n" +
@@ -835,7 +1136,32 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\vpath_prefix\x18\x06 \x01(\tR\n" +
 	"pathPrefix\x12-\n" +
 	"\x13real_use_path_style\x18\a \x01(\bR\x10realUsePathStyle\x12+\n" +
-	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\x18\n" +
+	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\x8c\x01\n" +
+	"\x14CreateVBucketRequest\x12\"\n" +
+	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\x12\x1f\n" +
+	"\vbucket_name\x18\x02 \x01(\tR\n" +
+	"bucketName\x12/\n" +
+	"\x13location_constraint\x18\x03 \x01(\tR\x12locationConstraint\"\xcb\x02\n" +
+	"\x15CreateVBucketResponse\x12#\n" +
+	"\rreal_endpoint\x18\x01 \x01(\tR\frealEndpoint\x12\x1f\n" +
+	"\vreal_bucket\x18\x02 \x01(\tR\n" +
+	"realBucket\x12&\n" +
+	"\x0freal_access_key\x18\x03 \x01(\tR\rrealAccessKey\x12&\n" +
+	"\x0freal_secret_key\x18\x04 \x01(\tR\rrealSecretKey\x12\x1f\n" +
+	"\vreal_region\x18\x05 \x01(\tR\n" +
+	"realRegion\x12\x1f\n" +
+	"\vpath_prefix\x18\x06 \x01(\tR\n" +
+	"pathPrefix\x12-\n" +
+	"\x13real_use_path_style\x18\a \x01(\bR\x10realUsePathStyle\x12+\n" +
+	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"9\n" +
+	"\x13ListVBucketsRequest\x12\"\n" +
+	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\"r\n" +
+	"\x0eVBucketSummary\x12\x1f\n" +
+	"\vbucket_name\x18\x01 \x01(\tR\n" +
+	"bucketName\x12?\n" +
+	"\rcreation_date\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\fcreationDate\"M\n" +
+	"\x14ListVBucketsResponse\x125\n" +
+	"\abuckets\x18\x01 \x03(\v2\x1b.vbuckets.v1.VBucketSummaryR\abuckets\"\x18\n" +
 	"\x16ListenForDeltasRequest\"\xc5\x01\n" +
 	"\x05Delta\x12A\n" +
 	"\vcredentials\x18\x01 \x01(\v2\x1d.vbuckets.v1.CredentialsDeltaH\x00R\vcredentials\x129\n" +
@@ -871,11 +1197,13 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"pathPrefix\x12-\n" +
 	"\x13real_use_path_style\x18\n" +
 	" \x01(\bR\x10realUsePathStyle\x12+\n" +
-	"\x03ttl\x18\v \x01(\v2\x19.google.protobuf.DurationR\x03ttl2\xf3\x02\n" +
+	"\x03ttl\x18\v \x01(\v2\x19.google.protobuf.DurationR\x03ttl2\xa0\x04\n" +
 	"\fControlPlane\x12b\n" +
 	"\x11LookupCredentials\x12%.vbuckets.v1.LookupCredentialsRequest\x1a&.vbuckets.v1.LookupCredentialsResponse\x12Y\n" +
 	"\x0eLookupBaseHost\x12\".vbuckets.v1.LookupBaseHostRequest\x1a#.vbuckets.v1.LookupBaseHostResponse\x12V\n" +
-	"\rLookupVBucket\x12!.vbuckets.v1.LookupVBucketRequest\x1a\".vbuckets.v1.LookupVBucketResponse\x12L\n" +
+	"\rLookupVBucket\x12!.vbuckets.v1.LookupVBucketRequest\x1a\".vbuckets.v1.LookupVBucketResponse\x12V\n" +
+	"\rCreateVBucket\x12!.vbuckets.v1.CreateVBucketRequest\x1a\".vbuckets.v1.CreateVBucketResponse\x12S\n" +
+	"\fListVBuckets\x12 .vbuckets.v1.ListVBucketsRequest\x1a!.vbuckets.v1.ListVBucketsResponse\x12L\n" +
 	"\x0fListenForDeltas\x12#.vbuckets.v1.ListenForDeltasRequest\x1a\x12.vbuckets.v1.Delta0\x01B1Z/github.com/danthegoodman1/vbuckets/api/v1;apiv1b\x06proto3"
 
 var (
@@ -890,7 +1218,7 @@ func file_v1_controlplane_proto_rawDescGZIP() []byte {
 	return file_v1_controlplane_proto_rawDescData
 }
 
-var file_v1_controlplane_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_v1_controlplane_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_v1_controlplane_proto_goTypes = []any{
 	(*LookupCredentialsRequest)(nil),  // 0: vbuckets.v1.LookupCredentialsRequest
 	(*LookupCredentialsResponse)(nil), // 1: vbuckets.v1.LookupCredentialsResponse
@@ -898,36 +1226,49 @@ var file_v1_controlplane_proto_goTypes = []any{
 	(*LookupBaseHostResponse)(nil),    // 3: vbuckets.v1.LookupBaseHostResponse
 	(*LookupVBucketRequest)(nil),      // 4: vbuckets.v1.LookupVBucketRequest
 	(*LookupVBucketResponse)(nil),     // 5: vbuckets.v1.LookupVBucketResponse
-	(*ListenForDeltasRequest)(nil),    // 6: vbuckets.v1.ListenForDeltasRequest
-	(*Delta)(nil),                     // 7: vbuckets.v1.Delta
-	(*CredentialsDelta)(nil),          // 8: vbuckets.v1.CredentialsDelta
-	(*BaseHostDelta)(nil),             // 9: vbuckets.v1.BaseHostDelta
-	(*VBucketDelta)(nil),              // 10: vbuckets.v1.VBucketDelta
-	(*durationpb.Duration)(nil),       // 11: google.protobuf.Duration
+	(*CreateVBucketRequest)(nil),      // 6: vbuckets.v1.CreateVBucketRequest
+	(*CreateVBucketResponse)(nil),     // 7: vbuckets.v1.CreateVBucketResponse
+	(*ListVBucketsRequest)(nil),       // 8: vbuckets.v1.ListVBucketsRequest
+	(*VBucketSummary)(nil),            // 9: vbuckets.v1.VBucketSummary
+	(*ListVBucketsResponse)(nil),      // 10: vbuckets.v1.ListVBucketsResponse
+	(*ListenForDeltasRequest)(nil),    // 11: vbuckets.v1.ListenForDeltasRequest
+	(*Delta)(nil),                     // 12: vbuckets.v1.Delta
+	(*CredentialsDelta)(nil),          // 13: vbuckets.v1.CredentialsDelta
+	(*BaseHostDelta)(nil),             // 14: vbuckets.v1.BaseHostDelta
+	(*VBucketDelta)(nil),              // 15: vbuckets.v1.VBucketDelta
+	(*durationpb.Duration)(nil),       // 16: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),     // 17: google.protobuf.Timestamp
 }
 var file_v1_controlplane_proto_depIdxs = []int32{
-	11, // 0: vbuckets.v1.LookupCredentialsResponse.ttl:type_name -> google.protobuf.Duration
-	11, // 1: vbuckets.v1.LookupBaseHostResponse.ttl:type_name -> google.protobuf.Duration
-	11, // 2: vbuckets.v1.LookupVBucketResponse.ttl:type_name -> google.protobuf.Duration
-	8,  // 3: vbuckets.v1.Delta.credentials:type_name -> vbuckets.v1.CredentialsDelta
-	9,  // 4: vbuckets.v1.Delta.base_host:type_name -> vbuckets.v1.BaseHostDelta
-	10, // 5: vbuckets.v1.Delta.vbucket:type_name -> vbuckets.v1.VBucketDelta
-	11, // 6: vbuckets.v1.CredentialsDelta.ttl:type_name -> google.protobuf.Duration
-	11, // 7: vbuckets.v1.BaseHostDelta.ttl:type_name -> google.protobuf.Duration
-	11, // 8: vbuckets.v1.VBucketDelta.ttl:type_name -> google.protobuf.Duration
-	0,  // 9: vbuckets.v1.ControlPlane.LookupCredentials:input_type -> vbuckets.v1.LookupCredentialsRequest
-	2,  // 10: vbuckets.v1.ControlPlane.LookupBaseHost:input_type -> vbuckets.v1.LookupBaseHostRequest
-	4,  // 11: vbuckets.v1.ControlPlane.LookupVBucket:input_type -> vbuckets.v1.LookupVBucketRequest
-	6,  // 12: vbuckets.v1.ControlPlane.ListenForDeltas:input_type -> vbuckets.v1.ListenForDeltasRequest
-	1,  // 13: vbuckets.v1.ControlPlane.LookupCredentials:output_type -> vbuckets.v1.LookupCredentialsResponse
-	3,  // 14: vbuckets.v1.ControlPlane.LookupBaseHost:output_type -> vbuckets.v1.LookupBaseHostResponse
-	5,  // 15: vbuckets.v1.ControlPlane.LookupVBucket:output_type -> vbuckets.v1.LookupVBucketResponse
-	7,  // 16: vbuckets.v1.ControlPlane.ListenForDeltas:output_type -> vbuckets.v1.Delta
-	13, // [13:17] is the sub-list for method output_type
-	9,  // [9:13] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	16, // 0: vbuckets.v1.LookupCredentialsResponse.ttl:type_name -> google.protobuf.Duration
+	16, // 1: vbuckets.v1.LookupBaseHostResponse.ttl:type_name -> google.protobuf.Duration
+	16, // 2: vbuckets.v1.LookupVBucketResponse.ttl:type_name -> google.protobuf.Duration
+	16, // 3: vbuckets.v1.CreateVBucketResponse.ttl:type_name -> google.protobuf.Duration
+	17, // 4: vbuckets.v1.VBucketSummary.creation_date:type_name -> google.protobuf.Timestamp
+	9,  // 5: vbuckets.v1.ListVBucketsResponse.buckets:type_name -> vbuckets.v1.VBucketSummary
+	13, // 6: vbuckets.v1.Delta.credentials:type_name -> vbuckets.v1.CredentialsDelta
+	14, // 7: vbuckets.v1.Delta.base_host:type_name -> vbuckets.v1.BaseHostDelta
+	15, // 8: vbuckets.v1.Delta.vbucket:type_name -> vbuckets.v1.VBucketDelta
+	16, // 9: vbuckets.v1.CredentialsDelta.ttl:type_name -> google.protobuf.Duration
+	16, // 10: vbuckets.v1.BaseHostDelta.ttl:type_name -> google.protobuf.Duration
+	16, // 11: vbuckets.v1.VBucketDelta.ttl:type_name -> google.protobuf.Duration
+	0,  // 12: vbuckets.v1.ControlPlane.LookupCredentials:input_type -> vbuckets.v1.LookupCredentialsRequest
+	2,  // 13: vbuckets.v1.ControlPlane.LookupBaseHost:input_type -> vbuckets.v1.LookupBaseHostRequest
+	4,  // 14: vbuckets.v1.ControlPlane.LookupVBucket:input_type -> vbuckets.v1.LookupVBucketRequest
+	6,  // 15: vbuckets.v1.ControlPlane.CreateVBucket:input_type -> vbuckets.v1.CreateVBucketRequest
+	8,  // 16: vbuckets.v1.ControlPlane.ListVBuckets:input_type -> vbuckets.v1.ListVBucketsRequest
+	11, // 17: vbuckets.v1.ControlPlane.ListenForDeltas:input_type -> vbuckets.v1.ListenForDeltasRequest
+	1,  // 18: vbuckets.v1.ControlPlane.LookupCredentials:output_type -> vbuckets.v1.LookupCredentialsResponse
+	3,  // 19: vbuckets.v1.ControlPlane.LookupBaseHost:output_type -> vbuckets.v1.LookupBaseHostResponse
+	5,  // 20: vbuckets.v1.ControlPlane.LookupVBucket:output_type -> vbuckets.v1.LookupVBucketResponse
+	7,  // 21: vbuckets.v1.ControlPlane.CreateVBucket:output_type -> vbuckets.v1.CreateVBucketResponse
+	10, // 22: vbuckets.v1.ControlPlane.ListVBuckets:output_type -> vbuckets.v1.ListVBucketsResponse
+	12, // 23: vbuckets.v1.ControlPlane.ListenForDeltas:output_type -> vbuckets.v1.Delta
+	18, // [18:24] is the sub-list for method output_type
+	12, // [12:18] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_v1_controlplane_proto_init() }
@@ -935,7 +1276,7 @@ func file_v1_controlplane_proto_init() {
 	if File_v1_controlplane_proto != nil {
 		return
 	}
-	file_v1_controlplane_proto_msgTypes[7].OneofWrappers = []any{
+	file_v1_controlplane_proto_msgTypes[12].OneofWrappers = []any{
 		(*Delta_Credentials)(nil),
 		(*Delta_BaseHost)(nil),
 		(*Delta_Vbucket)(nil),
@@ -946,7 +1287,7 @@ func file_v1_controlplane_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_v1_controlplane_proto_rawDesc), len(file_v1_controlplane_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

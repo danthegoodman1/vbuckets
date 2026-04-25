@@ -22,6 +22,8 @@ const (
 	ControlPlane_LookupCredentials_FullMethodName = "/vbuckets.v1.ControlPlane/LookupCredentials"
 	ControlPlane_LookupBaseHost_FullMethodName    = "/vbuckets.v1.ControlPlane/LookupBaseHost"
 	ControlPlane_LookupVBucket_FullMethodName     = "/vbuckets.v1.ControlPlane/LookupVBucket"
+	ControlPlane_CreateVBucket_FullMethodName     = "/vbuckets.v1.ControlPlane/CreateVBucket"
+	ControlPlane_ListVBuckets_FullMethodName      = "/vbuckets.v1.ControlPlane/ListVBuckets"
 	ControlPlane_ListenForDeltas_FullMethodName   = "/vbuckets.v1.ControlPlane/ListenForDeltas"
 )
 
@@ -36,6 +38,8 @@ type ControlPlaneClient interface {
 	LookupCredentials(ctx context.Context, in *LookupCredentialsRequest, opts ...grpc.CallOption) (*LookupCredentialsResponse, error)
 	LookupBaseHost(ctx context.Context, in *LookupBaseHostRequest, opts ...grpc.CallOption) (*LookupBaseHostResponse, error)
 	LookupVBucket(ctx context.Context, in *LookupVBucketRequest, opts ...grpc.CallOption) (*LookupVBucketResponse, error)
+	CreateVBucket(ctx context.Context, in *CreateVBucketRequest, opts ...grpc.CallOption) (*CreateVBucketResponse, error)
+	ListVBuckets(ctx context.Context, in *ListVBucketsRequest, opts ...grpc.CallOption) (*ListVBucketsResponse, error)
 	// ListenForDeltas opens a server-streaming RPC that pushes cache updates
 	// to the proxy. The control plane sends deltas whenever credentials, base
 	// hosts, or vbucket mappings change, allowing the proxy to maintain
@@ -81,6 +85,26 @@ func (c *controlPlaneClient) LookupVBucket(ctx context.Context, in *LookupVBucke
 	return out, nil
 }
 
+func (c *controlPlaneClient) CreateVBucket(ctx context.Context, in *CreateVBucketRequest, opts ...grpc.CallOption) (*CreateVBucketResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateVBucketResponse)
+	err := c.cc.Invoke(ctx, ControlPlane_CreateVBucket_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneClient) ListVBuckets(ctx context.Context, in *ListVBucketsRequest, opts ...grpc.CallOption) (*ListVBucketsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListVBucketsResponse)
+	err := c.cc.Invoke(ctx, ControlPlane_ListVBuckets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlPlaneClient) ListenForDeltas(ctx context.Context, in *ListenForDeltasRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Delta], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &ControlPlane_ServiceDesc.Streams[0], ControlPlane_ListenForDeltas_FullMethodName, cOpts...)
@@ -111,6 +135,8 @@ type ControlPlaneServer interface {
 	LookupCredentials(context.Context, *LookupCredentialsRequest) (*LookupCredentialsResponse, error)
 	LookupBaseHost(context.Context, *LookupBaseHostRequest) (*LookupBaseHostResponse, error)
 	LookupVBucket(context.Context, *LookupVBucketRequest) (*LookupVBucketResponse, error)
+	CreateVBucket(context.Context, *CreateVBucketRequest) (*CreateVBucketResponse, error)
+	ListVBuckets(context.Context, *ListVBucketsRequest) (*ListVBucketsResponse, error)
 	// ListenForDeltas opens a server-streaming RPC that pushes cache updates
 	// to the proxy. The control plane sends deltas whenever credentials, base
 	// hosts, or vbucket mappings change, allowing the proxy to maintain
@@ -134,6 +160,12 @@ func (UnimplementedControlPlaneServer) LookupBaseHost(context.Context, *LookupBa
 }
 func (UnimplementedControlPlaneServer) LookupVBucket(context.Context, *LookupVBucketRequest) (*LookupVBucketResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupVBucket not implemented")
+}
+func (UnimplementedControlPlaneServer) CreateVBucket(context.Context, *CreateVBucketRequest) (*CreateVBucketResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateVBucket not implemented")
+}
+func (UnimplementedControlPlaneServer) ListVBuckets(context.Context, *ListVBucketsRequest) (*ListVBucketsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListVBuckets not implemented")
 }
 func (UnimplementedControlPlaneServer) ListenForDeltas(*ListenForDeltasRequest, grpc.ServerStreamingServer[Delta]) error {
 	return status.Error(codes.Unimplemented, "method ListenForDeltas not implemented")
@@ -213,6 +245,42 @@ func _ControlPlane_LookupVBucket_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlane_CreateVBucket_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateVBucketRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServer).CreateVBucket(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlane_CreateVBucket_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServer).CreateVBucket(ctx, req.(*CreateVBucketRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlane_ListVBuckets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListVBucketsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServer).ListVBuckets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlane_ListVBuckets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServer).ListVBuckets(ctx, req.(*ListVBucketsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ControlPlane_ListenForDeltas_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(ListenForDeltasRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -242,6 +310,14 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "LookupVBucket",
 			Handler:    _ControlPlane_LookupVBucket_Handler,
+		},
+		{
+			MethodName: "CreateVBucket",
+			Handler:    _ControlPlane_CreateVBucket_Handler,
+		},
+		{
+			MethodName: "ListVBuckets",
+			Handler:    _ControlPlane_ListVBuckets_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

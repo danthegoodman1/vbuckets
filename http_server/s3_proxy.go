@@ -1,6 +1,8 @@
 package http_server
 
 import (
+	"encoding/xml"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -37,12 +39,125 @@ func RegisterS3Routes(resolver Resolver) RegisterRoutes {
 	return func(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(S3Auth(resolver))
-			r.HandleFunc("/*", handleS3Request)
+			r.HandleFunc("/*", handleS3Request(resolver))
 		})
 	}
 }
 
-func handleS3Request(w http.ResponseWriter, r *http.Request) {
+func handleS3Request(resolver Resolver) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch getS3Operation(r.Context()) {
+		case s3OperationCreateBucket:
+			handleCreateVBucket(resolver, w, r)
+		case s3OperationListBuckets:
+			handleListVBuckets(resolver, w, r)
+		default:
+			proxyS3Request(w, r)
+		}
+	}
+}
+
+func handleCreateVBucket(resolver Resolver, w http.ResponseWriter, r *http.Request) {
+	authInfo := getAuthInfo(r.Context())
+	bucket := getBucketName(r.Context())
+	locationConstraint := getCreateLocationConstraint(r.Context())
+
+	if _, err := resolver.CreateVBucket(r.Context(), authInfo.AccessKeyID, bucket, locationConstraint); err != nil {
+		writeCreateVBucketError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("Location", "/"+bucket)
+	w.WriteHeader(http.StatusOK)
+	_ = xml.NewEncoder(w).Encode(createBucketResult{
+		Xmlns:    s3XMLNamespace,
+		Location: "/" + bucket,
+	})
+}
+
+func handleListVBuckets(resolver Resolver, w http.ResponseWriter, r *http.Request) {
+	authInfo := getAuthInfo(r.Context())
+	buckets, err := resolver.ListVBuckets(r.Context(), authInfo.AccessKeyID)
+	if err != nil {
+		writeListVBucketsError(w, err)
+		return
+	}
+
+	result := listAllMyBucketsResult{
+		Xmlns: s3XMLNamespace,
+		Owner: listBucketsOwner{
+			ID:          authInfo.AccessKeyID,
+			DisplayName: authInfo.AccessKeyID,
+		},
+	}
+	for _, bucket := range buckets {
+		result.Buckets.Buckets = append(result.Buckets.Buckets, listBucketEntry{
+			Name:         bucket.Name,
+			CreationDate: bucket.CreationDate.UTC().Format(time.RFC3339),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	_ = xml.NewEncoder(w).Encode(result)
+}
+
+const s3XMLNamespace = "http://s3.amazonaws.com/doc/2006-03-01/"
+
+type createBucketResult struct {
+	XMLName  xml.Name `xml:"CreateBucketResult"`
+	Xmlns    string   `xml:"xmlns,attr,omitempty"`
+	Location string   `xml:"Location,omitempty"`
+}
+
+type listAllMyBucketsResult struct {
+	XMLName xml.Name           `xml:"ListAllMyBucketsResult"`
+	Xmlns   string             `xml:"xmlns,attr,omitempty"`
+	Owner   listBucketsOwner   `xml:"Owner"`
+	Buckets listBucketsWrapper `xml:"Buckets"`
+}
+
+type listBucketsOwner struct {
+	ID          string `xml:"ID"`
+	DisplayName string `xml:"DisplayName"`
+}
+
+type listBucketsWrapper struct {
+	Buckets []listBucketEntry `xml:"Bucket"`
+}
+
+type listBucketEntry struct {
+	Name         string `xml:"Name"`
+	CreationDate string `xml:"CreationDate"`
+}
+
+func writeCreateVBucketError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrVBucketAlreadyOwnedByYou):
+		writeS3Error(w, http.StatusConflict, "BucketAlreadyOwnedByYou", "Your previous request to create the named bucket succeeded and you already own it.")
+	case errors.Is(err, ErrVBucketAlreadyExists):
+		writeS3Error(w, http.StatusConflict, "BucketAlreadyExists", "The requested bucket name is not available.")
+	case errors.Is(err, ErrInvalidVBucketName):
+		writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "The specified bucket is not valid.")
+	case errors.Is(err, ErrInvalidVBucketArgument):
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid bucket creation argument.")
+	case errors.Is(err, ErrVBucketAccessDenied):
+		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+	default:
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create bucket")
+	}
+}
+
+func writeListVBucketsError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrVBucketAccessDenied) {
+		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return
+	}
+	writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to list buckets")
+}
+
+func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 	logger := zerolog.Ctx(r.Context())
 
 	vbConfig := getVBucketConfig(r.Context())

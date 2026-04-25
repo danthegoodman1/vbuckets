@@ -14,9 +14,11 @@ import (
 	"github.com/maypok86/otter/v2"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/danthegoodman1/vbuckets/http_server"
 	apiv1 "github.com/danthegoodman1/vbuckets/v1"
@@ -376,4 +378,81 @@ func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName stri
 		return nil, err
 	}
 	return result.VBucketConfig, nil
+}
+
+func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*http_server.VBucketConfig, error) {
+	client := c.getClient()
+	if client == nil {
+		return nil, errNotConnected
+	}
+	resp, err := client.CreateVBucket(ctx, &apiv1.CreateVBucketRequest{
+		AccessKeyId:        accessKeyID,
+		BucketName:         bucketName,
+		LocationConstraint: locationConstraint,
+	})
+	if err != nil {
+		return nil, mapCreateVBucketError(err)
+	}
+
+	cfg := &http_server.VBucketConfig{
+		RealEndpoint:     resp.RealEndpoint,
+		RealBucket:       resp.RealBucket,
+		RealAccessKey:    resp.RealAccessKey,
+		RealSecretKey:    resp.RealSecretKey,
+		RealRegion:       resp.RealRegion,
+		PathPrefix:       resp.PathPrefix,
+		RealUsePathStyle: resp.RealUsePathStyle,
+	}
+	c.caches.vbuckets.Set(vbucketCacheKey(accessKeyID, bucketName), cachedVBucket{
+		VBucketConfig: cfg,
+		TTL:           resp.Ttl.AsDuration(),
+	})
+	return cfg, nil
+}
+
+func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) ([]http_server.ListedVBucket, error) {
+	client := c.getClient()
+	if client == nil {
+		return nil, errNotConnected
+	}
+	resp, err := client.ListVBuckets(ctx, &apiv1.ListVBucketsRequest{
+		AccessKeyId: accessKeyID,
+	})
+	if err != nil {
+		return nil, mapListVBucketsError(err)
+	}
+
+	buckets := make([]http_server.ListedVBucket, 0, len(resp.Buckets))
+	for _, bucket := range resp.Buckets {
+		listed := http_server.ListedVBucket{Name: bucket.BucketName}
+		if bucket.CreationDate != nil {
+			listed.CreationDate = bucket.CreationDate.AsTime()
+		}
+		buckets = append(buckets, listed)
+	}
+	return buckets, nil
+}
+
+func mapCreateVBucketError(err error) error {
+	switch status.Code(err) {
+	case codes.AlreadyExists:
+		return fmt.Errorf("%w: %v", http_server.ErrVBucketAlreadyOwnedByYou, err)
+	case codes.Aborted, codes.FailedPrecondition:
+		return fmt.Errorf("%w: %v", http_server.ErrVBucketAlreadyExists, err)
+	case codes.InvalidArgument:
+		return fmt.Errorf("%w: %v", http_server.ErrInvalidVBucketArgument, err)
+	case codes.PermissionDenied, codes.Unauthenticated, codes.NotFound:
+		return fmt.Errorf("%w: %v", http_server.ErrVBucketAccessDenied, err)
+	default:
+		return err
+	}
+}
+
+func mapListVBucketsError(err error) error {
+	switch status.Code(err) {
+	case codes.PermissionDenied, codes.Unauthenticated, codes.NotFound:
+		return fmt.Errorf("%w: %v", http_server.ErrVBucketAccessDenied, err)
+	default:
+		return err
+	}
 }

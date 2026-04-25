@@ -19,7 +19,7 @@ Designed for whitelabeling -- give tenants their own bucket names, access keys, 
                  +------------+
 ```
 
-Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
+Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
 
 ## Lookup functions
 
@@ -30,10 +30,12 @@ The auth middleware is split into two phases with three distinct lookups, each i
 | `LookupCredentials` | access key ID | secret key, IAM policy, TTL |
 | `LookupBaseHost` | request hostname | base domain (if registered), TTL |
 | `LookupVBucket` | access key ID + bucket name | real endpoint, bucket, region, path prefix, addressing style, TTL |
+| `CreateVBucket` | access key ID + bucket name + location constraint | real endpoint, bucket, region, path prefix, addressing style, TTL |
+| `ListVBuckets` | access key ID | visible virtual bucket names and creation dates |
 
 `LookupBaseHost` determines whether an incoming request is virtual-hosted style (`bucket.s3.example.com`) or path style (`s3.example.com/bucket`) by checking if the hostname is (or is a subdomain of) a registered base domain. The set of base domains changes extremely rarely, so this is aggressively cacheable.
 
-**Phase 1 (authentication)** runs `LookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the bucket via `LookupBaseHost` + `LookupVBucket`, then checks IAM permissions. This separation means credential caches don't need to be invalidated when bucket mappings change and vice versa.
+**Phase 1 (authentication)** runs `LookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the request shape and checks IAM permissions. Object and bucket-object operations use `LookupBaseHost` + `LookupVBucket` before proxying. `CreateBucket` uses `CreateVBucket`, and `ListBuckets` uses `ListVBuckets`; neither operation is forwarded to the origin service.
 
 ## Path prefix rewriting
 
@@ -56,6 +58,8 @@ the incoming request:
   `Action`/`NotAction`, `Resource`/`NotResource`, and conditions for string,
   bool, null, numeric, and date comparisons.
 - Supported S3 actions:
+  - `s3:ListAllMyBuckets`
+  - `s3:CreateBucket`
   - `s3:ListBucket`
   - `s3:ListBucketMultipartUploads`
   - `s3:GetObject`
@@ -84,11 +88,13 @@ service ControlPlane {
   rpc LookupCredentials(LookupCredentialsRequest) returns (LookupCredentialsResponse);
   rpc LookupBaseHost(LookupBaseHostRequest) returns (LookupBaseHostResponse);
   rpc LookupVBucket(LookupVBucketRequest) returns (LookupVBucketResponse);
+  rpc CreateVBucket(CreateVBucketRequest) returns (CreateVBucketResponse);
+  rpc ListVBuckets(ListVBucketsRequest) returns (ListVBucketsResponse);
   rpc ListenForDeltas(ListenForDeltasRequest) returns (stream Delta);
 }
 ```
 
-The three unary RPCs handle on-demand lookups. Each response includes a `ttl` field that controls how long the proxy caches that entry.
+The unary RPCs handle on-demand lookups and intercepted create/list operations. Lookup and create responses include a `ttl` field that controls how long the proxy caches that entry.
 
 ### Delta stream
 

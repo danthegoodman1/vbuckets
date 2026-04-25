@@ -2,11 +2,21 @@ package http_server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/danthegoodman1/vbuckets/iam"
+)
+
+var (
+	ErrVBucketAlreadyOwnedByYou = errors.New("vbucket already owned by you")
+	ErrVBucketAlreadyExists     = errors.New("vbucket already exists")
+	ErrInvalidVBucketName       = errors.New("invalid vbucket name")
+	ErrInvalidVBucketArgument   = errors.New("invalid vbucket argument")
+	ErrVBucketAccessDenied      = errors.New("vbucket access denied")
 )
 
 // Resolver provides the three lookups the proxy needs. Implemented by
@@ -15,6 +25,8 @@ type Resolver interface {
 	LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
 	LookupBaseHost(ctx context.Context, hostname string) (string, bool, error)
 	LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
+	CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error)
+	ListVBuckets(ctx context.Context, accessKeyID string) ([]ListedVBucket, error)
 }
 
 // VirtualCredentials holds the secret key and IAM policy for a virtual access key ID.
@@ -36,6 +48,11 @@ type VBucketConfig struct {
 	RealRegion       string
 	PathPrefix       string // optional prefix prepended to object keys
 	RealUsePathStyle bool   // when true, use path-style addressing to the real backend
+}
+
+type ListedVBucket struct {
+	Name         string
+	CreationDate time.Time
 }
 
 // resolveBucket determines the bucket name and object key from the request,

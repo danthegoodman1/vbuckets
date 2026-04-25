@@ -5,6 +5,7 @@ package vbuckets.v1;
 option go_package = "github.com/danthegoodman1/vbuckets/api/v1;apiv1";
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 // ControlPlane is the service that users implement on their control plane
 // server. The vbuckets proxy connects to this service to resolve virtual
@@ -13,6 +14,8 @@ service ControlPlane {
   rpc LookupCredentials(LookupCredentialsRequest) returns (LookupCredentialsResponse);
   rpc LookupBaseHost(LookupBaseHostRequest) returns (LookupBaseHostResponse);
   rpc LookupVBucket(LookupVBucketRequest) returns (LookupVBucketResponse);
+  rpc CreateVBucket(CreateVBucketRequest) returns (CreateVBucketResponse);
+  rpc ListVBuckets(ListVBucketsRequest) returns (ListVBucketsResponse);
 
   // ListenForDeltas opens a server-streaming RPC that pushes cache updates
   // to the proxy. The control plane sends deltas whenever credentials, base
@@ -56,6 +59,36 @@ message LookupVBucketResponse {
   string path_prefix = 6;
   bool real_use_path_style = 7;
   google.protobuf.Duration ttl = 8;
+}
+
+message CreateVBucketRequest {
+  string access_key_id = 1;
+  string bucket_name = 2;
+  string location_constraint = 3;
+}
+
+message CreateVBucketResponse {
+  string real_endpoint = 1;
+  string real_bucket = 2;
+  string real_access_key = 3;
+  string real_secret_key = 4;
+  string real_region = 5;
+  string path_prefix = 6;
+  bool real_use_path_style = 7;
+  google.protobuf.Duration ttl = 8;
+}
+
+message ListVBucketsRequest {
+  string access_key_id = 1;
+}
+
+message VBucketSummary {
+  string bucket_name = 1;
+  google.protobuf.Timestamp creation_date = 2;
+}
+
+message ListVBucketsResponse {
+  repeated VBucketSummary buckets = 1;
 }
 
 message ListenForDeltasRequest {}
