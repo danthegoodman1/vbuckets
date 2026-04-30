@@ -57,7 +57,7 @@ func TestHandleS3Request_ListRewriteStreaming_RemovesStaleContentLength(t *testi
 	proxy := httptest.NewServer(router)
 	t.Cleanup(proxy.Close)
 
-	req := signedRequest(t, http.MethodGet, proxy.URL+"/"+testBucket+"?list-type=2", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodGet, proxy.URL+"/"+testBucket+"?list-type=2", nil, unsignedPayload, validCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)

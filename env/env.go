@@ -33,6 +33,8 @@ var (
 	UpstreamResponseHeaderTimeout = GetEnvOrDefaultDuration("UPSTREAM_RESPONSE_HEADER_TIMEOUT", 30*time.Second)
 	UpstreamExpectContinueTimeout = GetEnvOrDefaultDuration("UPSTREAM_EXPECT_CONTINUE_TIMEOUT", 1*time.Second)
 	UpstreamIdleConnTimeout       = GetEnvOrDefaultDuration("UPSTREAM_IDLE_CONN_TIMEOUT", 90*time.Second)
+	UpstreamMaxIdleConns          = GetEnvOrDefaultInt("UPSTREAM_MAX_IDLE_CONNS", 100)
+	UpstreamMaxIdleConnsPerHost   = GetEnvOrDefaultInt("UPSTREAM_MAX_IDLE_CONNS_PER_HOST", 100)
 
 	CacheMaxCredentials = GetEnvOrDefaultInt("CACHE_MAX_CREDENTIALS", 10_000)
 	CacheMaxBaseHosts   = GetEnvOrDefaultInt("CACHE_MAX_BASE_HOSTS", 10_000)

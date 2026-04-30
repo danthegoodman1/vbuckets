@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/danthegoodman1/vbuckets/http_server"
 	apiv1 "github.com/danthegoodman1/vbuckets/v1"
@@ -229,12 +230,18 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 				c.logger.Error().Err(err).Str("accessKeyID", cd.AccessKeyId).Msg("invalid credential IAM policy in delta")
 				return
 			}
+			ttl, err := cacheTTL("credentials delta", cd.Ttl)
+			if err != nil {
+				c.caches.credentials.Invalidate(cd.AccessKeyId)
+				c.logger.Error().Err(err).Str("accessKeyID", cd.AccessKeyId).Msg("invalid credential TTL in delta")
+				return
+			}
 			c.caches.credentials.Set(cd.AccessKeyId, cachedCredentials{
 				VirtualCredentials: &http_server.VirtualCredentials{
 					SecretKey: cd.SecretKey,
 					IAMPolicy: policy,
 				},
-				TTL: cd.Ttl.AsDuration(),
+				TTL: ttl,
 			})
 			c.logger.Debug().Str("accessKeyID", cd.AccessKeyId).Msg("credential upserted via delta")
 		}
@@ -245,10 +252,16 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 			c.caches.baseHosts.Invalidate(bh.Hostname)
 			c.logger.Debug().Str("hostname", bh.Hostname).Msg("base host removed via delta")
 		} else {
+			ttl, err := cacheTTL("base host delta", bh.Ttl)
+			if err != nil {
+				c.caches.baseHosts.Invalidate(bh.Hostname)
+				c.logger.Error().Err(err).Str("hostname", bh.Hostname).Msg("invalid base host TTL in delta")
+				return
+			}
 			c.caches.baseHosts.Set(bh.Hostname, cachedBaseHost{
 				BaseHost: bh.BaseHost,
 				Found:    bh.Found,
-				TTL:      bh.Ttl.AsDuration(),
+				TTL:      ttl,
 			})
 			c.logger.Debug().Str("hostname", bh.Hostname).Msg("base host upserted via delta")
 		}
@@ -260,6 +273,12 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 			c.caches.vbuckets.Invalidate(key)
 			c.logger.Debug().Str("key", key).Msg("vbucket removed via delta")
 		} else {
+			ttl, err := cacheTTL("vbucket delta", vb.Ttl)
+			if err != nil {
+				c.caches.vbuckets.Invalidate(key)
+				c.logger.Error().Err(err).Str("key", key).Msg("invalid vbucket TTL in delta")
+				return
+			}
 			c.caches.vbuckets.Set(key, cachedVBucket{
 				VBucketConfig: &http_server.VBucketConfig{
 					RealEndpoint:     vb.RealEndpoint,
@@ -270,7 +289,7 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 					PathPrefix:       vb.PathPrefix,
 					RealUsePathStyle: vb.RealUsePathStyle,
 				},
-				TTL: vb.Ttl.AsDuration(),
+				TTL: ttl,
 			})
 			c.logger.Debug().Str("key", key).Msg("vbucket upserted via delta")
 		}
@@ -278,6 +297,20 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 	default:
 		c.logger.Warn().Msg("received unknown delta type")
 	}
+}
+
+func cacheTTL(source string, ttl *durationpb.Duration) (time.Duration, error) {
+	if ttl == nil {
+		return 0, fmt.Errorf("%s TTL is required", source)
+	}
+	if err := ttl.CheckValid(); err != nil {
+		return 0, fmt.Errorf("%s TTL is invalid: %w", source, err)
+	}
+	duration := ttl.AsDuration()
+	if duration <= 0 {
+		return 0, fmt.Errorf("%s TTL must be positive", source)
+	}
+	return duration, nil
 }
 
 func (c *Client) getClient() apiv1.ControlPlaneClient {
@@ -298,6 +331,10 @@ func (c *Client) LookupCredentials(ctx context.Context, accessKeyID string) (*ht
 		if err != nil {
 			return cachedCredentials{}, err
 		}
+		ttl, err := cacheTTL("LookupCredentials response", resp.Ttl)
+		if err != nil {
+			return cachedCredentials{}, err
+		}
 		policy, err := http_server.ParseS3IAMPolicyJSON(resp.IamPolicyJson)
 		if err != nil {
 			return cachedCredentials{}, err
@@ -307,7 +344,7 @@ func (c *Client) LookupCredentials(ctx context.Context, accessKeyID string) (*ht
 				SecretKey: resp.SecretKey,
 				IAMPolicy: policy,
 			},
-			TTL: resp.Ttl.AsDuration(),
+			TTL: ttl,
 		}, nil
 	})
 
@@ -330,10 +367,14 @@ func (c *Client) LookupBaseHost(ctx context.Context, hostname string) (string, b
 		if err != nil {
 			return cachedBaseHost{}, err
 		}
+		ttl, err := cacheTTL("LookupBaseHost response", resp.Ttl)
+		if err != nil {
+			return cachedBaseHost{}, err
+		}
 		return cachedBaseHost{
 			BaseHost: resp.BaseHost,
 			Found:    resp.Found,
-			TTL:      resp.Ttl.AsDuration(),
+			TTL:      ttl,
 		}, nil
 	})
 
@@ -359,6 +400,10 @@ func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName stri
 		if err != nil {
 			return cachedVBucket{}, err
 		}
+		ttl, err := cacheTTL("LookupVBucket response", resp.Ttl)
+		if err != nil {
+			return cachedVBucket{}, err
+		}
 		return cachedVBucket{
 			VBucketConfig: &http_server.VBucketConfig{
 				RealEndpoint:     resp.RealEndpoint,
@@ -369,7 +414,7 @@ func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName stri
 				PathPrefix:       resp.PathPrefix,
 				RealUsePathStyle: resp.RealUsePathStyle,
 			},
-			TTL: resp.Ttl.AsDuration(),
+			TTL: ttl,
 		}, nil
 	})
 
@@ -403,10 +448,14 @@ func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, loc
 		PathPrefix:       resp.PathPrefix,
 		RealUsePathStyle: resp.RealUsePathStyle,
 	}
-	c.caches.vbuckets.Set(vbucketCacheKey(accessKeyID, bucketName), cachedVBucket{
-		VBucketConfig: cfg,
-		TTL:           resp.Ttl.AsDuration(),
-	})
+	if ttl, err := cacheTTL("CreateVBucket response", resp.Ttl); err != nil {
+		c.logger.Error().Err(err).Str("accessKeyID", accessKeyID).Str("bucket", bucketName).Msg("skipping vbucket cache warm due to invalid TTL")
+	} else {
+		c.caches.vbuckets.Set(vbucketCacheKey(accessKeyID, bucketName), cachedVBucket{
+			VBucketConfig: cfg,
+			TTL:           ttl,
+		})
+	}
 	return cfg, nil
 }
 

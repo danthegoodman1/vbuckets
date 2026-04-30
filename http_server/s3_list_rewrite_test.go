@@ -23,7 +23,7 @@ func TestRewriteListResponse_StreamRewritesExpectedFields(t *testing.T) {
 </ListBucketResult>`
 
 	var output bytes.Buffer
-	err := rewriteListResponse(strings.NewReader(input), &output, "tenant-abc/", "virtual-bucket")
+	err := rewriteListResponse(strings.NewReader(input), &output, "tenant-abc/", "virtual-bucket", false)
 	require.NoError(t, err)
 
 	got := output.String()
@@ -46,11 +46,40 @@ func TestRewriteListResponse_StreamHandlesLargeBody(t *testing.T) {
 	input.WriteString(`</ListBucketResult>`)
 
 	var output bytes.Buffer
-	err := rewriteListResponse(strings.NewReader(input.String()), &output, "tenant-abc/", "virtual-bucket")
+	err := rewriteListResponse(strings.NewReader(input.String()), &output, "tenant-abc/", "virtual-bucket", false)
 	require.NoError(t, err)
 
 	got := output.String()
 	assert.Contains(t, got, "<Name>virtual-bucket</Name>")
 	assert.Contains(t, got, "<Key>file-2499.txt</Key>")
 	assert.NotContains(t, got, "tenant-abc/file-")
+}
+
+func TestRewriteListResponse_StreamRewritesURLEncodedFields(t *testing.T) {
+	input := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>real-bucket</Name>
+  <EncodingType>url</EncodingType>
+  <Prefix>tenant-abc%2Fdir%2F</Prefix>
+  <StartAfter>tenant-abc%2Faa%20one</StartAfter>
+  <Marker>tenant-abc%2Fmm%2Bplus</Marker>
+  <NextMarker>tenant-abc%2Fnn%2Fnext</NextMarker>
+  <Contents><Key>tenant-abc%2Fdir%2Fa%20file.txt</Key></Contents>
+  <CommonPrefixes><Prefix>tenant-abc%2Fdir%2Fsub%2F</Prefix></CommonPrefixes>
+</ListBucketResult>`
+
+	var output bytes.Buffer
+	err := rewriteListResponse(strings.NewReader(input), &output, "tenant-abc/", "virtual-bucket", true)
+	require.NoError(t, err)
+
+	got := output.String()
+	assert.Contains(t, got, "<Name>virtual-bucket</Name>")
+	assert.Contains(t, got, "<EncodingType>url</EncodingType>")
+	assert.Contains(t, got, "<Prefix>dir%2F</Prefix>")
+	assert.Contains(t, got, "<StartAfter>aa%20one</StartAfter>")
+	assert.Contains(t, got, "<Marker>mm%2Bplus</Marker>")
+	assert.Contains(t, got, "<NextMarker>nn%2Fnext</NextMarker>")
+	assert.Contains(t, got, "<Key>dir%2Fa%20file.txt</Key>")
+	assert.Contains(t, got, "<Prefix>dir%2Fsub%2F</Prefix>")
+	assert.NotContains(t, got, "tenant-abc")
 }

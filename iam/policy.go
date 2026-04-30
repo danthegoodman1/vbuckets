@@ -64,6 +64,7 @@ type condition struct {
 	operator conditionOperator
 	key      string
 	values   []string
+	patterns []wildcard
 }
 
 type conditionOperator struct {
@@ -241,13 +242,8 @@ func (c condition) matches(ctx Context) bool {
 
 	anyMatch := false
 	for _, actual := range values {
-		for _, expected := range c.values {
-			if c.valueMatches(actual, expected) {
-				anyMatch = true
-				break
-			}
-		}
-		if anyMatch {
+		if c.valueMatchesAny(actual) {
+			anyMatch = true
 			break
 		}
 	}
@@ -258,12 +254,30 @@ func (c condition) matches(ctx Context) bool {
 	return anyMatch
 }
 
+func (c condition) valueMatchesAny(actual string) bool {
+	if c.operator.family == conditionStringLike {
+		for _, pattern := range c.patterns {
+			if pattern.matches(actual, false) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, expected := range c.values {
+		if c.valueMatches(actual, expected) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c condition) valueMatches(actual, expected string) bool {
 	switch c.operator.family {
 	case conditionStringEquals:
 		return actual == expected
 	case conditionStringLike:
-		return mustWildcard(expected).matches(actual, false)
+		return false
 	case conditionBool:
 		actualBool, actualErr := strconv.ParseBool(strings.ToLower(actual))
 		expectedBool, expectedErr := strconv.ParseBool(strings.ToLower(expected))
@@ -567,14 +581,26 @@ func parseConditions(raw json.RawMessage, allowedConditionKeys map[string]bool) 
 			if err != nil {
 				return nil, invalidPolicy("condition key %q: %w", key, err)
 			}
+			patterns, err := compileConditionPatterns(operator, values)
+			if err != nil {
+				return nil, invalidPolicy("condition key %q: %w", key, err)
+			}
 			conditions = append(conditions, condition{
 				operator: operator,
 				key:      canonicalKey,
 				values:   values,
+				patterns: patterns,
 			})
 		}
 	}
 	return conditions, nil
+}
+
+func compileConditionPatterns(operator conditionOperator, values []string) ([]wildcard, error) {
+	if operator.family != conditionStringLike {
+		return nil, nil
+	}
+	return compileWildcards(values, false)
 }
 
 func parseConditionOperator(name string) (conditionOperator, error) {

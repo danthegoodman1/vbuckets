@@ -27,7 +27,8 @@ var proxyClient = &http.Client{
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		MaxIdleConns:          env.UpstreamMaxIdleConns,
+		MaxIdleConnsPerHost:   env.UpstreamMaxIdleConnsPerHost,
 		IdleConnTimeout:       env.UpstreamIdleConnTimeout,
 		TLSHandshakeTimeout:   env.UpstreamTLSHandshakeTimeout,
 		ExpectContinueTimeout: env.UpstreamExpectContinueTimeout,
@@ -233,7 +234,7 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 		copyHeaders(resp.Header, w.Header())
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		if err := rewriteListResponse(resp.Body, w, normalizedPrefix, getBucketName(r.Context())); err != nil {
+		if err := rewriteListResponse(resp.Body, w, normalizedPrefix, getBucketName(r.Context()), listResponseUsesURLEncoding(r.URL.RawQuery)); err != nil {
 			logger.Error().Err(err).Msg("failed to rewrite list response")
 		}
 		return

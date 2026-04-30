@@ -2,7 +2,6 @@ package http_server
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/go-chi/chi/v5"
@@ -137,6 +135,7 @@ func TestMapS3IAMChecks_RejectsUnsupportedOperations(t *testing.T) {
 	}{
 		{name: "bucket versions", method: http.MethodGet, target: "/test-bucket?versions"},
 		{name: "object acl read", method: http.MethodGet, target: "/test-bucket/a.txt?acl", objectKey: "a.txt"},
+		{name: "copy object", method: http.MethodPut, target: "/test-bucket/a.txt", objectKey: "a.txt"},
 		{name: "multi object delete", method: http.MethodPost, target: "/test-bucket?delete"},
 		{name: "delete with unknown query", method: http.MethodDelete, target: "/test-bucket/a.txt?policy", objectKey: "a.txt"},
 	}
@@ -144,6 +143,9 @@ func TestMapS3IAMChecks_RejectsUnsupportedOperations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.target, nil)
+			if tt.name == "copy object" {
+				req.Header.Set("x-amz-copy-source", "/source-bucket/source.txt")
+			}
 			_, err := mapS3IAMChecks(req, testBucket, tt.objectKey)
 			require.ErrorIs(t, err, ErrUnsupportedS3Operation)
 		})
@@ -244,7 +246,32 @@ func TestS3Auth_IAMDenyDoesNotCallHandler(t *testing.T) {
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
 
-	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/allowed/a.txt", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/allowed/a.txt", nil, unsignedPayload, validCreds)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+	assert.False(t, called)
+}
+
+func TestS3Auth_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
+	resolver := newTestResolver()
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds)
+	req.Header.Set("x-amz-copy-source", "/"+testBucket+"/secret.txt")
+
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -263,7 +290,7 @@ func TestS3Auth_InvalidCredentialPolicyReturnsAccessDenied(t *testing.T) {
 	}
 
 	ts := newTestServer(t, resolver)
-	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/a.txt", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/a.txt", nil, unsignedPayload, validCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -283,7 +310,7 @@ func TestS3Auth_UnknownAccessKeyStillReturnsInvalidAccessKey(t *testing.T) {
 	}
 
 	ts := newTestServer(t, resolver)
-	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/a.txt", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/a.txt", nil, unsignedPayload, validCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -314,7 +341,7 @@ func TestS3Auth_ListBucketsInterceptsWithoutVBucketLookup(t *testing.T) {
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
 
-	req := signedRequest(t, http.MethodGet, ts.URL+"/", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/", nil, unsignedPayload, validCreds)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -347,8 +374,7 @@ func TestS3Auth_CreateBucketInterceptsWithoutVBucketLookup(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	body := []byte(`<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>us-west-2</LocationConstraint></CreateBucketConfiguration>`)
-	payloadHash := fmt.Sprintf("%x", sha256.Sum256(body))
-	req := signedRequest(t, http.MethodPut, ts.URL+"/new-bucket", body, payloadHash, validCreds)
+	req := signedRequest(t, http.MethodPut, ts.URL+"/new-bucket", body, unsignedPayload, validCreds)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -387,7 +413,7 @@ func TestS3Auth_CreateBucketDeniedDoesNotMutate(t *testing.T) {
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
 
-	req := signedRequest(t, http.MethodPut, ts.URL+"/new-bucket", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodPut, ts.URL+"/new-bucket", nil, unsignedPayload, validCreds)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -413,14 +439,7 @@ func TestS3Client_CreateBucketAndListBuckets(t *testing.T) {
 	ts := httptest.NewServer(router)
 	t.Cleanup(ts.Close)
 
-	client := s3.New(s3.Options{
-		Region: testRegion,
-		Credentials: credentials.NewStaticCredentialsProvider(
-			testAccessKey, testSecretKey, "",
-		),
-		BaseEndpoint: aws.String(ts.URL),
-		UsePathStyle: true,
-	})
+	client := newUnsignedPayloadS3Client(ts.URL)
 
 	_, err := client.CreateBucket(context.Background(), &s3.CreateBucketInput{
 		Bucket: aws.String("sdk-created-bucket"),

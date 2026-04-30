@@ -53,12 +53,17 @@ func rewriteListQueryForPrefix(rawQuery string, pathPrefix string) string {
 	return q.Encode()
 }
 
+func listResponseUsesURLEncoding(rawQuery string) bool {
+	q, _ := url.ParseQuery(rawQuery)
+	return q.Get("encoding-type") == "url"
+}
+
 // rewriteListResponse rewrites a ListObjects V1/V2 XML response:
 //   - strips pathPrefix from object keys, prefix echo, and common prefixes
 //   - replaces the echoed bucket name with the virtual bucket name
 //
 // Uses streaming XML token rewriting so unknown elements are preserved.
-func rewriteListResponse(in io.Reader, out io.Writer, pathPrefix, virtualBucket string) error {
+func rewriteListResponse(in io.Reader, out io.Writer, pathPrefix, virtualBucket string, urlEncoded bool) error {
 	decoder := xml.NewDecoder(in)
 	encoder := xml.NewEncoder(out)
 	var stack []string
@@ -97,7 +102,7 @@ func rewriteListResponse(in io.Reader, out io.Writer, pathPrefix, virtualBucket 
 				"ListBucketResult/NextMarker",
 				"ListBucketResult/CommonPrefixes/Prefix",
 				"ListBucketResult/Contents/Key":
-				text = strings.TrimPrefix(text, pathPrefix)
+				text = stripListPathPrefix(text, pathPrefix, urlEncoded)
 			}
 			if err := encoder.EncodeToken(xml.CharData(text)); err != nil {
 				return err
@@ -110,4 +115,16 @@ func rewriteListResponse(in io.Reader, out io.Writer, pathPrefix, virtualBucket 
 	}
 
 	return encoder.Flush()
+}
+
+func stripListPathPrefix(text, pathPrefix string, urlEncoded bool) string {
+	if !urlEncoded {
+		return strings.TrimPrefix(text, pathPrefix)
+	}
+
+	decoded, err := url.PathUnescape(text)
+	if err != nil {
+		return strings.TrimPrefix(text, awsURIEncode(pathPrefix))
+	}
+	return awsURIEncode(strings.TrimPrefix(decoded, pathPrefix))
 }

@@ -136,6 +136,9 @@ func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, e
 		return []iam.Request{newIAMRequest("s3:GetObject", objectResource)}, nil
 
 	case http.MethodPut:
+		if hasHeader(r, "x-amz-copy-source") {
+			return nil, unsupportedS3Operation(r)
+		}
 		if hasQueryKey(query, "tagging") {
 			return []iam.Request{newIAMRequest("s3:PutObjectTagging", objectResource)}, nil
 		}

@@ -19,7 +19,7 @@ Designed for whitelabeling -- give tenants their own bucket names, access keys, 
                  +------------+
 ```
 
-Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
+Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Incoming requests must use `x-amz-content-sha256: UNSIGNED-PAYLOAD` so uploads can stream through the proxy without buffering. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
 
 ## Lookup functions
 
@@ -39,7 +39,7 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 ## Path prefix rewriting
 
-When a vbucket mapping includes a path prefix, all object keys are transparently scoped under that prefix in the real bucket. For single-object operations (GET, PUT, DELETE, etc.) the prefix is prepended to the key in the URL path. For ListObjects V1/V2 the proxy rewrites the `prefix`, `start-after`, and `marker` query parameters on the way out, and strips the prefix from keys, common prefixes, and other echoed fields in the XML response on the way back.
+When a vbucket mapping includes a path prefix, all object keys are transparently scoped under that prefix in the real bucket. For single-object operations (GET, PUT, DELETE, etc.) the prefix is prepended to the key in the URL path. For ListObjects V1/V2 the proxy rewrites the `prefix`, `start-after`, and `marker` query parameters on the way out, and strips the prefix from keys, common prefixes, and other echoed fields in the XML response on the way back, including URL-encoded XML fields when `encoding-type=url` is requested.
 
 ## IAM
 
@@ -74,6 +74,8 @@ the incoming request:
   - `s3:AbortMultipartUpload`
   - `s3:ListMultipartUploadParts`
 - Requests that map to unsupported S3 actions or unsupported subresources are
+  denied before proxying.
+- CopyObject (`PUT` with `x-amz-copy-source`) is currently unsupported and is
   denied before proxying.
 - Unsupported identity-policy features such as `Principal`, policy variables,
   resource policies, session policies, object-tag condition keys, and KMS
@@ -143,3 +145,5 @@ Lookup results and deltas are cached locally, going to the control plane as need
 | `UPSTREAM_RESPONSE_HEADER_TIMEOUT` | `30s` | Upstream response header timeout |
 | `UPSTREAM_EXPECT_CONTINUE_TIMEOUT` | `1s` | Upstream `100-continue` wait timeout |
 | `UPSTREAM_IDLE_CONN_TIMEOUT` | `90s` | Upstream idle connection timeout |
+| `UPSTREAM_MAX_IDLE_CONNS` | `100` | Max idle upstream connections across all hosts |
+| `UPSTREAM_MAX_IDLE_CONNS_PER_HOST` | `100` | Max idle upstream connections per host |

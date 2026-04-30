@@ -16,7 +16,10 @@ import (
 
 const unsignedPayload = "UNSIGNED-PAYLOAD"
 
-var errRequestTimeTooSkewed = errors.New("request time too skewed")
+var (
+	errRequestTimeTooSkewed   = errors.New("request time too skewed")
+	errUnsupportedPayloadHash = errors.New("unsupported payload hash")
+)
 
 type AuthInfo struct {
 	AccessKeyID   string
@@ -81,8 +84,7 @@ func parseAuthorizationHeader(header string) (*AuthInfo, error) {
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#create-canonical-request
 //
 // The payload hash is taken from the x-amz-content-sha256 header, which must
-// be present. The body is never read -- the header value (whether a real hash
-// or "UNSIGNED-PAYLOAD") is itself covered by the signature.
+// be present and must be UNSIGNED-PAYLOAD. The body is never read.
 func buildCanonicalRequest(r *http.Request, signedHeaders []string) string {
 	var b strings.Builder
 
@@ -179,14 +181,18 @@ func computeSigningKey(secret, date, region, service string) []byte {
 
 // verifySignature checks that the request's SigV4 signature matches the expected
 // signature derived from the provided secret key. The request body is never
-// read -- the x-amz-content-sha256 header value is used as the payload hash.
+// read; clients must use UNSIGNED-PAYLOAD so streaming remains possible.
 func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string) error {
 	return verifySignatureAtTime(r, authInfo, secretKey, time.Now().UTC(), env.SigV4MaxClockSkew)
 }
 
 func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string, now time.Time, maxSkew time.Duration) error {
-	if r.Header.Get("x-amz-content-sha256") == "" {
+	payloadHash := r.Header.Get("x-amz-content-sha256")
+	if payloadHash == "" {
 		return fmt.Errorf("missing x-amz-content-sha256 header")
+	}
+	if payloadHash != unsignedPayload {
+		return fmt.Errorf("%w: x-amz-content-sha256 must be %s", errUnsupportedPayloadHash, unsignedPayload)
 	}
 
 	datetime := r.Header.Get("X-Amz-Date")

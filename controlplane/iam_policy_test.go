@@ -23,20 +23,31 @@ const controlPlaneAllowAllPolicyJSON = `{"Version":"2012-10-17","Statement":{"Ef
 
 type fakeControlPlaneClient struct {
 	lookupCredentials func(ctx context.Context, in *apiv1.LookupCredentialsRequest, opts ...grpc.CallOption) (*apiv1.LookupCredentialsResponse, error)
+	lookupBaseHost    func(ctx context.Context, in *apiv1.LookupBaseHostRequest, opts ...grpc.CallOption) (*apiv1.LookupBaseHostResponse, error)
+	lookupVBucket     func(ctx context.Context, in *apiv1.LookupVBucketRequest, opts ...grpc.CallOption) (*apiv1.LookupVBucketResponse, error)
 	createVBucket     func(ctx context.Context, in *apiv1.CreateVBucketRequest, opts ...grpc.CallOption) (*apiv1.CreateVBucketResponse, error)
 	listVBuckets      func(ctx context.Context, in *apiv1.ListVBucketsRequest, opts ...grpc.CallOption) (*apiv1.ListVBucketsResponse, error)
 }
 
 func (f *fakeControlPlaneClient) LookupCredentials(ctx context.Context, in *apiv1.LookupCredentialsRequest, opts ...grpc.CallOption) (*apiv1.LookupCredentialsResponse, error) {
+	if f.lookupCredentials == nil {
+		return nil, errors.New("not implemented")
+	}
 	return f.lookupCredentials(ctx, in, opts...)
 }
 
-func (f *fakeControlPlaneClient) LookupBaseHost(context.Context, *apiv1.LookupBaseHostRequest, ...grpc.CallOption) (*apiv1.LookupBaseHostResponse, error) {
-	return nil, errors.New("not implemented")
+func (f *fakeControlPlaneClient) LookupBaseHost(ctx context.Context, in *apiv1.LookupBaseHostRequest, opts ...grpc.CallOption) (*apiv1.LookupBaseHostResponse, error) {
+	if f.lookupBaseHost == nil {
+		return nil, errors.New("not implemented")
+	}
+	return f.lookupBaseHost(ctx, in, opts...)
 }
 
-func (f *fakeControlPlaneClient) LookupVBucket(context.Context, *apiv1.LookupVBucketRequest, ...grpc.CallOption) (*apiv1.LookupVBucketResponse, error) {
-	return nil, errors.New("not implemented")
+func (f *fakeControlPlaneClient) LookupVBucket(ctx context.Context, in *apiv1.LookupVBucketRequest, opts ...grpc.CallOption) (*apiv1.LookupVBucketResponse, error) {
+	if f.lookupVBucket == nil {
+		return nil, errors.New("not implemented")
+	}
+	return f.lookupVBucket(ctx, in, opts...)
 }
 
 func (f *fakeControlPlaneClient) ListenForDeltas(context.Context, *apiv1.ListenForDeltasRequest, ...grpc.CallOption) (apiv1.ControlPlane_ListenForDeltasClient, error) {
@@ -44,10 +55,16 @@ func (f *fakeControlPlaneClient) ListenForDeltas(context.Context, *apiv1.ListenF
 }
 
 func (f *fakeControlPlaneClient) CreateVBucket(ctx context.Context, in *apiv1.CreateVBucketRequest, opts ...grpc.CallOption) (*apiv1.CreateVBucketResponse, error) {
+	if f.createVBucket == nil {
+		return nil, errors.New("not implemented")
+	}
 	return f.createVBucket(ctx, in, opts...)
 }
 
 func (f *fakeControlPlaneClient) ListVBuckets(ctx context.Context, in *apiv1.ListVBucketsRequest, opts ...grpc.CallOption) (*apiv1.ListVBucketsResponse, error) {
+	if f.listVBuckets == nil {
+		return nil, errors.New("not implemented")
+	}
 	return f.listVBuckets(ctx, in, opts...)
 }
 
@@ -98,6 +115,80 @@ func TestLookupCredentials_InvalidIAMPolicyIsNotCached(t *testing.T) {
 	require.Equal(t, int64(2), calls.Load())
 }
 
+func invalidTTLTestCases() []struct {
+	name string
+	ttl  *durationpb.Duration
+} {
+	return []struct {
+		name string
+		ttl  *durationpb.Duration
+	}{
+		{name: "nil", ttl: nil},
+		{name: "zero", ttl: durationpb.New(0)},
+		{name: "negative", ttl: durationpb.New(-time.Minute)},
+	}
+}
+
+func TestLookupCaches_InvalidTTLsAreNotCached(t *testing.T) {
+	for _, tt := range invalidTTLTestCases() {
+		t.Run("credentials/"+tt.name, func(t *testing.T) {
+			c := newTestClientWithFake(&fakeControlPlaneClient{
+				lookupCredentials: func(_ context.Context, _ *apiv1.LookupCredentialsRequest, _ ...grpc.CallOption) (*apiv1.LookupCredentialsResponse, error) {
+					return &apiv1.LookupCredentialsResponse{
+						SecretKey:     "secret",
+						IamPolicyJson: controlPlaneAllowAllPolicyJSON,
+						Ttl:           tt.ttl,
+					}, nil
+				},
+			})
+
+			_, err := c.LookupCredentials(context.Background(), "access-key")
+			require.Error(t, err)
+			_, ok := c.caches.credentials.GetIfPresent("access-key")
+			require.False(t, ok)
+		})
+
+		t.Run("base-host/"+tt.name, func(t *testing.T) {
+			c := newTestClientWithFake(&fakeControlPlaneClient{
+				lookupBaseHost: func(_ context.Context, _ *apiv1.LookupBaseHostRequest, _ ...grpc.CallOption) (*apiv1.LookupBaseHostResponse, error) {
+					return &apiv1.LookupBaseHostResponse{
+						BaseHost: "s3.example.com",
+						Found:    true,
+						Ttl:      tt.ttl,
+					}, nil
+				},
+			})
+
+			_, _, err := c.LookupBaseHost(context.Background(), "bucket.s3.example.com")
+			require.Error(t, err)
+			_, ok := c.caches.baseHosts.GetIfPresent("bucket.s3.example.com")
+			require.False(t, ok)
+		})
+
+		t.Run("vbucket/"+tt.name, func(t *testing.T) {
+			c := newTestClientWithFake(&fakeControlPlaneClient{
+				lookupVBucket: func(_ context.Context, _ *apiv1.LookupVBucketRequest, _ ...grpc.CallOption) (*apiv1.LookupVBucketResponse, error) {
+					return &apiv1.LookupVBucketResponse{
+						RealEndpoint:     "https://s3.example.com",
+						RealBucket:       "real-bucket",
+						RealAccessKey:    "real-access",
+						RealSecretKey:    "real-secret",
+						RealRegion:       "us-east-1",
+						PathPrefix:       "tenant",
+						RealUsePathStyle: true,
+						Ttl:              tt.ttl,
+					}, nil
+				},
+			})
+
+			_, err := c.LookupVBucket(context.Background(), "access-key", "bucket")
+			require.Error(t, err)
+			_, ok := c.caches.vbuckets.GetIfPresent(vbucketCacheKey("access-key", "bucket"))
+			require.False(t, ok)
+		})
+	}
+}
+
 func TestHandleDelta_CredentialsPolicyUpsertAndInvalidation(t *testing.T) {
 	c := NewClient("test-control-plane", zerolog.Nop())
 	c.handleDelta(&apiv1.Delta{Delta: &apiv1.Delta_Credentials{Credentials: &apiv1.CredentialsDelta{
@@ -126,6 +217,78 @@ func TestHandleDelta_CredentialsPolicyUpsertAndInvalidation(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestHandleDelta_InvalidTTLsInvalidateAndDoNotPanic(t *testing.T) {
+	for _, tt := range invalidTTLTestCases() {
+		t.Run("credentials/"+tt.name, func(t *testing.T) {
+			c := NewClient("test-control-plane", zerolog.Nop())
+			c.caches.credentials.Set("access-key", cachedCredentials{
+				VirtualCredentials: &http_server.VirtualCredentials{
+					SecretKey: "old-secret",
+					IAMPolicy: iam.DenyAllPolicy(),
+				},
+				TTL: time.Minute,
+			})
+
+			require.NotPanics(t, func() {
+				c.handleDelta(&apiv1.Delta{Delta: &apiv1.Delta_Credentials{Credentials: &apiv1.CredentialsDelta{
+					AccessKeyId:   "access-key",
+					SecretKey:     "secret",
+					IamPolicyJson: controlPlaneAllowAllPolicyJSON,
+					Ttl:           tt.ttl,
+				}}})
+			})
+			_, ok := c.caches.credentials.GetIfPresent("access-key")
+			require.False(t, ok)
+		})
+
+		t.Run("base-host/"+tt.name, func(t *testing.T) {
+			c := NewClient("test-control-plane", zerolog.Nop())
+			c.caches.baseHosts.Set("bucket.s3.example.com", cachedBaseHost{
+				BaseHost: "s3.example.com",
+				Found:    true,
+				TTL:      time.Minute,
+			})
+
+			require.NotPanics(t, func() {
+				c.handleDelta(&apiv1.Delta{Delta: &apiv1.Delta_BaseHost{BaseHost: &apiv1.BaseHostDelta{
+					Hostname: "bucket.s3.example.com",
+					BaseHost: "s3.example.com",
+					Found:    true,
+					Ttl:      tt.ttl,
+				}}})
+			})
+			_, ok := c.caches.baseHosts.GetIfPresent("bucket.s3.example.com")
+			require.False(t, ok)
+		})
+
+		t.Run("vbucket/"+tt.name, func(t *testing.T) {
+			c := NewClient("test-control-plane", zerolog.Nop())
+			key := vbucketCacheKey("access-key", "bucket")
+			c.caches.vbuckets.Set(key, cachedVBucket{
+				VBucketConfig: &http_server.VBucketConfig{RealBucket: "old-real"},
+				TTL:           time.Minute,
+			})
+
+			require.NotPanics(t, func() {
+				c.handleDelta(&apiv1.Delta{Delta: &apiv1.Delta_Vbucket{Vbucket: &apiv1.VBucketDelta{
+					AccessKeyId:      "access-key",
+					BucketName:       "bucket",
+					RealEndpoint:     "https://s3.example.com",
+					RealBucket:       "real-bucket",
+					RealAccessKey:    "real-access",
+					RealSecretKey:    "real-secret",
+					RealRegion:       "us-east-1",
+					PathPrefix:       "tenant",
+					RealUsePathStyle: true,
+					Ttl:              tt.ttl,
+				}}})
+			})
+			_, ok := c.caches.vbuckets.GetIfPresent(key)
+			require.False(t, ok)
+		})
+	}
+}
+
 func TestCreateVBucket_WarmsCache(t *testing.T) {
 	c := newTestClientWithFake(&fakeControlPlaneClient{
 		createVBucket: func(_ context.Context, in *apiv1.CreateVBucketRequest, _ ...grpc.CallOption) (*apiv1.CreateVBucketResponse, error) {
@@ -152,6 +315,33 @@ func TestCreateVBucket_WarmsCache(t *testing.T) {
 	cached, ok := c.caches.vbuckets.GetIfPresent(vbucketCacheKey("access-key", "new-bucket"))
 	require.True(t, ok)
 	require.Equal(t, "tenants/access-key/new-bucket", cached.PathPrefix)
+}
+
+func TestCreateVBucket_InvalidTTLSkipsCacheWarm(t *testing.T) {
+	for _, tt := range invalidTTLTestCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestClientWithFake(&fakeControlPlaneClient{
+				createVBucket: func(_ context.Context, _ *apiv1.CreateVBucketRequest, _ ...grpc.CallOption) (*apiv1.CreateVBucketResponse, error) {
+					return &apiv1.CreateVBucketResponse{
+						RealEndpoint:     "https://s3.example.com",
+						RealBucket:       "real-bucket",
+						RealAccessKey:    "real-access",
+						RealSecretKey:    "real-secret",
+						RealRegion:       "us-east-1",
+						PathPrefix:       "tenant",
+						RealUsePathStyle: true,
+						Ttl:              tt.ttl,
+					}, nil
+				},
+			})
+
+			cfg, err := c.CreateVBucket(context.Background(), "access-key", "new-bucket", "")
+			require.NoError(t, err)
+			require.Equal(t, "real-bucket", cfg.RealBucket)
+			_, ok := c.caches.vbuckets.GetIfPresent(vbucketCacheKey("access-key", "new-bucket"))
+			require.False(t, ok)
+		})
+	}
 }
 
 func TestCreateVBucket_MapsControlPlaneErrors(t *testing.T) {

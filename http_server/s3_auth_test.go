@@ -16,6 +16,7 @@ import (
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/stretchr/testify/assert"
@@ -159,11 +160,25 @@ var validCreds = aws.Credentials{
 	SecretAccessKey: testSecretKey,
 }
 
+func newUnsignedPayloadS3Client(endpoint string) *s3.Client {
+	return s3.New(s3.Options{
+		Region: testRegion,
+		Credentials: credentials.NewStaticCredentialsProvider(
+			testAccessKey, testSecretKey, "",
+		),
+		BaseEndpoint: aws.String(endpoint),
+		UsePathStyle: true,
+		APIOptions: []func(*middleware.Stack) error{
+			awsv4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
+		},
+	})
+}
+
 func TestSigV4_RawSigner_GET(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
 
-	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/my-key.txt", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/my-key.txt", nil, unsignedPayload, validCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -177,9 +192,8 @@ func TestSigV4_RawSigner_PUT_WithBody(t *testing.T) {
 	ts := newTestServer(t, resolver)
 
 	body := []byte("hello world, this is a test upload")
-	payloadHash := fmt.Sprintf("%x", sha256.Sum256(body))
 
-	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/upload/test.txt", body, payloadHash, validCreds)
+	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/upload/test.txt", body, unsignedPayload, validCreds)
 	req.Header.Set("Content-Type", "text/plain")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -203,11 +217,31 @@ func TestSigV4_RawSigner_UnsignedPayload(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+func TestSigV4_RawSigner_ConcretePayloadHashRejected(t *testing.T) {
+	resolver := newTestResolver()
+	ts := newTestServer(t, resolver)
+
+	body := []byte("payload with a concrete hash")
+	payloadHash := fmt.Sprintf("%x", sha256.Sum256(body))
+	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/hashed.bin", body, payloadHash, validCreds)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, string(respBody), "<Code>InvalidRequest</Code>")
+	assert.Contains(t, string(respBody), "UNSIGNED-PAYLOAD")
+}
+
 func TestSigV4_RawSigner_WithQueryParams(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
 
-	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"?list-type=2&prefix=photos/&max-keys=100", nil, emptyPayloadHash(), validCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"?list-type=2&prefix=photos/&max-keys=100", nil, unsignedPayload, validCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -224,7 +258,7 @@ func TestSigV4_RawSigner_InvalidCredentials(t *testing.T) {
 		AccessKeyID:     testAccessKey,
 		SecretAccessKey: "wrong-secret-key-should-fail",
 	}
-	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/secret.txt", nil, emptyPayloadHash(), badCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/secret.txt", nil, unsignedPayload, badCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -241,7 +275,7 @@ func TestSigV4_RawSigner_UnknownAccessKey(t *testing.T) {
 		AccessKeyID:     "AKIAI_UNKNOWN_KEY",
 		SecretAccessKey: testSecretKey,
 	}
-	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/test.txt", nil, emptyPayloadHash(), unknownCreds)
+	req := signedRequest(t, http.MethodGet, ts.URL+"/"+testBucket+"/test.txt", nil, unsignedPayload, unknownCreds)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -260,7 +294,7 @@ func TestSigV4_RawSigner_RequestTimeTooSkewed(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
 
-	req := signedRequestAtTime(t, http.MethodGet, ts.URL+"/"+testBucket+"/old-object.txt", nil, emptyPayloadHash(), validCreds, time.Now().UTC().Add(-16*time.Minute))
+	req := signedRequestAtTime(t, http.MethodGet, ts.URL+"/"+testBucket+"/old-object.txt", nil, unsignedPayload, validCreds, time.Now().UTC().Add(-16*time.Minute))
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -283,7 +317,7 @@ func TestSigV4_RawSigner_ConfigurableClockSkew(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
 
-	req := signedRequestAtTime(t, http.MethodGet, ts.URL+"/"+testBucket+"/old-but-accepted.txt", nil, emptyPayloadHash(), validCreds, time.Now().UTC().Add(-30*time.Minute))
+	req := signedRequestAtTime(t, http.MethodGet, ts.URL+"/"+testBucket+"/old-but-accepted.txt", nil, unsignedPayload, validCreds, time.Now().UTC().Add(-30*time.Minute))
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -296,14 +330,7 @@ func TestSigV4_S3Client_PutObject(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
 
-	client := s3.New(s3.Options{
-		Region: testRegion,
-		Credentials: credentials.NewStaticCredentialsProvider(
-			testAccessKey, testSecretKey, "",
-		),
-		BaseEndpoint: aws.String(ts.URL),
-		UsePathStyle: true,
-	})
+	client := newUnsignedPayloadS3Client(ts.URL)
 
 	_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String(testBucket),
@@ -315,7 +342,7 @@ func TestSigV4_S3Client_PutObject(t *testing.T) {
 		// Signature errors are the only ones we care about -- response parsing
 		// errors are expected since we return a minimal mock response
 		assert.False(t,
-			strings.Contains(errStr, "SignatureDoesNotMatch") || strings.Contains(errStr, "403") || strings.Contains(errStr, "AccessDenied"),
+			strings.Contains(errStr, "SignatureDoesNotMatch") || strings.Contains(errStr, "403") || strings.Contains(errStr, "AccessDenied") || strings.Contains(errStr, "InvalidRequest"),
 			"signature verification failed: %v", err,
 		)
 		t.Logf("non-signature error (signature was accepted): %v", err)
@@ -326,14 +353,7 @@ func TestSigV4_S3Client_HeadObject(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
 
-	client := s3.New(s3.Options{
-		Region: testRegion,
-		Credentials: credentials.NewStaticCredentialsProvider(
-			testAccessKey, testSecretKey, "",
-		),
-		BaseEndpoint: aws.String(ts.URL),
-		UsePathStyle: true,
-	})
+	client := newUnsignedPayloadS3Client(ts.URL)
 
 	_, err := client.HeadObject(context.Background(), &s3.HeadObjectInput{
 		Bucket: aws.String(testBucket),
@@ -342,7 +362,7 @@ func TestSigV4_S3Client_HeadObject(t *testing.T) {
 	if err != nil {
 		errStr := err.Error()
 		assert.False(t,
-			strings.Contains(errStr, "SignatureDoesNotMatch") || strings.Contains(errStr, "403") || strings.Contains(errStr, "AccessDenied"),
+			strings.Contains(errStr, "SignatureDoesNotMatch") || strings.Contains(errStr, "403") || strings.Contains(errStr, "AccessDenied") || strings.Contains(errStr, "InvalidRequest"),
 			"signature verification failed: %v", err,
 		)
 		t.Logf("non-signature error (signature was accepted): %v", err)
@@ -373,7 +393,7 @@ func TestSigV4_VHostStyle(t *testing.T) {
 	// Override Host to simulate vhost-style while still connecting to test server
 	req.Host = testBucket + ".s3.test.local"
 
-	payloadHash := emptyPayloadHash()
+	payloadHash := unsignedPayload
 	req.Header.Set("x-amz-content-sha256", payloadHash)
 
 	signer := awsv4.NewSigner()

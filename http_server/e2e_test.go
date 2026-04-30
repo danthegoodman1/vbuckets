@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -165,6 +167,9 @@ func setupE2EWithPolicy(t *testing.T, policy *iam.Policy) *e2eEnv {
 			),
 			BaseEndpoint: aws.String(ts.URL),
 			UsePathStyle: true,
+			APIOptions: []func(*middleware.Stack) error{
+				awsv4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
+			},
 		}),
 		DirectClient: s3.New(s3.Options{
 			Region: "us-east-1",

@@ -116,6 +116,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 					writeS3Error(w, http.StatusForbidden, "RequestTimeTooSkewed", "The difference between the request time and server time is too large.")
 					return
 				}
+				if errors.Is(err, errUnsupportedPayloadHash) {
+					writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "x-amz-content-sha256 must be UNSIGNED-PAYLOAD.")
+					return
+				}
 				writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 				return
 			}
