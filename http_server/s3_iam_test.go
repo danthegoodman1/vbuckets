@@ -283,6 +283,28 @@ func TestS3Auth_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
 	assert.False(t, called)
 }
 
+func TestS3Client_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
+	resolver := newTestResolver()
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	client := newUnsignedPayloadS3Client(ts.URL)
+	_, err := client.CopyObject(context.Background(), &s3.CopyObjectInput{
+		Bucket:     aws.String(testBucket),
+		Key:        aws.String("copied.txt"),
+		CopySource: aws.String(testBucket + "/secret.txt"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+	assert.False(t, called)
+}
+
 func TestS3Auth_InvalidCredentialPolicyReturnsAccessDenied(t *testing.T) {
 	resolver := newTestResolver()
 	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
