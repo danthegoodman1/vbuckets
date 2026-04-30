@@ -224,6 +224,76 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	assert.Equal(t, testBody, string(directBody))
 }
 
+func TestE2E_CopyObjectSameVirtualBucket(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	e := setupE2E(t)
+
+	sourceKey := "copy/source.txt"
+	destKey := "copy/dest.txt"
+	testBody := "copied through upstream server-side copy"
+
+	_, err := e.ProxyClient.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String(sourceKey),
+		Body:   strings.NewReader(testBody),
+	})
+	require.NoError(t, err)
+
+	_, err = e.ProxyClient.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(e2eVirtualBucket),
+		Key:        aws.String(destKey),
+		CopySource: aws.String(e2eVirtualBucket + "/" + sourceKey),
+	})
+	require.NoError(t, err)
+
+	getResult, err := e.ProxyClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(e2eVirtualBucket),
+		Key:    aws.String(destKey),
+	})
+	require.NoError(t, err)
+	defer getResult.Body.Close()
+
+	body, err := io.ReadAll(getResult.Body)
+	require.NoError(t, err)
+	assert.Equal(t, testBody, string(body))
+
+	for _, key := range []string{"tenant-abc/" + sourceKey, "tenant-abc/" + destKey} {
+		directResult, err := e.DirectClient.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(garageBucket),
+			Key:    aws.String(key),
+		})
+		require.NoError(t, err)
+
+		directBody, err := io.ReadAll(directResult.Body)
+		require.NoError(t, err)
+		require.NoError(t, directResult.Body.Close())
+		assert.Equal(t, testBody, string(directBody))
+	}
+
+	_, err = e.ProxyClient.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(e2eVirtualBucket),
+		Key:        aws.String("copy/cross-bucket.txt"),
+		CopySource: aws.String("other-virtual-bucket/" + sourceKey),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+
+	_, err = e.ProxyClient.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		Bucket:     aws.String(e2eVirtualBucket),
+		Key:        aws.String("copy/multipart.txt"),
+		CopySource: aws.String(e2eVirtualBucket + "/" + sourceKey),
+		PartNumber: aws.Int32(1),
+		UploadId:   aws.String("upload-1"),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "AccessDenied")
+}
+
 func TestE2E_ListObjectsPrefixIsolation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")

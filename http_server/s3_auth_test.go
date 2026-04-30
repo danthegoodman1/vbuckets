@@ -131,10 +131,18 @@ func emptyPayloadHash() string {
 }
 
 func signedRequest(t *testing.T, method, url string, body []byte, payloadHash string, creds aws.Credentials) *http.Request {
-	return signedRequestAtTime(t, method, url, body, payloadHash, creds, time.Now().UTC())
+	return signedRequestAtTimeWithHeaders(t, method, url, body, payloadHash, creds, time.Now().UTC(), nil)
 }
 
 func signedRequestAtTime(t *testing.T, method, url string, body []byte, payloadHash string, creds aws.Credentials, signedAt time.Time) *http.Request {
+	return signedRequestAtTimeWithHeaders(t, method, url, body, payloadHash, creds, signedAt, nil)
+}
+
+func signedRequestWithHeaders(t *testing.T, method, url string, body []byte, payloadHash string, creds aws.Credentials, headers map[string]string) *http.Request {
+	return signedRequestAtTimeWithHeaders(t, method, url, body, payloadHash, creds, time.Now().UTC(), headers)
+}
+
+func signedRequestAtTimeWithHeaders(t *testing.T, method, url string, body []byte, payloadHash string, creds aws.Credentials, signedAt time.Time, headers map[string]string) *http.Request {
 	t.Helper()
 
 	var bodyReader *bytes.Reader
@@ -148,6 +156,9 @@ func signedRequestAtTime(t *testing.T, method, url string, body []byte, payloadH
 	require.NoError(t, err)
 
 	req.Header.Set("x-amz-content-sha256", payloadHash)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 
 	signer := awsv4.NewSigner()
 	require.NoError(t, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", testRegion, signedAt))

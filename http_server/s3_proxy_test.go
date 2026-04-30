@@ -76,3 +76,61 @@ func TestHandleS3Request_ListRewriteStreaming_RemovesStaleContentLength(t *testi
 	assert.Contains(t, string(body), "<Key>a/very/long/object/name/that-will-shrink.txt</Key>")
 	assert.NotContains(t, string(body), "tenant-abc/")
 }
+
+func TestHandleS3Request_CopyObjectRewritesSourceAndDestination(t *testing.T) {
+	var upstreamCalled bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		assert.Equal(t, http.MethodPut, r.Method)
+		assert.Equal(t, "/real-bucket/tenant-abc/dest.txt", r.URL.Path)
+		assert.Equal(t, "real-bucket/tenant-abc/source%20one.txt?versionId=v%2F1", r.Header.Get(copySourceHeader))
+		assert.NotEmpty(t, r.Header.Get("Authorization"))
+		assert.Equal(t, unsignedPayload, r.Header.Get("x-amz-content-sha256"))
+
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<CopyObjectResult><ETag>"abc123"</ETag></CopyObjectResult>`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	resolver := &testResolver{
+		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+			if accessKeyID != testAccessKey {
+				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+			}
+			return &VirtualCredentials{SecretKey: testSecretKey, IAMPolicy: testAllowAllPolicy}, nil
+		},
+		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
+			return "", false, nil
+		},
+		vbucket: func(_ context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
+			return &VBucketConfig{
+				RealEndpoint:     upstream.URL,
+				RealBucket:       "real-bucket",
+				RealAccessKey:    "real-access",
+				RealSecretKey:    "real-secret",
+				RealRegion:       "us-east-1",
+				PathPrefix:       "tenant-abc",
+				RealUsePathStyle: true,
+			}, nil
+		},
+	}
+
+	router := chi.NewRouter()
+	RegisterS3Routes(resolver)(router)
+	proxy := httptest.NewServer(router)
+	t.Cleanup(proxy.Close)
+
+	req := signedRequestWithHeaders(t, http.MethodPut, proxy.URL+"/"+testBucket+"/dest.txt", nil, unsignedPayload, validCreds, map[string]string{
+		copySourceHeader: "/" + testBucket + "/source%20one.txt?versionId=v/1",
+	})
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.True(t, upstreamCalled)
+}

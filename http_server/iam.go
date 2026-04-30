@@ -100,6 +100,9 @@ func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, e
 	if objectKey == "" {
 		switch r.Method {
 		case http.MethodPut:
+			if isCopyObjectRequest(r) {
+				return nil, unsupportedS3Operation(r)
+			}
 			if queryHasOnlyIgnoredKeys(query) {
 				return []iam.Request{newIAMRequest("s3:CreateBucket", bucketResource)}, nil
 			}
@@ -136,8 +139,30 @@ func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, e
 		return []iam.Request{newIAMRequest("s3:GetObject", objectResource)}, nil
 
 	case http.MethodPut:
-		if hasHeader(r, "x-amz-copy-source") {
-			return nil, unsupportedS3Operation(r)
+		if isCopyObjectRequest(r) {
+			if hasAnyQueryKey(query, "partNumber", "uploadId") || !queryHasOnlyIgnoredKeys(query) {
+				return nil, unsupportedS3Operation(r)
+			}
+			source, err := parseCopySource(r.Header.Get(copySourceHeader), bucket)
+			if err != nil {
+				return nil, unsupportedS3Operation(r)
+			}
+
+			checks := []iam.Request{
+				newIAMRequest("s3:PutObject", objectResource),
+			}
+			sourceAction := "s3:GetObject"
+			if source.VersionID != "" {
+				sourceAction = "s3:GetObjectVersion"
+			}
+			checks = append(checks, newIAMRequest(sourceAction, s3ObjectARN(bucket, source.Key)))
+			if requestUsesACLHeaders(r) {
+				checks = append(checks, newIAMRequest("s3:PutObjectAcl", objectResource))
+			}
+			if hasHeader(r, "x-amz-tagging") {
+				checks = append(checks, newIAMRequest("s3:PutObjectTagging", objectResource))
+			}
+			return checks, nil
 		}
 		if hasQueryKey(query, "tagging") {
 			return []iam.Request{newIAMRequest("s3:PutObjectTagging", objectResource)}, nil

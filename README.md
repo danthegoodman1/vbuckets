@@ -19,7 +19,7 @@ Designed for whitelabeling -- give tenants their own bucket names, access keys, 
                  +------------+
 ```
 
-Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Incoming requests must use `x-amz-content-sha256: UNSIGNED-PAYLOAD` so uploads can stream through the proxy without buffering. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
+Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Incoming requests must use `x-amz-content-sha256: UNSIGNED-PAYLOAD` so uploads can stream through the proxy without buffering, and any `x-amz-*` request headers except `x-amz-content-sha256` must be included in the SigV4 signed headers. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
 
 ## Lookup functions
 
@@ -75,7 +75,11 @@ the incoming request:
   - `s3:ListMultipartUploadParts`
 - Requests that map to unsupported S3 actions or unsupported subresources are
   denied before proxying.
-- CopyObject (`PUT` with `x-amz-copy-source`) is currently unsupported and is
+- CopyObject (`PUT` with `x-amz-copy-source`) is supported only within the same
+  virtual bucket. vbuckets authorizes destination `s3:PutObject` plus source
+  `s3:GetObject` or `s3:GetObjectVersion`, rewrites the source to the real
+  bucket/prefix, then waits synchronously for upstream S3. Cross-bucket,
+  cross-vbucket, ARN/access-point/absolute URL, and multipart copy requests are
   denied before proxying.
 - Unsupported identity-policy features such as `Principal`, policy variables,
   resource policies, session policies, object-tag condition keys, and KMS

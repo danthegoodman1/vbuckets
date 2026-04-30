@@ -120,6 +120,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 					writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "x-amz-content-sha256 must be UNSIGNED-PAYLOAD.")
 					return
 				}
+				if errors.Is(err, errUnsignedAmzHeader) {
+					writeS3Error(w, http.StatusForbidden, "AccessDenied", "There were headers present in the request which were not signed.")
+					return
+				}
 				writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 				return
 			}
@@ -206,7 +210,7 @@ func isListBucketsRequest(r *http.Request, bucket, objectKey string) bool {
 }
 
 func isCreateBucketRequest(r *http.Request, objectKey string) bool {
-	return r.Method == http.MethodPut && objectKey == "" && queryHasOnlyIgnoredKeys(r.URL.Query())
+	return r.Method == http.MethodPut && objectKey == "" && !isCopyObjectRequest(r) && queryHasOnlyIgnoredKeys(r.URL.Query())
 }
 
 const maxCreateBucketConfigBytes = 1 << 20

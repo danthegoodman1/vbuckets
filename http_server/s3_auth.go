@@ -19,6 +19,7 @@ const unsignedPayload = "UNSIGNED-PAYLOAD"
 var (
 	errRequestTimeTooSkewed   = errors.New("request time too skewed")
 	errUnsupportedPayloadHash = errors.New("unsupported payload hash")
+	errUnsignedAmzHeader      = errors.New("unsigned x-amz header")
 )
 
 type AuthInfo struct {
@@ -194,6 +195,9 @@ func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string
 	if payloadHash != unsignedPayload {
 		return fmt.Errorf("%w: x-amz-content-sha256 must be %s", errUnsupportedPayloadHash, unsignedPayload)
 	}
+	if err := requireSignedAmzHeaders(r, authInfo.SignedHeaders); err != nil {
+		return err
+	}
 
 	datetime := r.Header.Get("X-Amz-Date")
 	if datetime == "" {
@@ -221,6 +225,30 @@ func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string
 
 	if !hmac.Equal([]byte(expectedSig), []byte(authInfo.Signature)) {
 		return fmt.Errorf("signature mismatch")
+	}
+
+	return nil
+}
+
+func requireSignedAmzHeaders(r *http.Request, signedHeaders []string) error {
+	signed := make(map[string]bool, len(signedHeaders))
+	for _, header := range signedHeaders {
+		signed[strings.ToLower(header)] = true
+	}
+
+	for header := range r.Header {
+		lower := strings.ToLower(header)
+		if !strings.HasPrefix(lower, "x-amz-") {
+			continue
+		}
+		// S3 treats x-amz-content-sha256 as the canonical payload hash even
+		// when it is not listed in SignedHeaders.
+		if lower == "x-amz-content-sha256" {
+			continue
+		}
+		if !signed[lower] {
+			return fmt.Errorf("%w: %s", errUnsignedAmzHeader, lower)
+		}
 	}
 
 	return nil

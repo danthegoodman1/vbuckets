@@ -26,6 +26,7 @@ func TestMapS3IAMChecks_CoreOperations(t *testing.T) {
 		target    string
 		bucket    string
 		objectKey string
+		headers   map[string]string
 		want      []iam.Request
 	}{
 		{
@@ -66,10 +67,57 @@ func TestMapS3IAMChecks_CoreOperations(t *testing.T) {
 			method:    http.MethodPut,
 			target:    "/test-bucket/a.txt",
 			objectKey: "a.txt",
+			headers: map[string]string{
+				"x-amz-acl":     "public-read",
+				"x-amz-tagging": "class=public",
+			},
 			want: []iam.Request{
 				{Action: "s3:PutObject", Resource: "arn:aws:s3:::test-bucket/a.txt"},
 				{Action: "s3:PutObjectAcl", Resource: "arn:aws:s3:::test-bucket/a.txt"},
 				{Action: "s3:PutObjectTagging", Resource: "arn:aws:s3:::test-bucket/a.txt"},
+			},
+		},
+		{
+			name:      "copy object same bucket",
+			method:    http.MethodPut,
+			target:    "/test-bucket/copied.txt",
+			objectKey: "copied.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/test-bucket/source.txt",
+			},
+			want: []iam.Request{
+				{Action: "s3:PutObject", Resource: "arn:aws:s3:::test-bucket/copied.txt"},
+				{Action: "s3:GetObject", Resource: "arn:aws:s3:::test-bucket/source.txt"},
+			},
+		},
+		{
+			name:      "copy object source version",
+			method:    http.MethodPut,
+			target:    "/test-bucket/copied.txt",
+			objectKey: "copied.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/test-bucket/source.txt?versionId=version-1",
+			},
+			want: []iam.Request{
+				{Action: "s3:PutObject", Resource: "arn:aws:s3:::test-bucket/copied.txt"},
+				{Action: "s3:GetObjectVersion", Resource: "arn:aws:s3:::test-bucket/source.txt"},
+			},
+		},
+		{
+			name:      "copy object with acl and tagging headers",
+			method:    http.MethodPut,
+			target:    "/test-bucket/copied.txt",
+			objectKey: "copied.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/test-bucket/source.txt",
+				"x-amz-acl":         "public-read",
+				"x-amz-tagging":     "class=public",
+			},
+			want: []iam.Request{
+				{Action: "s3:PutObject", Resource: "arn:aws:s3:::test-bucket/copied.txt"},
+				{Action: "s3:GetObject", Resource: "arn:aws:s3:::test-bucket/source.txt"},
+				{Action: "s3:PutObjectAcl", Resource: "arn:aws:s3:::test-bucket/copied.txt"},
+				{Action: "s3:PutObjectTagging", Resource: "arn:aws:s3:::test-bucket/copied.txt"},
 			},
 		},
 		{
@@ -111,9 +159,8 @@ func TestMapS3IAMChecks_CoreOperations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.target, nil)
-			if tt.name == "put object with acl and tagging headers" {
-				req.Header.Set("x-amz-acl", "public-read")
-				req.Header.Set("x-amz-tagging", "class=public")
+			for key, value := range tt.headers {
+				req.Header.Set(key, value)
 			}
 			bucket := tt.bucket
 			if bucket == "" && tt.name != "list all my buckets" {
@@ -132,10 +179,46 @@ func TestMapS3IAMChecks_RejectsUnsupportedOperations(t *testing.T) {
 		method    string
 		target    string
 		objectKey string
+		headers   map[string]string
 	}{
 		{name: "bucket versions", method: http.MethodGet, target: "/test-bucket?versions"},
 		{name: "object acl read", method: http.MethodGet, target: "/test-bucket/a.txt?acl", objectKey: "a.txt"},
-		{name: "copy object", method: http.MethodPut, target: "/test-bucket/a.txt", objectKey: "a.txt"},
+		{
+			name:      "copy object cross bucket",
+			method:    http.MethodPut,
+			target:    "/test-bucket/a.txt",
+			objectKey: "a.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/source-bucket/source.txt",
+			},
+		},
+		{
+			name:      "multipart copy object",
+			method:    http.MethodPut,
+			target:    "/test-bucket/a.txt?partNumber=1&uploadId=upload-1",
+			objectKey: "a.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/test-bucket/source.txt",
+			},
+		},
+		{
+			name:      "copy object acl subresource",
+			method:    http.MethodPut,
+			target:    "/test-bucket/a.txt?acl",
+			objectKey: "a.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/test-bucket/source.txt",
+			},
+		},
+		{
+			name:      "copy object tagging subresource",
+			method:    http.MethodPut,
+			target:    "/test-bucket/a.txt?tagging",
+			objectKey: "a.txt",
+			headers: map[string]string{
+				"x-amz-copy-source": "/test-bucket/source.txt",
+			},
+		},
 		{name: "multi object delete", method: http.MethodPost, target: "/test-bucket?delete"},
 		{name: "delete with unknown query", method: http.MethodDelete, target: "/test-bucket/a.txt?policy", objectKey: "a.txt"},
 	}
@@ -143,8 +226,8 @@ func TestMapS3IAMChecks_RejectsUnsupportedOperations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.target, nil)
-			if tt.name == "copy object" {
-				req.Header.Set("x-amz-copy-source", "/source-bucket/source.txt")
+			for key, value := range tt.headers {
+				req.Header.Set(key, value)
 			}
 			_, err := mapS3IAMChecks(req, testBucket, tt.objectKey)
 			require.ErrorIs(t, err, ErrUnsupportedS3Operation)
@@ -258,7 +341,54 @@ func TestS3Auth_IAMDenyDoesNotCallHandler(t *testing.T) {
 	assert.False(t, called)
 }
 
-func TestS3Auth_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
+func TestS3Auth_CopyObjectAllowedSameBucketCallsHandler(t *testing.T) {
+	resolver := newTestResolver()
+	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+		if accessKeyID != testAccessKey {
+			return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+		}
+		return &VirtualCredentials{
+			SecretKey: testSecretKey,
+			IAMPolicy: mustParseTestPolicy(`{
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": "s3:PutObject",
+						"Resource": "arn:aws:s3:::test-bucket/copied.txt"
+					},
+					{
+						"Effect": "Allow",
+						"Action": "s3:GetObject",
+						"Resource": "arn:aws:s3:::test-bucket/source.txt"
+					}
+				]
+			}`),
+		}, nil
+	}
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		assert.Equal(t, "copied.txt", getObjectKey(r.Context()))
+		assert.Equal(t, "/"+testBucket+"/source.txt", r.Header.Get(copySourceHeader))
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	req := signedRequestWithHeaders(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds, map[string]string{
+		copySourceHeader: "/" + testBucket + "/source.txt",
+	})
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.True(t, called)
+}
+
+func TestS3Auth_CopyObjectUnsignedCopySourceDoesNotCallHandler(t *testing.T) {
 	resolver := newTestResolver()
 
 	var called bool
@@ -270,7 +400,49 @@ func TestS3Auth_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds)
-	req.Header.Set("x-amz-copy-source", "/"+testBucket+"/secret.txt")
+	req.Header.Set(copySourceHeader, "/"+testBucket+"/source.txt")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+	assert.Contains(t, string(body), "not signed")
+	assert.False(t, called)
+}
+
+func TestS3Auth_CopyObjectMissingSourcePermissionDoesNotCallHandler(t *testing.T) {
+	resolver := newTestResolver()
+	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+		if accessKeyID != testAccessKey {
+			return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+		}
+		return &VirtualCredentials{
+			SecretKey: testSecretKey,
+			IAMPolicy: mustParseTestPolicy(`{
+				"Statement": {
+					"Effect": "Allow",
+					"Action": "s3:PutObject",
+					"Resource": "arn:aws:s3:::test-bucket/copied.txt"
+				}
+			}`),
+		}, nil
+	}
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	req := signedRequestWithHeaders(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds, map[string]string{
+		copySourceHeader: "/" + testBucket + "/source.txt",
+	})
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -283,8 +455,23 @@ func TestS3Auth_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
 	assert.False(t, called)
 }
 
-func TestS3Client_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
+func TestS3Auth_CopyObjectMissingDestinationPermissionDoesNotCallHandler(t *testing.T) {
 	resolver := newTestResolver()
+	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+		if accessKeyID != testAccessKey {
+			return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+		}
+		return &VirtualCredentials{
+			SecretKey: testSecretKey,
+			IAMPolicy: mustParseTestPolicy(`{
+				"Statement": {
+					"Effect": "Allow",
+					"Action": "s3:GetObject",
+					"Resource": "arn:aws:s3:::test-bucket/source.txt"
+				}
+			}`),
+		}, nil
+	}
 
 	var called bool
 	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -294,15 +481,197 @@ func TestS3Client_CopyObjectDeniedDoesNotCallHandler(t *testing.T) {
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
 
+	req := signedRequestWithHeaders(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds, map[string]string{
+		copySourceHeader: "/" + testBucket + "/source.txt",
+	})
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+	assert.False(t, called)
+}
+
+func TestS3Auth_CopyObjectACLAndTaggingPermissionsRequired(t *testing.T) {
+	resolver := newTestResolver()
+	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+		if accessKeyID != testAccessKey {
+			return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+		}
+		return &VirtualCredentials{
+			SecretKey: testSecretKey,
+			IAMPolicy: mustParseTestPolicy(`{
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": "s3:PutObject",
+						"Resource": "arn:aws:s3:::test-bucket/copied.txt"
+					},
+					{
+						"Effect": "Allow",
+						"Action": "s3:GetObject",
+						"Resource": "arn:aws:s3:::test-bucket/source.txt"
+					}
+				]
+			}`),
+		}, nil
+	}
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	req := signedRequestWithHeaders(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds, map[string]string{
+		copySourceHeader: "/" + testBucket + "/source.txt",
+		"x-amz-acl":      "public-read",
+		"x-amz-tagging":  "class=public",
+	})
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+	assert.False(t, called)
+}
+
+func TestS3Auth_CopyObjectVersionRequiresGetObjectVersion(t *testing.T) {
+	resolver := newTestResolver()
+	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+		if accessKeyID != testAccessKey {
+			return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+		}
+		return &VirtualCredentials{
+			SecretKey: testSecretKey,
+			IAMPolicy: mustParseTestPolicy(`{
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": "s3:PutObject",
+						"Resource": "arn:aws:s3:::test-bucket/copied.txt"
+					},
+					{
+						"Effect": "Allow",
+						"Action": "s3:GetObject",
+						"Resource": "arn:aws:s3:::test-bucket/source.txt"
+					}
+				]
+			}`),
+		}, nil
+	}
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	req := signedRequestWithHeaders(t, http.MethodPut, ts.URL+"/"+testBucket+"/copied.txt", nil, unsignedPayload, validCreds, map[string]string{
+		copySourceHeader: "/" + testBucket + "/source.txt?versionId=version-1",
+	})
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+	assert.False(t, called)
+}
+
+func TestS3Auth_CopyObjectUnsupportedFormsDoNotCallHandler(t *testing.T) {
+	resolver := newTestResolver()
+
+	tests := []struct {
+		name       string
+		target     string
+		copySource string
+	}{
+		{
+			name:       "cross bucket",
+			target:     "/" + testBucket + "/copied.txt",
+			copySource: "/other-bucket/source.txt",
+		},
+		{
+			name:       "multipart copy",
+			target:     "/" + testBucket + "/copied.txt?partNumber=1&uploadId=upload-1",
+			copySource: "/" + testBucket + "/source.txt",
+		},
+		{
+			name:       "acl subresource",
+			target:     "/" + testBucket + "/copied.txt?acl",
+			copySource: "/" + testBucket + "/source.txt",
+		},
+		{
+			name:       "tagging subresource",
+			target:     "/" + testBucket + "/copied.txt?tagging",
+			copySource: "/" + testBucket + "/source.txt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var called bool
+			handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusOK)
+			}))
+			ts := httptest.NewServer(handler)
+			t.Cleanup(ts.Close)
+
+			req := signedRequestWithHeaders(t, http.MethodPut, ts.URL+tt.target, nil, unsignedPayload, validCreds, map[string]string{
+				copySourceHeader: tt.copySource,
+			})
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+			assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+			assert.False(t, called)
+		})
+	}
+}
+
+func TestS3Client_CopyObjectAllowedSameBucketCallsHandler(t *testing.T) {
+	resolver := newTestResolver()
+
+	var called bool
+	handler := S3Auth(resolver)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<CopyObjectResult><ETag>"abc123"</ETag></CopyObjectResult>`))
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
 	client := newUnsignedPayloadS3Client(ts.URL)
 	_, err := client.CopyObject(context.Background(), &s3.CopyObjectInput{
 		Bucket:     aws.String(testBucket),
 		Key:        aws.String("copied.txt"),
-		CopySource: aws.String(testBucket + "/secret.txt"),
+		CopySource: aws.String(testBucket + "/source.txt"),
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AccessDenied")
-	assert.False(t, called)
+	require.NoError(t, err)
+	assert.True(t, called)
 }
 
 func TestS3Auth_InvalidCredentialPolicyReturnsAccessDenied(t *testing.T) {

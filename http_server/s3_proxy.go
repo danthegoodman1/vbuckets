@@ -200,6 +200,15 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 	outReq.ContentLength = r.ContentLength
 
 	copyHeaders(r.Header, outReq.Header)
+	if isCopyObjectRequest(r) {
+		copySource, err := rewriteCopySource(r.Header.Get(copySourceHeader), getBucketName(r.Context()), vbConfig, normalizedPrefix)
+		if err != nil {
+			logger.Warn().Err(err).Msg("failed to rewrite copy source")
+			writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+			return
+		}
+		outReq.Header.Set(copySourceHeader, copySource)
+	}
 
 	endpointHost := parseEndpoint(vbConfig.RealEndpoint).Host
 	if vbConfig.RealUsePathStyle {
