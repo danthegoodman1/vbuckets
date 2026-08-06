@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
 	"github.com/danthegoodman1/vbuckets/http_server"
 	"github.com/danthegoodman1/vbuckets/iam"
-	apiv1 "github.com/danthegoodman1/vbuckets/v1"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"

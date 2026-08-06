@@ -21,8 +21,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
 	"github.com/danthegoodman1/vbuckets/http_server"
-	apiv1 "github.com/danthegoodman1/vbuckets/v1"
 )
 
 type Client struct {

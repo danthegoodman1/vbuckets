@@ -31,9 +31,9 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
 	"github.com/danthegoodman1/vbuckets/controlplane"
 	"github.com/danthegoodman1/vbuckets/http_server"
-	apiv1 "github.com/danthegoodman1/vbuckets/v1"
 )
 
 const garageToml = `

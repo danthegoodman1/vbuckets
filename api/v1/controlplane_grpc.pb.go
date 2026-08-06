@@ -44,6 +44,11 @@ type ControlPlaneClient interface {
 	// to the proxy. The control plane sends deltas whenever credentials, base
 	// hosts, or vbucket mappings change, allowing the proxy to maintain
 	// long-lived caches with fast invalidation.
+	//
+	// This pre-release form is best-effort: it has no revision, resume cursor,
+	// or initial synchronization barrier and therefore does not provide a
+	// no-stale-window guarantee. A revisioned synchronization contract will be
+	// added before the API is considered production-ready.
 	ListenForDeltas(ctx context.Context, in *ListenForDeltasRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Delta], error)
 }
 
@@ -141,6 +146,11 @@ type ControlPlaneServer interface {
 	// to the proxy. The control plane sends deltas whenever credentials, base
 	// hosts, or vbucket mappings change, allowing the proxy to maintain
 	// long-lived caches with fast invalidation.
+	//
+	// This pre-release form is best-effort: it has no revision, resume cursor,
+	// or initial synchronization barrier and therefore does not provide a
+	// no-stale-window guarantee. A revisioned synchronization contract will be
+	// added before the API is considered production-ready.
 	ListenForDeltas(*ListenForDeltasRequest, grpc.ServerStreamingServer[Delta]) error
 	mustEmbedUnimplementedControlPlaneServer()
 }

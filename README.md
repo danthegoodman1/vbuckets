@@ -37,17 +37,104 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 **Phase 1 (authentication)** runs `LookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the request shape and checks IAM permissions. Object and bucket-object operations use `LookupBaseHost` + `LookupVBucket` before proxying. `CreateBucket` uses `CreateVBucket`, and `ListBuckets` uses `ListVBuckets`; neither operation is forwarded to the origin service.
 
-## Path prefix rewriting
+## Target S3 operation and virtualization contract
 
-When a vbucket mapping includes a path prefix, all object keys are transparently scoped under that prefix in the real bucket. For single-object operations (GET, PUT, DELETE, etc.) the prefix is prepended to the key in the URL path. For ListObjects V1/V2 the proxy rewrites the `prefix`, `start-after`, and `marker` query parameters on the way out, and strips the prefix from keys, common prefixes, and other echoed fields in the XML response on the way back, including URL-encoded XML fields when `encoding-type=url` is requested.
+This matrix is the acceptance contract for the Phase 1 request planner and
+Phase 2 namespace transforms; it is not a claim that the current implementation
+already enforces every row. Today, valid examples from the rows are recognized
+and IAM-mapped, but operation detection still accepts some unknown or ambiguous
+query shapes. Prefix rewriting is still applied too broadly to bucket-level
+requests, only successful ListObjects XML has a namespace-aware response
+transform, upstream multipart/error/redirect metadata may pass through, and
+hop-by-hop filtering does not yet remove headers named by `Connection`. Until
+Phases 1 and 2 close those gaps, deployments must not rely on the exact grammar
+or complete no-leak/prefix-isolation properties below.
+
+The target surface is deliberately exact. A request will use only one row;
+unknown query keys, duplicate singleton keys, conflicting subresources, or
+operation-changing headers not named by that row will be unsupported. `X`
+means no operation query or exactly one `x-id` whose value names that AWS
+operation. Every other query key shown is a singleton. A flag such as `uploads`
+must occur once with an empty value. The stable `C-S3-*` identifiers and their
+currently valid representative shapes are checked by
+[`TestS3OperationContract`](./http_server/s3_contract_test.go).
+
+Under the target contract, the signing headers described above are required on
+every row. Ordinary HTTP content, range, and conditional headers are allowed
+where their HTTP method uses them, as are signed `x-amz-meta-*` object metadata
+headers. ACL/grant, tagging, copy, storage-class, and server-side-encryption
+headers affect an operation and are accepted only where called out below.
+Session tokens, KMS enforcement, checksummed trailers, and SigV4 streaming
+chunks are not part of this contract.
+
+| ID | Virtual operation | Exact method/path and allowed query | Relevant headers/body | Required IAM action(s) | Upstream request | Success response |
+|---|---|---|---|---|---|---|
+| C-S3-001 | ListBuckets | `GET /`; `X` | Empty body | `s3:ListAllMyBuckets` on `*` | Not forwarded; control-plane list | R1 |
+| C-S3-002 | CreateBucket | `PUT /{bucket}`; `X` | Empty body or `CreateBucketConfiguration` XML | `s3:CreateBucket` on bucket | Not forwarded; control-plane create | R2 |
+| C-S3-003 | HeadBucket | `HEAD /{bucket}`; `X` | Empty body | `s3:ListBucket` on bucket | Real bucket root; never apply object prefix | R3 |
+| C-S3-004 | ListObjects V1 | `GET /{bucket}`; `prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`, optional `x-id=ListObjects` | Empty body | `s3:ListBucket` on bucket | Real bucket root; prefix `prefix`/`marker` values | R5 |
+| C-S3-005 | ListObjects V2 | `GET /{bucket}`; required `list-type=2`, plus `prefix`, `delimiter`, `continuation-token`, `fetch-owner`, `max-keys`, `encoding-type`, `start-after`, optional `x-id=ListObjectsV2` | Empty body | `s3:ListBucket` on bucket | Real bucket root; prefix key-bearing values | R5 |
+| C-S3-006 | ListMultipartUploads | `GET /{bucket}`; required `uploads`, plus `delimiter`, `encoding-type`, `key-marker`, `max-uploads`, `prefix`, `upload-id-marker`, optional `x-id=ListMultipartUploads` | Empty body | `s3:ListBucketMultipartUploads` on bucket | Real bucket root; prefix key-bearing values | R6 |
+| C-S3-007 | GetObject | `GET /{bucket}/{key}`; response override keys, `partNumber`, optional `x-id=GetObject` | Range/conditional headers; empty body | `s3:GetObject` on object | Prefix object key | R4 |
+| C-S3-008 | HeadObject | `HEAD /{bucket}/{key}`; `partNumber`, optional `x-id=HeadObject` | Conditional headers; empty body | `s3:GetObject` on object | Prefix object key | R3 |
+| C-S3-009 | GetObjectVersion | C-S3-007 plus required `versionId` | As C-S3-007 | `s3:GetObjectVersion` on object | Prefix object key; preserve version | R4 |
+| C-S3-010 | HeadObjectVersion | C-S3-008 plus required `versionId` | As C-S3-008 | `s3:GetObjectVersion` on object | Prefix object key; preserve version | R3 |
+| C-S3-011 | PutObject | `PUT /{bucket}/{key}`; `X` | Object stream; metadata/storage/encryption headers; ACL/grant and tagging headers add their respective IAM checks | `s3:PutObject`, plus `s3:PutObjectAcl` and/or `s3:PutObjectTagging` when used | Prefix object key; stream body | R3 |
+| C-S3-012 | PutObjectAcl | `PUT /{bucket}/{key}`; required `acl`, optional `x-id=PutObjectAcl` | ACL XML or ACL/grant headers | `s3:PutObjectAcl` on object | Prefix object key | R3 |
+| C-S3-013 | PutObjectTagging | `PUT /{bucket}/{key}`; required `tagging`, optional `x-id=PutObjectTagging` | Tagging XML | `s3:PutObjectTagging` on object | Prefix object key | R3 |
+| C-S3-014 | CopyObject | `PUT /{bucket}/{key}`; `X` | Signed `x-amz-copy-source` in the same virtual bucket; optional ACL/grant and tagging headers | Destination `s3:PutObject`; source `s3:GetObject` or `s3:GetObjectVersion`; optional ACL/tagging actions | Prefix destination and source keys; replace source bucket | R10 |
+| C-S3-015 | DeleteObject | `DELETE /{bucket}/{key}`; `X` | Empty body | `s3:DeleteObject` on object | Prefix object key | R3 |
+| C-S3-016 | DeleteObjectVersion | C-S3-015 plus required `versionId` | Empty body | `s3:DeleteObjectVersion` on object | Prefix object key; preserve version | R3 |
+| C-S3-017 | CreateMultipartUpload | `POST /{bucket}/{key}`; required `uploads`, optional `x-id=CreateMultipartUpload` | Metadata/storage/encryption headers; ACL/grant and tagging headers add their respective IAM checks | `s3:PutObject`, plus optional ACL/tagging actions | Prefix object key | R7 |
+| C-S3-018 | UploadPart | `PUT /{bucket}/{key}`; exactly `partNumber` + `uploadId`, optional `x-id=UploadPart` | Part stream | `s3:PutObject` on object | Prefix object key; stream part | R3 |
+| C-S3-019 | ListParts | `GET /{bucket}/{key}`; required `uploadId`, optional `max-parts`, `part-number-marker`, `x-id=ListParts` | Empty body | `s3:ListMultipartUploadParts` on object | Prefix object key | R8 |
+| C-S3-020 | CompleteMultipartUpload | `POST /{bucket}/{key}`; required `uploadId`, optional `x-id=CompleteMultipartUpload` | Bounded completed-parts XML | `s3:PutObject` on object | Prefix object key | R9 |
+| C-S3-021 | AbortMultipartUpload | `DELETE /{bucket}/{key}`; required `uploadId`, optional `x-id=AbortMultipartUpload` | Empty body | `s3:AbortMultipartUpload` on object | Prefix object key | R3 |
+
+“Response override keys” are `response-cache-control`,
+`response-content-disposition`, `response-content-encoding`,
+`response-content-language`, `response-content-type`, and `response-expires`.
+
+The target response profiles are part of the same acceptance boundary:
+
+| Profile | Required behavior |
+|---|---|
+| R1 | Synthesize ListBuckets XML containing virtual bucket names only. |
+| R2 | Synthesize CreateBucket XML and `Location` from the virtual bucket. |
+| R3 | Forward only safe status/headers; there is no namespace-bearing success body. |
+| R4 | Stream object bytes without buffering; forward only safe object metadata headers. |
+| R5 | Stream-transform ListObjects XML, removing the configured prefix from every key/marker/prefix and replacing the bucket name. |
+| R6 | Transform ListMultipartUploads XML, including bucket, prefix, key markers, upload keys, and common prefixes. |
+| R7 | Transform CreateMultipartUpload bucket/key fields. |
+| R8 | Transform ListParts bucket/key and marker fields. |
+| R9 | Transform CompleteMultipartUpload bucket/key/location fields. |
+| R10 | Transform any namespace-bearing CopyObject success fields. |
+
+For every target profile, non-success XML, redirects, and headers must follow
+one global rule: configured real endpoint, bucket, region routing data, access
+keys, and path prefix must never be client-visible. Phase 2 will validate and
+transform namespace-bearing control XML before committing response headers
+while keeping unbounded object and list bodies streaming. It must strip
+hop-by-hop headers, headers named by `Connection`, unsafe trailers, upstream
+endpoint headers, and stale length/checksum metadata after a body transform.
+
+Under the completed contract, a mapping's path prefix is applied only to object
+keys and key-bearing list/multipart fields; bucket-level requests stay at the
+real bucket root. The Phase 2 gate will prove that two virtual buckets sharing
+one backend have disjoint request namespaces and cannot infer each other's
+configured identifiers from successes, errors, or redirects.
 
 ## IAM
 
 Credentials carry a required AWS IAM JSON identity policy. Each proxied
 request is evaluated against that policy before forwarding to the real bucket.
-Evaluation is fail-closed: implicit deny is the default, explicit `Deny`
-overrides `Allow`, malformed policies are rejected, and unsupported IAM/S3
-features are denied instead of ignored.
+For policies that compile today, unmatched requests default to implicit deny
+and a valid explicit `Deny` overrides `Allow`. The parser rejects malformed
+JSON/policy structure and unknown policy elements and condition keys. It does
+not yet reject malformed typed bool/null/numeric/date condition operands, and
+S3 request-shape detection is not yet exact. Phase 1 makes both boundaries
+fail closed before the broader malformed-policy and unsupported-S3 guarantees
+are considered complete.
 
 The supported surface is the S3 data-plane core that vbuckets can enforce from
 the incoming request:
@@ -59,26 +146,10 @@ the incoming request:
   bool, null, numeric, and date comparisons.
 - CreateBucket policies may use `s3:LocationConstraint` when the request body
   includes a location constraint.
-- Supported S3 actions:
-  - `s3:ListAllMyBuckets`
-  - `s3:CreateBucket`
-  - `s3:ListBucket`
-  - `s3:ListBucketMultipartUploads`
-  - `s3:GetObject`
-  - `s3:GetObjectVersion`
-  - `s3:PutObject`
-  - `s3:PutObjectAcl`
-  - `s3:PutObjectTagging`
-  - `s3:DeleteObject`
-  - `s3:DeleteObjectVersion`
-  - `s3:AbortMultipartUpload`
-  - `s3:ListMultipartUploadParts`
-- Requests that map to unsupported S3 actions or unsupported subresources are
-  denied before proxying.
-- CopyObject (`PUT` with `x-amz-copy-source`) is supported only within the same
-  virtual bucket. vbuckets authorizes destination `s3:PutObject` plus source
-  `s3:GetObject` or `s3:GetObjectVersion`, rewrites the source to the real
-  bucket/prefix, then waits synchronously for upstream S3. Cross-bucket,
+- The target mapping between S3 actions and exact operations is defined by the
+  matrix above. Phase 1 will make requests outside that grammar fail before
+  proxying; the current branch does not yet provide that exactness guarantee.
+- CopyObject is supported only within the same virtual bucket. Cross-bucket,
   cross-vbucket, ARN/access-point/absolute URL, and multipart copy requests are
   denied before proxying.
 - Unsupported identity-policy features such as `Principal`, policy variables,
@@ -106,13 +177,48 @@ The unary RPCs handle on-demand lookups and intercepted create/list operations. 
 
 ### Delta stream
 
-`ListenForDeltas` is a server-streaming RPC that pushes cache updates to the proxy. When credentials are revoked, bucket mappings change, or base hosts are added/removed, the control plane sends a `Delta` message with the full updated value (upsert) or a removal flag. This gives an Envoy xDS-like pattern: long-lived caches with fast, precise invalidation -- no polling, no stale windows.
+`ListenForDeltas` is a server-streaming RPC that pushes cache updates to the proxy. When credentials are revoked, bucket mappings change, or base hosts are added/removed, the control plane sends a `Delta` message with the full updated value (upsert) or a removal flag.
 
 Each delta also carries a `ttl` so the control plane controls per-entry cache lifetimes even for pushed data.
+
+The current pre-release v1 messages do not carry a revision, resume cursor, or
+initial synchronization barrier. Its delta stream is therefore best-effort:
+it shortens ordinary propagation but cannot claim “no stale windows.” Before
+the control-plane API is production-ready, its revisioned synchronization
+contract is:
+
+- Revisions are monotonic. Neither an older unary lookup nor a reordered event
+  may replace or be returned after a newer revision has been observed.
+- The proxy is not ready at startup or reconnect until it observes an explicit
+  synchronization barrier covering its cache state.
+- A missing revision, invalid resume cursor, disconnect, or stream failure
+  makes the proxy unsynchronized immediately. Readiness fails and authorization
+  and routing decisions fail closed until a new barrier is established.
+- Cache TTL is a memory/load policy, not a revocation guarantee. Maximum
+  revocation exposure is measured as stream-failure detection time plus
+  control-plane resynchronization time; both components must be observable and
+  bounded by deployment configuration.
+- Negative lookup results are revisioned and cached separately from service
+  failures. Unavailable/internal responses are never converted into negatives.
 
 ### Caching
 
 Lookup results and deltas are cached locally, going to the control plane as needed. Three independent caches (credentials, base hosts, vbuckets) each use per-entry TTLs from the control plane. Cache misses trigger the unary gRPC lookup; concurrent requests for the same key are deduplicated automatically to protect the control plane from thundering herds.
+
+## Development toolchain
+
+The supported compiler is Go 1.26.0, as declared by `go.mod`. Protobuf checks
+use Buf v1.72.0 and exact `protoc-gen-go` v1.36.11 revision 1 /
+`protoc-gen-go-grpc` v1.6.1 revision 1 remote plugins; `make` invokes the pinned
+Buf module with `go run`, so a different globally installed Buf cannot change
+results.
+
+- `make generate` refreshes generated Go sources in `api/v1`.
+- `make proto-check` lints, generates into an isolated directory, and fails on
+  generated-code drift or the wrong output path.
+- `make proto-breaking` compares the API with `main` (override with
+  `PROTO_BASELINE=<branch>`).
+- `make check` runs protobuf lint/drift/breaking gates and the full Go suite.
 
 ### Configuration
 
