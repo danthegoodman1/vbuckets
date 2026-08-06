@@ -1,6 +1,7 @@
 package http_server
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -47,10 +48,15 @@ func RegisterS3Routes(resolver Resolver) RegisterRoutes {
 
 func handleS3Request(resolver Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		switch getS3Operation(r.Context()) {
-		case s3OperationCreateBucket:
+		plan := getS3OperationPlan(r.Context())
+		if plan == nil {
+			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Missing validated S3 operation plan")
+			return
+		}
+		switch plan.kind {
+		case operationCreateBucket:
 			handleCreateVBucket(resolver, w, r)
-		case s3OperationListBuckets:
+		case operationListBuckets:
 			handleListVBuckets(resolver, w, r)
 		default:
 			proxyS3Request(w, r)
@@ -169,14 +175,19 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 	logger := zerolog.Ctx(r.Context())
 
 	vbConfig := getVBucketConfig(r.Context())
-	objectKey := getObjectKey(r.Context())
+	plan := getS3OperationPlan(r.Context())
+	if plan == nil {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Missing validated S3 operation plan")
+		return
+	}
+	objectKey := plan.objectKey
 
 	var normalizedPrefix string
 	if vbConfig.PathPrefix != "" {
 		normalizedPrefix = strings.TrimSuffix(vbConfig.PathPrefix, "/") + "/"
 	}
 
-	listRewrite := normalizedPrefix != "" && isListObjectsRequest(r.Method, objectKey, r.URL.RawQuery)
+	listRewrite := normalizedPrefix != "" && (plan.kind == operationListObjects || plan.kind == operationListObjectsV2)
 
 	// For non-list requests, prepend the prefix to the object key in the path.
 	// For list requests, the prefix goes into the query parameters instead.
@@ -184,30 +195,29 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 		objectKey = normalizedPrefix + objectKey
 	}
 
-	rawQuery := r.URL.RawQuery
+	rawQuery := plan.rawQuery
 	if listRewrite {
 		rawQuery = rewriteListQueryForPrefix(rawQuery, normalizedPrefix)
 	}
 
 	outboundURL := buildOutboundURL(vbConfig, objectKey, rawQuery)
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outboundURL, r.Body)
+	body := r.Body
+	if plan.bodyKind == bodyCompleteMultipartXML {
+		body = io.NopCloser(bytes.NewReader(plan.controlBody))
+	}
+	outReq, err := http.NewRequestWithContext(r.Context(), plan.method, outboundURL, body)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create outbound request")
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to construct upstream request")
 		return
 	}
-	outReq.ContentLength = r.ContentLength
+	outReq.ContentLength = plan.contentLength
 
-	copyHeaders(r.Header, outReq.Header)
-	if isCopyObjectRequest(r) {
-		copySource, err := rewriteCopySource(r.Header.Get(copySourceHeader), getBucketName(r.Context()), vbConfig, normalizedPrefix)
-		if err != nil {
-			logger.Warn().Err(err).Msg("failed to rewrite copy source")
-			writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-			return
-		}
-		outReq.Header.Set(copySourceHeader, copySource)
+	copyHeaders(plan.forwardHeaders, outReq.Header)
+	if plan.kind == operationCopyObject {
+		source := plan.copySource
+		outReq.Header.Set(copySourceHeader, buildCopySource(vbConfig.RealBucket, normalizedPrefix+source.Key, source.VersionID))
 	}
 
 	endpointHost := parseEndpoint(vbConfig.RealEndpoint).Host
@@ -243,7 +253,7 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 		copyHeaders(resp.Header, w.Header())
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		if err := rewriteListResponse(resp.Body, w, normalizedPrefix, getBucketName(r.Context()), listResponseUsesURLEncoding(r.URL.RawQuery)); err != nil {
+		if err := rewriteListResponse(resp.Body, w, normalizedPrefix, plan.bucket, listResponseUsesURLEncoding(plan.rawQuery)); err != nil {
 			logger.Error().Err(err).Msg("failed to rewrite list response")
 		}
 		return

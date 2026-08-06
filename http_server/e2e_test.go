@@ -281,7 +281,7 @@ func TestE2E_CopyObjectSameVirtualBucket(t *testing.T) {
 		CopySource: aws.String("other-virtual-bucket/" + sourceKey),
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AccessDenied")
+	assert.Contains(t, err.Error(), "InvalidRequest")
 
 	_, err = e.ProxyClient.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
 		Bucket:     aws.String(e2eVirtualBucket),
@@ -291,7 +291,7 @@ func TestE2E_CopyObjectSameVirtualBucket(t *testing.T) {
 		UploadId:   aws.String("upload-1"),
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AccessDenied")
+	assert.Contains(t, err.Error(), "InvalidRequest")
 }
 
 func TestE2E_ListObjectsPrefixIsolation(t *testing.T) {

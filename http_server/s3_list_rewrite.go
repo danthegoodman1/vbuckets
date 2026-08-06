@@ -7,35 +7,6 @@ import (
 	"strings"
 )
 
-// bucketSubresources are S3 bucket-level query params that indicate
-// non-list operations (GetBucketVersioning, GetBucketAcl, etc.).
-// If any of these appear in the query string, the request is NOT a list request.
-var bucketSubresources = map[string]bool{
-	"acl": true, "cors": true, "lifecycle": true, "policy": true,
-	"versioning": true, "tagging": true, "encryption": true,
-	"notification": true, "replication": true, "website": true,
-	"logging": true, "accelerate": true, "analytics": true,
-	"inventory": true, "metrics": true, "publicAccessBlock": true,
-	"ownershipControls": true, "intelligent-tiering": true,
-	"object-lock": true, "location": true,
-	// These are list-like but have different response schemas;
-	// treat them as subresources for now until we add dedicated rewriting.
-	"versions": true, "uploads": true,
-}
-
-func isListObjectsRequest(method string, objectKey string, rawQuery string) bool {
-	if method != "GET" || objectKey != "" {
-		return false
-	}
-	query, _ := url.ParseQuery(rawQuery)
-	for key := range query {
-		if bucketSubresources[key] {
-			return false
-		}
-	}
-	return true
-}
-
 // rewriteListQueryForPrefix prepends pathPrefix to the prefix, start-after,
 // and marker query parameters used by ListObjects V1/V2.
 func rewriteListQueryForPrefix(rawQuery string, pathPrefix string) string {

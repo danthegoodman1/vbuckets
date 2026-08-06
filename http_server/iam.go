@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +38,31 @@ var s3AllowedConditionKeys = map[string]bool{
 	"aws:securetransport":             true,
 }
 
+var s3ConditionKeyTypes = map[string]iam.ConditionValueType{
+	"s3:prefix":                       iam.ConditionValueString,
+	"s3:delimiter":                    iam.ConditionValueString,
+	"s3:max-keys":                     iam.ConditionValueNumeric,
+	"s3:locationconstraint":           iam.ConditionValueString,
+	"s3:authtype":                     iam.ConditionValueString,
+	"s3:signatureversion":             iam.ConditionValueString,
+	"s3:signatureage":                 iam.ConditionValueNumeric,
+	"s3:x-amz-acl":                    iam.ConditionValueString,
+	"s3:x-amz-copy-source":            iam.ConditionValueString,
+	"s3:x-amz-grant-full-control":     iam.ConditionValueString,
+	"s3:x-amz-grant-read":             iam.ConditionValueString,
+	"s3:x-amz-grant-read-acp":         iam.ConditionValueString,
+	"s3:x-amz-grant-write":            iam.ConditionValueString,
+	"s3:x-amz-grant-write-acp":        iam.ConditionValueString,
+	"s3:x-amz-metadata-directive":     iam.ConditionValueString,
+	"s3:x-amz-server-side-encryption": iam.ConditionValueString,
+	"s3:x-amz-storage-class":          iam.ConditionValueString,
+	"s3:x-amz-tagging":                iam.ConditionValueString,
+	"s3:x-amz-tagging-directive":      iam.ConditionValueString,
+	"aws:currenttime":                 iam.ConditionValueDate,
+	"aws:epochtime":                   iam.ConditionValueNumeric,
+	"aws:securetransport":             iam.ConditionValueBool,
+}
+
 var s3HeaderConditionKeys = map[string]string{
 	"x-amz-acl":                    "s3:x-amz-acl",
 	"x-amz-copy-source":            "s3:x-amz-copy-source",
@@ -57,14 +81,15 @@ var s3HeaderConditionKeys = map[string]string{
 func ParseS3IAMPolicyJSON(policyJSON string) (*iam.Policy, error) {
 	return iam.ParsePolicyJSON(policyJSON, iam.Options{
 		AllowedConditionKeys: s3AllowedConditionKeys,
+		ConditionKeyTypes:    s3ConditionKeyTypes,
 	})
 }
 
-func AuthorizeS3Request(policy *iam.Policy, r *http.Request, authInfo *AuthInfo, bucket, objectKey, locationConstraint string) error {
-	checks, err := buildS3IAMRequests(r, bucket, objectKey, locationConstraint, authInfo, time.Now().UTC())
-	if err != nil {
-		return err
+func AuthorizeS3Plan(policy *iam.Policy, plan *S3OperationPlan) error {
+	if plan == nil || !plan.authorizationReady {
+		return fmt.Errorf("%w: operation plan authorization context is not sealed", ErrMalformedS3Request)
 	}
+	checks := buildS3IAMRequestsFromPlan(plan)
 	for _, check := range checks {
 		if err := policy.Authorize(check); err != nil {
 			return err
@@ -73,202 +98,80 @@ func AuthorizeS3Request(policy *iam.Policy, r *http.Request, authInfo *AuthInfo,
 	return nil
 }
 
-func buildS3IAMRequests(r *http.Request, bucket, objectKey, locationConstraint string, authInfo *AuthInfo, now time.Time) ([]iam.Request, error) {
-	checks, err := mapS3IAMChecks(r, bucket, objectKey)
-	if err != nil {
-		return nil, err
+func buildS3IAMRequestsFromPlan(plan *S3OperationPlan) []iam.Request {
+	checks := make([]iam.Request, len(plan.iamChecks))
+	for i := range plan.iamChecks {
+		checks[i] = plan.iamChecks[i]
+		checks[i].Context = cloneIAMContext(plan.iamChecks[i].Context)
 	}
-	ctx := buildS3IAMContext(r, authInfo, bucket, objectKey, locationConstraint, now)
-	for i := range checks {
-		checks[i].Context = ctx
-	}
-	return checks, nil
+	return checks
 }
 
-func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, error) {
-	query := r.URL.Query()
-	bucketResource := s3BucketARN(bucket)
-	objectResource := s3ObjectARN(bucket, objectKey)
-
-	if bucket == "" && objectKey == "" {
-		if r.Method == http.MethodGet && queryHasOnlyIgnoredKeys(query) {
-			return []iam.Request{newIAMRequest("s3:ListAllMyBuckets", "*")}, nil
-		}
-		return nil, unsupportedS3Operation(r)
-	}
-
-	if objectKey == "" {
-		switch r.Method {
-		case http.MethodPut:
-			if isCopyObjectRequest(r) {
-				return nil, unsupportedS3Operation(r)
-			}
-			if queryHasOnlyIgnoredKeys(query) {
-				return []iam.Request{newIAMRequest("s3:CreateBucket", bucketResource)}, nil
-			}
-			return nil, unsupportedS3Operation(r)
-		case http.MethodGet:
-			if hasQueryKey(query, "uploads") {
-				return []iam.Request{newIAMRequest("s3:ListBucketMultipartUploads", bucketResource)}, nil
-			}
-			if isListObjectsRequest(r.Method, objectKey, r.URL.RawQuery) {
-				return []iam.Request{newIAMRequest("s3:ListBucket", bucketResource)}, nil
-			}
-			return nil, unsupportedS3Operation(r)
-		case http.MethodHead:
-			if queryHasOnlyIgnoredKeys(query) {
-				return []iam.Request{newIAMRequest("s3:ListBucket", bucketResource)}, nil
-			}
-			return nil, unsupportedS3Operation(r)
-		default:
-			return nil, unsupportedS3Operation(r)
-		}
-	}
-
-	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		if hasQueryKey(query, "uploadId") {
-			return []iam.Request{newIAMRequest("s3:ListMultipartUploadParts", objectResource)}, nil
-		}
-		if hasAnyQueryKey(query, "acl", "tagging", "torrent", "legal-hold", "retention", "attributes") {
-			return nil, unsupportedS3Operation(r)
-		}
-		if hasQueryKey(query, "versionId") {
-			return []iam.Request{newIAMRequest("s3:GetObjectVersion", objectResource)}, nil
-		}
-		return []iam.Request{newIAMRequest("s3:GetObject", objectResource)}, nil
-
-	case http.MethodPut:
-		if isCopyObjectRequest(r) {
-			if hasAnyQueryKey(query, "partNumber", "uploadId") || !queryHasOnlyIgnoredKeys(query) {
-				return nil, unsupportedS3Operation(r)
-			}
-			source, err := parseCopySource(r.Header.Get(copySourceHeader), bucket)
-			if err != nil {
-				return nil, unsupportedS3Operation(r)
-			}
-
-			checks := []iam.Request{
-				newIAMRequest("s3:PutObject", objectResource),
-			}
-			sourceAction := "s3:GetObject"
-			if source.VersionID != "" {
-				sourceAction = "s3:GetObjectVersion"
-			}
-			checks = append(checks, newIAMRequest(sourceAction, s3ObjectARN(bucket, source.Key)))
-			if requestUsesACLHeaders(r) {
-				checks = append(checks, newIAMRequest("s3:PutObjectAcl", objectResource))
-			}
-			if hasHeader(r, "x-amz-tagging") {
-				checks = append(checks, newIAMRequest("s3:PutObjectTagging", objectResource))
-			}
-			return checks, nil
-		}
-		if hasQueryKey(query, "tagging") {
-			return []iam.Request{newIAMRequest("s3:PutObjectTagging", objectResource)}, nil
-		}
-		if hasQueryKey(query, "acl") {
-			return []iam.Request{newIAMRequest("s3:PutObjectAcl", objectResource)}, nil
-		}
-		if hasQueryKey(query, "partNumber") && !hasQueryKey(query, "uploadId") {
-			return nil, unsupportedS3Operation(r)
-		}
-		if hasQueryKey(query, "uploadId") && !hasQueryKey(query, "partNumber") {
-			return nil, unsupportedS3Operation(r)
-		}
-		checks := []iam.Request{newIAMRequest("s3:PutObject", objectResource)}
-		if requestUsesACLHeaders(r) {
-			checks = append(checks, newIAMRequest("s3:PutObjectAcl", objectResource))
-		}
-		if hasHeader(r, "x-amz-tagging") {
-			checks = append(checks, newIAMRequest("s3:PutObjectTagging", objectResource))
-		}
-		return checks, nil
-
-	case http.MethodDelete:
-		if hasQueryKey(query, "uploadId") {
-			return []iam.Request{newIAMRequest("s3:AbortMultipartUpload", objectResource)}, nil
-		}
-		if hasQueryKey(query, "versionId") {
-			return []iam.Request{newIAMRequest("s3:DeleteObjectVersion", objectResource)}, nil
-		}
-		if !queryHasOnlyIgnoredKeys(query) {
-			return nil, unsupportedS3Operation(r)
-		}
-		return []iam.Request{newIAMRequest("s3:DeleteObject", objectResource)}, nil
-
-	case http.MethodPost:
-		if hasQueryKey(query, "uploads") || hasQueryKey(query, "uploadId") {
-			return []iam.Request{newIAMRequest("s3:PutObject", objectResource)}, nil
-		}
-		return nil, unsupportedS3Operation(r)
-
-	default:
-		return nil, unsupportedS3Operation(r)
-	}
-}
-
-func buildS3IAMContext(r *http.Request, authInfo *AuthInfo, bucket, objectKey, locationConstraint string, now time.Time) iam.Context {
+func buildS3IAMWireContext(plan *S3OperationPlan) iam.Context {
 	ctx := iam.Context{
 		"s3:authtype":         []string{"REST-HEADER"},
 		"s3:signatureversion": []string{"AWS4-HMAC-SHA256"},
-		"aws:currenttime":     []string{now.Format(time.RFC3339)},
-		"aws:epochtime":       []string{strconv.FormatInt(now.Unix(), 10)},
-		"aws:securetransport": []string{strconv.FormatBool(r.TLS != nil)},
+		"aws:securetransport": []string{strconv.FormatBool(plan.secureTransport)},
 	}
 
-	query := r.URL.Query()
-	if locationConstraint != "" {
-		ctx["s3:locationconstraint"] = []string{locationConstraint}
-	}
-	if bucket != "" && isBucketListLikeRequest(r.Method, objectKey, r.URL.RawQuery) {
-		ctx["s3:prefix"] = queryValuesOrDefault(query, "prefix", "")
-		if values, ok := query["delimiter"]; ok {
-			ctx["s3:delimiter"] = values
+	if plan.kind == operationListObjects || plan.kind == operationListObjectsV2 || plan.kind == operationListMultipartUploads {
+		ctx["s3:prefix"] = queryValuesOrDefault(plan.query, "prefix", "")
+		if values, ok := plan.query["delimiter"]; ok {
+			ctx["s3:delimiter"] = append([]string(nil), values...)
 		}
-		if values, ok := query["max-keys"]; ok {
-			ctx["s3:max-keys"] = values
+		if values, ok := plan.query["max-keys"]; ok {
+			ctx["s3:max-keys"] = append([]string(nil), values...)
 		}
 	}
 
 	for header, conditionKey := range s3HeaderConditionKeys {
-		if values := r.Header.Values(header); len(values) > 0 {
-			ctx[conditionKey] = values
+		if values := allHeaderValues(plan.forwardHeaders, header); len(values) > 0 {
+			ctx[conditionKey] = append([]string(nil), values...)
 		}
 	}
-
-	if authInfo != nil {
-		if signedAt, err := time.Parse("20060102T150405Z", r.Header.Get("X-Amz-Date")); err == nil {
-			age := now.Sub(signedAt.UTC())
-			if age < 0 {
-				age = 0
-			}
-			ctx["s3:signatureage"] = []string{strconv.FormatInt(age.Milliseconds(), 10)}
-		}
-	}
-
 	return ctx
 }
 
-func isBucketListLikeRequest(method string, objectKey string, rawQuery string) bool {
-	query, _ := url.ParseQuery(rawQuery)
-	return method == http.MethodGet && objectKey == "" && (!hasAnyBucketSubresource(query) || hasQueryKey(query, "uploads"))
-}
-
-func hasAnyBucketSubresource(query url.Values) bool {
-	for key := range query {
-		if bucketSubresources[key] {
-			return true
-		}
+func (p *S3OperationPlan) withAuthorizationContext(locationConstraint string, now time.Time) *S3OperationPlan {
+	plan := p.clone()
+	plan.locationConstraint = locationConstraint
+	ctx := cloneIAMContext(plan.iamContext)
+	ctx["aws:currenttime"] = []string{now.Format(time.RFC3339)}
+	ctx["aws:epochtime"] = []string{strconv.FormatInt(now.Unix(), 10)}
+	if locationConstraint != "" {
+		ctx["s3:locationconstraint"] = []string{locationConstraint}
 	}
-	return false
+	if signedAt, err := time.Parse("20060102T150405Z", plan.signedAt); err == nil {
+		age := now.Sub(signedAt.UTC())
+		if age < 0 {
+			age = 0
+		}
+		ctx["s3:signatureage"] = []string{strconv.FormatInt(age.Milliseconds(), 10)}
+	}
+	plan.iamContext = cloneIAMContext(ctx)
+	for i := range plan.iamChecks {
+		plan.iamChecks[i].Context = cloneIAMContext(ctx)
+	}
+	plan.authorizationReady = true
+	return plan
 }
 
-func queryValuesOrDefault(query url.Values, key, defaultValue string) []string {
+func queryValuesOrDefault(query map[string][]string, key, defaultValue string) []string {
 	if values, ok := query[key]; ok {
-		return values
+		return append([]string(nil), values...)
 	}
 	return []string{defaultValue}
+}
+
+func cloneIAMContext(ctx iam.Context) iam.Context {
+	if ctx == nil {
+		return nil
+	}
+	clone := make(iam.Context, len(ctx))
+	for key, values := range ctx {
+		clone[key] = append([]string(nil), values...)
+	}
+	return clone
 }
 
 func newIAMRequest(action, resource string) iam.Request {
@@ -286,35 +189,12 @@ func s3ObjectARN(bucket, key string) string {
 	return "arn:aws:s3:::" + bucket + "/" + key
 }
 
-func hasQueryKey(query url.Values, key string) bool {
-	_, ok := query[key]
-	return ok
-}
-
-func hasAnyQueryKey(query url.Values, keys ...string) bool {
-	for _, key := range keys {
-		if hasQueryKey(query, key) {
-			return true
-		}
-	}
-	return false
-}
-
-func queryHasOnlyIgnoredKeys(query url.Values) bool {
-	for key := range query {
-		if key != "x-id" {
-			return false
-		}
-	}
-	return true
-}
-
 func requestUsesACLHeaders(r *http.Request) bool {
 	if hasHeader(r, "x-amz-acl") {
 		return true
 	}
 	for name := range r.Header {
-		if strings.HasPrefix(strings.ToLower(name), "x-amz-grant-") {
+		if knownGrantHeader(strings.ToLower(name)) {
 			return true
 		}
 	}
@@ -322,8 +202,7 @@ func requestUsesACLHeaders(r *http.Request) bool {
 }
 
 func hasHeader(r *http.Request, key string) bool {
-	_, ok := r.Header[http.CanonicalHeaderKey(key)]
-	return ok
+	return len(allHeaderValues(r.Header, key)) != 0
 }
 
 func unsupportedS3Operation(r *http.Request) error {

@@ -401,3 +401,36 @@ func FuzzParsePolicyJSON(f *testing.F) {
 		})
 	})
 }
+
+func TestParsePolicyJSONRejectsMalformedTypedConditionOperands(t *testing.T) {
+	tests := []struct {
+		name     string
+		operator string
+		key      string
+		value    string
+	}{
+		{name: "bool", operator: "Bool", key: "aws:SecureTransport", value: `"definitely"`},
+		{name: "null", operator: "Null", key: "test:key", value: `"sometimes"`},
+		{name: "numeric text", operator: "NumericLessThan", key: "s3:max-keys", value: `"ten"`},
+		{name: "numeric NaN", operator: "NumericEquals", key: "s3:max-keys", value: `"NaN"`},
+		{name: "numeric infinity", operator: "NumericGreaterThan", key: "s3:max-keys", value: `"+Inf"`},
+		{name: "date", operator: "DateGreaterThan", key: "aws:CurrentTime", value: `"tomorrow-ish"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policyJSON := fmt.Sprintf(`{
+				"Statement": {
+					"Effect": "Deny",
+					"Action": "s3:GetObject",
+					"Resource": "*",
+					"Condition": {%q: {%q: %s}}
+				}
+			}`, tt.operator, tt.key, tt.value)
+
+			policy, err := ParsePolicyJSON(policyJSON, Options{AllowedConditionKeys: testConditionKeys})
+			require.Nil(t, policy)
+			require.ErrorIs(t, err, ErrInvalidPolicy)
+		})
+	}
+}

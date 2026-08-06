@@ -1,6 +1,7 @@
 package http_server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func mapS3IAMChecks(r *http.Request, bucket, objectKey string) ([]iam.Request, error) {
+	plan, err := planS3Operation(r, bucket, objectKey)
+	if err != nil {
+		return nil, err
+	}
+	checks := buildS3IAMRequestsFromPlan(plan)
+	for i := range checks {
+		checks[i].Context = nil
+	}
+	return checks, nil
+}
+
+func buildS3IAMRequests(r *http.Request, bucket, objectKey, locationConstraint string, now time.Time) ([]iam.Request, error) {
+	plan, err := planS3Operation(r, bucket, objectKey)
+	if err != nil {
+		return nil, err
+	}
+	plan = plan.withAuthorizationContext(locationConstraint, now)
+	return buildS3IAMRequestsFromPlan(plan), nil
+}
 
 func TestMapS3IAMChecks_CoreOperations(t *testing.T) {
 	tests := []struct {
@@ -235,13 +257,317 @@ func TestMapS3IAMChecks_RejectsUnsupportedOperations(t *testing.T) {
 	}
 }
 
+func TestMapS3IAMChecks_FailsClosedOnAmbiguousQueryShapes(t *testing.T) {
+	tests := []struct {
+		name      string
+		method    string
+		target    string
+		bucket    string
+		objectKey string
+		headers   map[string]string
+	}{
+		{name: "put object retention", method: http.MethodPut, target: "/test-bucket/a.txt?retention", bucket: testBucket, objectKey: "a.txt"},
+		{name: "unknown bucket get", method: http.MethodGet, target: "/test-bucket?inventory", bucket: testBucket},
+		{name: "duplicate version id", method: http.MethodGet, target: "/test-bucket/a.txt?versionId=v1&versionId=v2", bucket: testBucket, objectKey: "a.txt"},
+		{name: "mismatched x-id", method: http.MethodGet, target: "/test-bucket/a.txt?x-id=PutObject", bucket: testBucket, objectKey: "a.txt"},
+		{name: "invalid empty x-id", method: http.MethodGet, target: "/test-bucket/a.txt?x-id=", bucket: testBucket, objectKey: "a.txt"},
+		{name: "conflicting object subresources", method: http.MethodPut, target: "/test-bucket/a.txt?acl&tagging", bucket: testBucket, objectKey: "a.txt"},
+		{name: "conflicting bucket subresources", method: http.MethodGet, target: "/test-bucket?uploads&list-type=2", bucket: testBucket},
+		{name: "duplicate multipart flag", method: http.MethodPost, target: "/test-bucket/a.txt?uploads&uploads", bucket: testBucket, objectKey: "a.txt"},
+		{name: "invalid part number", method: http.MethodGet, target: "/test-bucket/a.txt?partNumber=0", bucket: testBucket, objectKey: "a.txt"},
+		{name: "invalid max keys", method: http.MethodGet, target: "/test-bucket?max-keys=lots", bucket: testBucket},
+		{name: "invalid fetch owner", method: http.MethodGet, target: "/test-bucket?list-type=2&fetch-owner=yes", bucket: testBucket},
+		{name: "invalid encoding type", method: http.MethodGet, target: "/test-bucket?encoding-type=xml", bucket: testBucket},
+		{name: "object lock header", method: http.MethodPut, target: "/test-bucket/a.txt", bucket: testBucket, objectKey: "a.txt", headers: map[string]string{"x-amz-object-lock-mode": "GOVERNANCE"}},
+		{name: "KMS encryption mode", method: http.MethodPut, target: "/test-bucket/a.txt", bucket: testBucket, objectKey: "a.txt", headers: map[string]string{"x-amz-server-side-encryption": "aws:kms"}},
+		{name: "copy source on get", method: http.MethodGet, target: "/test-bucket/a.txt", bucket: testBucket, objectKey: "a.txt", headers: map[string]string{copySourceHeader: "/test-bucket/source.txt"}},
+		{name: "governance bypass delete", method: http.MethodDelete, target: "/test-bucket/a.txt", bucket: testBucket, objectKey: "a.txt", headers: map[string]string{"x-amz-bypass-governance-retention": "true"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.target, nil)
+			for name, value := range tt.headers {
+				req.Header.Set(name, value)
+			}
+			_, err := mapS3IAMChecks(req, tt.bucket, tt.objectKey)
+			require.ErrorIs(t, err, ErrUnsupportedS3Operation)
+		})
+	}
+}
+
+func TestS3Auth_UnsupportedShapeFailsBeforeVBucketLookup(t *testing.T) {
+	resolver := newTestResolver()
+	vbucketLookups := 0
+	resolver.vbucket = func(context.Context, string, string) (*VBucketConfig, error) {
+		vbucketLookups++
+		return &VBucketConfig{}, nil
+	}
+
+	called := false
+	handler := S3Auth(resolver)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	req := signedRequest(t, http.MethodPut, ts.URL+"/"+testBucket+"/a.txt?retention", nil, unsignedPayload, validCreds)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Zero(t, vbucketLookups)
+	assert.False(t, called)
+}
+
+func TestPlanS3OperationRejectsBodiesForEmptyOperations(t *testing.T) {
+	tests := []struct {
+		name      string
+		method    string
+		target    string
+		bucket    string
+		objectKey string
+		headers   map[string]string
+	}{
+		{name: "list buckets", method: http.MethodGet, target: "/"},
+		{name: "head bucket", method: http.MethodHead, target: "/bucket", bucket: "bucket"},
+		{name: "list objects", method: http.MethodGet, target: "/bucket?list-type=2", bucket: "bucket"},
+		{name: "list multipart uploads", method: http.MethodGet, target: "/bucket?uploads", bucket: "bucket"},
+		{name: "get object", method: http.MethodGet, target: "/bucket/key", bucket: "bucket", objectKey: "key"},
+		{name: "head object", method: http.MethodHead, target: "/bucket/key", bucket: "bucket", objectKey: "key"},
+		{name: "copy object", method: http.MethodPut, target: "/bucket/key", bucket: "bucket", objectKey: "key", headers: map[string]string{copySourceHeader: "/bucket/source"}},
+		{name: "delete object", method: http.MethodDelete, target: "/bucket/key", bucket: "bucket", objectKey: "key"},
+		{name: "create multipart", method: http.MethodPost, target: "/bucket/key?uploads", bucket: "bucket", objectKey: "key"},
+		{name: "list parts", method: http.MethodGet, target: "/bucket/key?uploadId=u1", bucket: "bucket", objectKey: "key"},
+		{name: "abort multipart", method: http.MethodDelete, target: "/bucket/key?uploadId=u1", bucket: "bucket", objectKey: "key"},
+	}
+
+	for _, tt := range tests {
+		for _, body := range []struct {
+			name    string
+			unknown bool
+		}{
+			{name: "known length"},
+			{name: "chunked unknown length", unknown: true},
+		} {
+			t.Run(tt.name+"/"+body.name, func(t *testing.T) {
+				req := httptest.NewRequest(tt.method, tt.target, strings.NewReader("not-empty"))
+				if body.unknown {
+					req.ContentLength = -1
+					req.TransferEncoding = []string{"chunked"}
+				}
+				for name, value := range tt.headers {
+					req.Header.Set(name, value)
+				}
+				_, err := planS3Operation(req, tt.bucket, tt.objectKey)
+				require.ErrorIs(t, err, ErrUnsupportedS3Operation)
+			})
+		}
+	}
+}
+
+func TestS3AuthRejectsUnboundedOrMalformedCompleteMultipartXML(t *testing.T) {
+	resolver := newTestResolver()
+	called := false
+	handler := S3Auth(resolver)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "oversized", body: bytes.Repeat([]byte("x"), (1<<20)+1)},
+		{name: "wrong root", body: []byte(`<NotCompleteMultipartUpload/>`)},
+		{name: "malformed", body: []byte(`<CompleteMultipartUpload>`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called = false
+			req := signedRequest(t, http.MethodPost, ts.URL+"/"+testBucket+"/key?uploadId=u1", tt.body, unsignedPayload, validCreds)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.False(t, called)
+		})
+	}
+}
+
+func TestPlanS3OperationRejectsSingletonAndHeaderConflicts(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		target  string
+		headers http.Header
+	}{
+		{name: "duplicate metadata directive", method: http.MethodPut, target: "/bucket/key", headers: http.Header{copySourceHeader: {"/bucket/source"}, "X-Amz-Metadata-Directive": {"COPY", "REPLACE"}}},
+		{name: "duplicate tagging directive", method: http.MethodPut, target: "/bucket/key", headers: http.Header{copySourceHeader: {"/bucket/source"}, "X-Amz-Tagging-Directive": {"COPY", "REPLACE"}}},
+		{name: "canned ACL and grant", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Acl": {"private"}, "X-Amz-Grant-Read": {`id="reader"`}}},
+		{name: "AES256 and SSE-C", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Server-Side-Encryption": {"AES256"}, "X-Amz-Server-Side-Encryption-Customer-Algorithm": {"AES256"}, "X-Amz-Server-Side-Encryption-Customer-Key": {"key"}, "X-Amz-Server-Side-Encryption-Customer-Key-Md5": {"md5"}}},
+		{name: "incomplete SSE-C", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Server-Side-Encryption-Customer-Algorithm": {"AES256"}}},
+		{name: "invalid SSE-C algorithm", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Server-Side-Encryption-Customer-Algorithm": {"DES"}, "X-Amz-Server-Side-Encryption-Customer-Key": {"key"}, "X-Amz-Server-Side-Encryption-Customer-Key-Md5": {"md5"}}},
+		{name: "two checksum value families", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Checksum-Crc32": {"one"}, "X-Amz-Checksum-Sha256": {"two"}}},
+		{name: "checksum algorithm mismatch", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Sdk-Checksum-Algorithm": {"CRC32"}, "X-Amz-Checksum-Sha256": {"sum"}}},
+		{name: "duplicate checksum algorithm", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Sdk-Checksum-Algorithm": {"CRC32", "SHA256"}}},
+		{name: "checksum algorithm without value", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Sdk-Checksum-Algorithm": {"CRC32"}}},
+		{name: "unknown checksum family", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Checksum-Future": {"sum"}}},
+		{name: "unknown grant family", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Grant-Future": {`id="reader"`}}},
+		{name: "invalid metadata directive", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Copy-Source": {"/bucket/source"}, "X-Amz-Metadata-Directive": {"MAYBE"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.target, nil)
+			req.Header = tt.headers.Clone()
+			_, err := planS3Operation(req, "bucket", "key")
+			require.ErrorIs(t, err, ErrUnsupportedS3Operation)
+		})
+	}
+}
+
+func TestAuthorizeS3PlanUsesValuesCapturedAtPlanning(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	req := httptest.NewRequest(http.MethodGet, "/bucket?list-type=2&prefix=accepted/", nil)
+	req.Header.Set("X-Amz-Date", now.Add(-time.Second).Format("20060102T150405Z"))
+	plan, err := planS3Operation(req, "bucket", "")
+	require.NoError(t, err)
+
+	policy := mustParseTestPolicy(`{
+		"Statement": {
+			"Effect": "Allow",
+			"Action": "s3:ListBucket",
+			"Resource": "arn:aws:s3:::bucket",
+			"Condition": {"StringEquals": {"s3:prefix": "accepted/"}}
+		}
+	}`)
+	req.URL.RawQuery = "list-type=2&prefix=mutated/"
+	req.Header.Set("X-Amz-Date", now.Add(-time.Hour).Format("20060102T150405Z"))
+
+	plan = plan.withAuthorizationContext("", now)
+	require.NoError(t, AuthorizeS3Plan(policy, plan))
+}
+
+func TestAuthorizeS3PlanRejectsUnsealedPlan(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	plan, err := planS3Operation(req, "bucket", "key")
+	require.NoError(t, err)
+	require.ErrorIs(t, AuthorizeS3Plan(testAllowAllPolicy, plan), ErrMalformedS3Request)
+}
+
+func TestS3OperationPlanDefensivelyCapturesHeadersAndIAMContext(t *testing.T) {
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("body"))
+	req.Header.Set("x-amz-acl", "private")
+	req.Header.Set("x-amz-meta-tenant", "original")
+	req.Header.Set("X-Amz-Date", now.Add(-time.Second).Format("20060102T150405Z"))
+	plan, err := planS3Operation(req, "bucket", "key")
+	require.NoError(t, err)
+
+	req.Method = http.MethodDelete
+	req.Header.Set("x-amz-acl", "public-read")
+	req.Header.Set("x-amz-meta-tenant", "mutated")
+	plan = plan.withAuthorizationContext("", now)
+
+	assert.Equal(t, http.MethodPut, plan.method)
+	assert.Equal(t, "private", plan.forwardHeaders.Get("x-amz-acl"))
+	assert.Equal(t, "original", plan.forwardHeaders.Get("x-amz-meta-tenant"))
+	checks := buildS3IAMRequestsFromPlan(plan)
+	require.Len(t, checks, 2)
+	for _, check := range checks {
+		assert.Equal(t, []string{"private"}, check.Context["s3:x-amz-acl"])
+	}
+	checks[0].Context["s3:x-amz-acl"][0] = "corrupted"
+	checks[0].Context["new:key"] = []string{"new"}
+	again := buildS3IAMRequestsFromPlan(plan)
+	assert.Equal(t, []string{"private"}, again[0].Context["s3:x-amz-acl"])
+	assert.NotContains(t, again[0].Context, "new:key")
+}
+
+func TestPlanS3OperationPreservesStreamingBodyRows(t *testing.T) {
+	tests := []struct {
+		name      string
+		method    string
+		target    string
+		objectKey string
+	}{
+		{name: "put object", method: http.MethodPut, target: "/bucket/key", objectKey: "key"},
+		{name: "put ACL", method: http.MethodPut, target: "/bucket/key?acl", objectKey: "key"},
+		{name: "put tagging", method: http.MethodPut, target: "/bucket/key?tagging", objectKey: "key"},
+		{name: "upload part", method: http.MethodPut, target: "/bucket/key?partNumber=1&uploadId=u1", objectKey: "key"},
+	}
+	for _, tt := range tests {
+		for _, unknown := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/unknown=%t", tt.name, unknown), func(t *testing.T) {
+				req := httptest.NewRequest(tt.method, tt.target, strings.NewReader("streaming body"))
+				if unknown {
+					req.ContentLength = -1
+					req.TransferEncoding = []string{"chunked"}
+				}
+				plan, err := planS3Operation(req, "bucket", tt.objectKey)
+				require.NoError(t, err)
+				assert.Equal(t, bodyStreaming, plan.bodyKind)
+			})
+		}
+	}
+}
+
+func TestPlanS3OperationAcceptsOwnedHeaderCombinations(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		target  string
+		headers http.Header
+	}{
+		{name: "SSE-C tuple", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Server-Side-Encryption-Customer-Algorithm": {"AES256"}, "X-Amz-Server-Side-Encryption-Customer-Key": {"key"}, "X-Amz-Server-Side-Encryption-Customer-Key-Md5": {"md5"}}},
+		{name: "put checksum", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Sdk-Checksum-Algorithm": {"CRC32"}, "X-Amz-Checksum-Crc32": {"sum"}}},
+		{name: "copy directives", method: http.MethodPut, target: "/bucket/key", headers: http.Header{"X-Amz-Copy-Source": {"/bucket/source"}, "X-Amz-Metadata-Directive": {"REPLACE"}, "X-Amz-Tagging-Directive": {"COPY"}}},
+		{name: "create multipart checksum", method: http.MethodPost, target: "/bucket/key?uploads", headers: http.Header{"X-Amz-Checksum-Algorithm": {"SHA256"}, "X-Amz-Checksum-Type": {"COMPOSITE"}}},
+		{name: "complete multipart checksum", method: http.MethodPost, target: "/bucket/key?uploadId=u1", headers: http.Header{"X-Amz-Checksum-Sha256": {"sum"}, "X-Amz-Checksum-Type": {"FULL_OBJECT"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.target, nil)
+			req.Header = tt.headers.Clone()
+			_, err := planS3Operation(req, "bucket", "key")
+			require.NoError(t, err)
+		})
+	}
+}
+
+func FuzzPlanS3Operation(f *testing.F) {
+	f.Add(http.MethodGet, "list-type=2&prefix=a", testBucket, "", "")
+	f.Add(http.MethodPut, "retention", testBucket, "a.txt", "")
+	f.Add(http.MethodPut, "", testBucket, "copy.txt", "/test-bucket/source.txt")
+	f.Fuzz(func(t *testing.T, method, rawQuery, bucket, objectKey, copySource string) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Method = method
+		req.URL.RawQuery = rawQuery
+		if copySource != "" {
+			req.Header.Set(copySourceHeader, copySource)
+		}
+		_, _ = planS3Operation(req, bucket, objectKey)
+	})
+}
+
+func FuzzParseCopySource(f *testing.F) {
+	f.Add("/bucket/key", "bucket")
+	f.Add("bucket/key?versionId=v1", "bucket")
+	f.Add("arn:aws:s3:::bucket/key", "bucket")
+	f.Fuzz(func(t *testing.T, raw, bucket string) {
+		_, _ = parseCopySource(raw, bucket)
+	})
+}
+
 func TestBuildS3IAMRequests_Context(t *testing.T) {
 	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	req := httptest.NewRequest(http.MethodGet, "/test-bucket?list-type=2&delimiter=/&max-keys=25", nil)
 	req.Header.Set("X-Amz-Date", now.Add(-2*time.Second).Format("20060102T150405Z"))
-	req.Header.Set("x-amz-acl", "private")
 
-	checks, err := buildS3IAMRequests(req, testBucket, "", "", &AuthInfo{}, now)
+	checks, err := buildS3IAMRequests(req, testBucket, "", "", now)
 	require.NoError(t, err)
 	require.Len(t, checks, 1)
 
@@ -249,7 +575,7 @@ func TestBuildS3IAMRequests_Context(t *testing.T) {
 	assert.Equal(t, []string{""}, ctx["s3:prefix"])
 	assert.Equal(t, []string{"/"}, ctx["s3:delimiter"])
 	assert.Equal(t, []string{"25"}, ctx["s3:max-keys"])
-	assert.Equal(t, []string{"private"}, ctx["s3:x-amz-acl"])
+	assert.NotContains(t, ctx, "s3:x-amz-acl")
 	assert.Equal(t, []string{"REST-HEADER"}, ctx["s3:authtype"])
 	assert.Equal(t, []string{"AWS4-HMAC-SHA256"}, ctx["s3:signatureversion"])
 	assert.Equal(t, []string{"2000"}, ctx["s3:signatureage"])
@@ -262,7 +588,7 @@ func TestBuildS3IAMRequests_ListBucketsDoesNotSetListObjectConditions(t *testing
 	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	req := httptest.NewRequest(http.MethodGet, "/?x-id=ListBuckets", nil)
 
-	checks, err := buildS3IAMRequests(req, "", "", "", &AuthInfo{}, now)
+	checks, err := buildS3IAMRequests(req, "", "", "", now)
 	require.NoError(t, err)
 	require.Len(t, checks, 1)
 
@@ -276,7 +602,7 @@ func TestBuildS3IAMRequests_CreateBucketLocationConstraintContext(t *testing.T) 
 	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	req := httptest.NewRequest(http.MethodPut, "/test-bucket", nil)
 
-	checks, err := buildS3IAMRequests(req, testBucket, "", "us-west-2", &AuthInfo{}, now)
+	checks, err := buildS3IAMRequests(req, testBucket, "", "us-west-2", now)
 	require.NoError(t, err)
 	require.Len(t, checks, 1)
 	assert.Equal(t, "s3:CreateBucket", checks[0].Action)
@@ -291,6 +617,34 @@ func TestBuildS3IAMRequests_CreateBucketLocationConstraintContext(t *testing.T) 
 		}
 	}`)
 	require.NoError(t, policy.Authorize(checks[0]))
+}
+
+func TestParseS3IAMPolicyRejectsConditionOperatorKeyTypeMismatch(t *testing.T) {
+	tests := []struct {
+		operator string
+		key      string
+		value    string
+	}{
+		{operator: "StringEquals", key: "aws:SecureTransport", value: `"true"`},
+		{operator: "Bool", key: "s3:max-keys", value: `true`},
+		{operator: "NumericEquals", key: "aws:CurrentTime", value: `1`},
+		{operator: "DateEquals", key: "s3:prefix", value: `"2026-08-06T00:00:00Z"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.operator+"/"+tt.key, func(t *testing.T) {
+			policy, err := ParseS3IAMPolicyJSON(fmt.Sprintf(`{
+				"Statement": {
+					"Effect": "Deny",
+					"Action": "s3:*",
+					"Resource": "*",
+					"Condition": {%q: {%q: %s}}
+				}
+			}`, tt.operator, tt.key, tt.value))
+			require.Nil(t, policy)
+			require.ErrorIs(t, err, iam.ErrInvalidPolicy)
+		})
+	}
 }
 
 func TestParseCreateBucketLocationConstraintRejectsUnexpectedRoot(t *testing.T) {
@@ -644,8 +998,8 @@ func TestS3Auth_CopyObjectUnsupportedFormsDoNotCallHandler(t *testing.T) {
 
 			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
-			assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-			assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Contains(t, string(body), "<Code>InvalidRequest</Code>")
 			assert.False(t, called)
 		})
 	}

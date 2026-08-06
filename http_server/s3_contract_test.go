@@ -22,9 +22,8 @@ type s3ContractEntry struct {
 	response  string
 }
 
-// s3OperationContract is the executable index for the target matrix in
-// README.md. The samples intentionally prove only currently accepted shapes;
-// Phase 1 adds the rejection grammar and Phase 2 implements response profiles.
+// s3OperationContract is the executable index for the exact request planner
+// matrix in README.md. Phase 2 implements the remaining response transforms.
 var s3OperationContract = []s3ContractEntry{
 	{"C-S3-001", "ListBuckets", http.MethodGet, "/", "", "", nil, []string{"s3:ListAllMyBuckets"}, "R1"},
 	{"C-S3-002", "CreateBucket", http.MethodPut, "/photos", "photos", "", nil, []string{"s3:CreateBucket"}, "R2"},
@@ -99,8 +98,16 @@ func TestS3OperationContract(t *testing.T) {
 				}
 			}
 
-			checks, err := mapS3IAMChecks(req, tt.bucket, tt.object)
+			plan, err := planS3Operation(req, tt.bucket, tt.object)
 			require.NoError(t, err)
+			expectedKind := strings.ReplaceAll(tt.operation, " ", "")
+			if expectedKind == "ListObjectsV1" {
+				expectedKind = "ListObjects"
+			}
+			require.Equal(t, S3OperationKind(expectedKind), plan.Kind())
+			require.Equal(t, S3ResponseProfile(tt.response), plan.ResponseProfile())
+			require.Equal(t, contractBodyKind(tt.operation), plan.bodyKind)
+			checks := plan.iamChecks
 			actions := make([]string, len(checks))
 			for i := range checks {
 				actions[i] = checks[i].Action
@@ -112,5 +119,109 @@ func TestS3OperationContract(t *testing.T) {
 	for profile := range s3ResponseProfiles {
 		require.Truef(t, usedProfiles[profile], "response profile %s is not assigned to an operation", profile)
 		require.Truef(t, strings.Contains(readme, "| "+profile+" |"), "response profile %s is missing from README.md", profile)
+	}
+}
+
+func TestS3OperationContractRejectsUnknownQueryAcrossAllRows(t *testing.T) {
+	for _, tt := range s3OperationContract {
+		t.Run(tt.id, func(t *testing.T) {
+			separator := "?"
+			if strings.Contains(tt.target, "?") {
+				separator = "&"
+			}
+			req, err := http.NewRequest(tt.method, tt.target+separator+"unsupported-contract-key=value", nil)
+			require.NoError(t, err)
+			req.Header = tt.headers.Clone()
+			_, err = planS3Operation(req, tt.bucket, tt.object)
+			require.ErrorIs(t, err, ErrUnsupportedS3Operation)
+		})
+	}
+}
+
+func TestS3OperationContractAcceptsAllowedQueryCombinations(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		target string
+		object string
+		kind   S3OperationKind
+	}{
+		{name: "ListObjects V1", method: http.MethodGet, target: "/bucket?prefix=&delimiter=%2F&marker=m&max-keys=1000&encoding-type=url&x-id=ListObjects", kind: operationListObjects},
+		{name: "ListObjects V2", method: http.MethodGet, target: "/bucket?list-type=2&prefix=p&delimiter=%2F&continuation-token=t&fetch-owner=true&max-keys=1000&encoding-type=url&start-after=s&x-id=ListObjectsV2", kind: operationListObjectsV2},
+		{name: "ListMultipartUploads", method: http.MethodGet, target: "/bucket?uploads&delimiter=%2F&encoding-type=url&key-marker=k&max-uploads=1000&prefix=p&upload-id-marker=u&x-id=ListMultipartUploads", kind: operationListMultipartUploads},
+		{name: "GetObjectVersion", method: http.MethodGet, target: "/bucket/key?versionId=v&partNumber=1&response-cache-control=no-cache&response-content-disposition=inline&response-content-encoding=gzip&response-content-language=en&response-content-type=text%2Fplain&response-expires=tomorrow&x-id=GetObject", object: "key", kind: operationGetObjectVersion},
+		{name: "HeadObjectVersion", method: http.MethodHead, target: "/bucket/key?versionId=v&partNumber=1&x-id=HeadObject", object: "key", kind: operationHeadObjectVersion},
+		{name: "ListParts", method: http.MethodGet, target: "/bucket/key?uploadId=u&max-parts=1000&part-number-marker=1&x-id=ListParts", object: "key", kind: operationListParts},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(tt.method, tt.target, nil)
+			require.NoError(t, err)
+			plan, err := planS3Operation(req, "bucket", tt.object)
+			require.NoError(t, err)
+			require.Equal(t, tt.kind, plan.kind)
+		})
+	}
+}
+
+func TestS3OperationContractExactXIDGrammar(t *testing.T) {
+	for _, tt := range s3OperationContract {
+		t.Run(tt.id, func(t *testing.T) {
+			separator := "?"
+			if strings.Contains(tt.target, "?") {
+				separator = "&"
+			}
+			for _, test := range []struct {
+				name    string
+				suffix  string
+				wantErr bool
+			}{
+				{name: "matching", suffix: separator + "x-id=" + contractXID(tt.operation)},
+				{name: "mismatched", suffix: separator + "x-id=DefinitelyWrong", wantErr: true},
+				{name: "duplicate", suffix: separator + "x-id=" + contractXID(tt.operation) + "&x-id=" + contractXID(tt.operation), wantErr: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					req, err := http.NewRequest(tt.method, tt.target+test.suffix, nil)
+					require.NoError(t, err)
+					req.Header = tt.headers.Clone()
+					_, err = planS3Operation(req, tt.bucket, tt.object)
+					if test.wantErr {
+						require.ErrorIs(t, err, ErrUnsupportedS3Operation)
+					} else {
+						require.NoError(t, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func contractXID(operation string) string {
+	switch operation {
+	case "ListObjects V1":
+		return "ListObjects"
+	case "ListObjects V2":
+		return "ListObjectsV2"
+	case "GetObjectVersion":
+		return "GetObject"
+	case "HeadObjectVersion":
+		return "HeadObject"
+	case "DeleteObjectVersion":
+		return "DeleteObject"
+	default:
+		return strings.ReplaceAll(operation, " ", "")
+	}
+}
+
+func contractBodyKind(operation string) s3BodyKind {
+	switch operation {
+	case "PutObject", "PutObjectAcl", "PutObjectTagging", "UploadPart":
+		return bodyStreaming
+	case "CreateBucket":
+		return bodyCreateBucketConfiguration
+	case "CompleteMultipartUpload":
+		return bodyCompleteMultipartXML
+	default:
+		return bodyEmpty
 	}
 }

@@ -19,7 +19,7 @@ Designed for whitelabeling -- give tenants their own bucket names, access keys, 
                  +------------+
 ```
 
-Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Incoming requests must use `x-amz-content-sha256: UNSIGNED-PAYLOAD` so uploads can stream through the proxy without buffering, and any `x-amz-*` request headers except `x-amz-content-sha256` must be included in the SigV4 signed headers. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
+Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Incoming requests must use `x-amz-content-sha256: UNSIGNED-PAYLOAD` so uploads can stream through the proxy without buffering. SigV4 signed-header names must be lowercase, sorted, and unique; `host` and `x-amz-date` are required, all values of a signed header are canonicalized and verified, and any other `x-amz-*` request header except `x-amz-content-sha256` must also be signed. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
 
 ## Lookup functions
 
@@ -39,38 +39,53 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 ## Target S3 operation and virtualization contract
 
-This matrix is the acceptance contract for the Phase 1 request planner and
-Phase 2 namespace transforms; it is not a claim that the current implementation
-already enforces every row. Today, valid examples from the rows are recognized
-and IAM-mapped, but operation detection still accepts some unknown or ambiguous
-query shapes. Prefix rewriting is still applied too broadly to bucket-level
-requests, only successful ListObjects XML has a namespace-aware response
+This matrix is the enforced acceptance contract for the request planner and
+the acceptance contract for the remaining Phase 2 namespace transforms. Today,
+requests are decoded once into a typed operation plan, and unknown, duplicate,
+conflicting, or operation-mismatched query/header shapes fail before virtual
+bucket mapping or IAM evaluation. Prefix rewriting is still applied too broadly
+to bucket-level requests, only successful ListObjects XML has a namespace-aware response
 transform, upstream multipart/error/redirect metadata may pass through, and
 hop-by-hop filtering does not yet remove headers named by `Connection`. Until
-Phases 1 and 2 close those gaps, deployments must not rely on the exact grammar
-or complete no-leak/prefix-isolation properties below.
+Phase 2 closes those response and rewrite gaps, deployments must not rely on the
+complete no-leak/prefix-isolation properties below.
 
-The target surface is deliberately exact. A request will use only one row;
-unknown query keys, duplicate singleton keys, conflicting subresources, or
-operation-changing headers not named by that row will be unsupported. `X`
+The supported request surface is deliberately exact. A request uses only one row;
+unknown query keys, duplicate singleton keys, conflicting subresources or
+headers, unexpected bodies, or operation-changing headers not named by that row
+are unsupported. `X`
 means no operation query or exactly one `x-id` whose value names that AWS
 operation. Every other query key shown is a singleton. A flag such as `uploads`
 must occur once with an empty value. The stable `C-S3-*` identifiers and their
 currently valid representative shapes are checked by
 [`TestS3OperationContract`](./http_server/s3_contract_test.go).
+Numeric pagination and part fields must contain an in-range decimal integer;
+`fetch-owner` is `true` or `false`, and the only supported `encoding-type` is
+`url`.
 
-Under the target contract, the signing headers described above are required on
+The signing headers described above are required on
 every row. Ordinary HTTP content, range, and conditional headers are allowed
 where their HTTP method uses them, as are signed `x-amz-meta-*` object metadata
 headers. ACL/grant, tagging, copy, storage-class, and server-side-encryption
 headers affect an operation and are accepted only where called out below.
-Session tokens, KMS enforcement, checksummed trailers, and SigV4 streaming
-chunks are not part of this contract.
+Session tokens, KMS-specific and object-lock request forms, signed/checksummed
+trailers, and SigV4 streaming chunks are rejected as unsupported.
+
+An empty-body row requires a zero content length and rejects chunked or
+otherwise unknown-length bodies. `CreateBucketConfiguration` and
+`CompleteMultipartUpload` XML are each capped at 1 MiB and parsed before any
+bucket mapping or upstream request; object, part, ACL, and tagging body rows
+remain streaming. Operation headers are singletons unless their family is
+explicitly repeatable. Canned ACLs cannot be combined with grant headers.
+SSE-C requires its AES256 algorithm, key, and key-MD5 tuple and cannot be
+combined with SSE-S3. Fixed checksum values are supported for PutObject,
+UploadPart, and CompleteMultipartUpload, while CreateMultipartUpload may select
+the checksum algorithm; multiple or inconsistent checksum families are rejected.
 
 | ID | Virtual operation | Exact method/path and allowed query | Relevant headers/body | Required IAM action(s) | Upstream request | Success response |
 |---|---|---|---|---|---|---|
 | C-S3-001 | ListBuckets | `GET /`; `X` | Empty body | `s3:ListAllMyBuckets` on `*` | Not forwarded; control-plane list | R1 |
-| C-S3-002 | CreateBucket | `PUT /{bucket}`; `X` | Empty body or `CreateBucketConfiguration` XML | `s3:CreateBucket` on bucket | Not forwarded; control-plane create | R2 |
+| C-S3-002 | CreateBucket | `PUT /{bucket}`; `X` | Empty body or bounded `CreateBucketConfiguration` XML | `s3:CreateBucket` on bucket | Not forwarded; control-plane create | R2 |
 | C-S3-003 | HeadBucket | `HEAD /{bucket}`; `X` | Empty body | `s3:ListBucket` on bucket | Real bucket root; never apply object prefix | R3 |
 | C-S3-004 | ListObjects V1 | `GET /{bucket}`; `prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`, optional `x-id=ListObjects` | Empty body | `s3:ListBucket` on bucket | Real bucket root; prefix `prefix`/`marker` values | R5 |
 | C-S3-005 | ListObjects V2 | `GET /{bucket}`; required `list-type=2`, plus `prefix`, `delimiter`, `continuation-token`, `fetch-owner`, `max-keys`, `encoding-type`, `start-after`, optional `x-id=ListObjectsV2` | Empty body | `s3:ListBucket` on bucket | Real bucket root; prefix key-bearing values | R5 |
@@ -82,13 +97,13 @@ chunks are not part of this contract.
 | C-S3-011 | PutObject | `PUT /{bucket}/{key}`; `X` | Object stream; metadata/storage/encryption headers; ACL/grant and tagging headers add their respective IAM checks | `s3:PutObject`, plus `s3:PutObjectAcl` and/or `s3:PutObjectTagging` when used | Prefix object key; stream body | R3 |
 | C-S3-012 | PutObjectAcl | `PUT /{bucket}/{key}`; required `acl`, optional `x-id=PutObjectAcl` | ACL XML or ACL/grant headers | `s3:PutObjectAcl` on object | Prefix object key | R3 |
 | C-S3-013 | PutObjectTagging | `PUT /{bucket}/{key}`; required `tagging`, optional `x-id=PutObjectTagging` | Tagging XML | `s3:PutObjectTagging` on object | Prefix object key | R3 |
-| C-S3-014 | CopyObject | `PUT /{bucket}/{key}`; `X` | Signed `x-amz-copy-source` in the same virtual bucket; optional ACL/grant and tagging headers | Destination `s3:PutObject`; source `s3:GetObject` or `s3:GetObjectVersion`; optional ACL/tagging actions | Prefix destination and source keys; replace source bucket | R10 |
+| C-S3-014 | CopyObject | `PUT /{bucket}/{key}`; `X` | Empty body; signed `x-amz-copy-source` in the same virtual bucket; optional ACL/grant and tagging headers | Destination `s3:PutObject`; source `s3:GetObject` or `s3:GetObjectVersion`; optional ACL/tagging actions | Prefix destination and source keys; replace source bucket | R10 |
 | C-S3-015 | DeleteObject | `DELETE /{bucket}/{key}`; `X` | Empty body | `s3:DeleteObject` on object | Prefix object key | R3 |
 | C-S3-016 | DeleteObjectVersion | C-S3-015 plus required `versionId` | Empty body | `s3:DeleteObjectVersion` on object | Prefix object key; preserve version | R3 |
-| C-S3-017 | CreateMultipartUpload | `POST /{bucket}/{key}`; required `uploads`, optional `x-id=CreateMultipartUpload` | Metadata/storage/encryption headers; ACL/grant and tagging headers add their respective IAM checks | `s3:PutObject`, plus optional ACL/tagging actions | Prefix object key | R7 |
+| C-S3-017 | CreateMultipartUpload | `POST /{bucket}/{key}`; required `uploads`, optional `x-id=CreateMultipartUpload` | Empty body; metadata/storage/encryption headers; ACL/grant and tagging headers add their respective IAM checks | `s3:PutObject`, plus optional ACL/tagging actions | Prefix object key | R7 |
 | C-S3-018 | UploadPart | `PUT /{bucket}/{key}`; exactly `partNumber` + `uploadId`, optional `x-id=UploadPart` | Part stream | `s3:PutObject` on object | Prefix object key; stream part | R3 |
 | C-S3-019 | ListParts | `GET /{bucket}/{key}`; required `uploadId`, optional `max-parts`, `part-number-marker`, `x-id=ListParts` | Empty body | `s3:ListMultipartUploadParts` on object | Prefix object key | R8 |
-| C-S3-020 | CompleteMultipartUpload | `POST /{bucket}/{key}`; required `uploadId`, optional `x-id=CompleteMultipartUpload` | Bounded completed-parts XML | `s3:PutObject` on object | Prefix object key | R9 |
+| C-S3-020 | CompleteMultipartUpload | `POST /{bucket}/{key}`; required `uploadId`, optional `x-id=CompleteMultipartUpload` | Completed-parts XML, bounded to 1 MiB | `s3:PutObject` on object | Prefix object key | R9 |
 | C-S3-021 | AbortMultipartUpload | `DELETE /{bucket}/{key}`; required `uploadId`, optional `x-id=AbortMultipartUpload` | Empty body | `s3:AbortMultipartUpload` on object | Prefix object key | R3 |
 
 “Response override keys” are `response-cache-control`,
@@ -128,13 +143,10 @@ configured identifiers from successes, errors, or redirects.
 
 Credentials carry a required AWS IAM JSON identity policy. Each proxied
 request is evaluated against that policy before forwarding to the real bucket.
-For policies that compile today, unmatched requests default to implicit deny
-and a valid explicit `Deny` overrides `Allow`. The parser rejects malformed
-JSON/policy structure and unknown policy elements and condition keys. It does
-not yet reject malformed typed bool/null/numeric/date condition operands, and
-S3 request-shape detection is not yet exact. Phase 1 makes both boundaries
-fail closed before the broader malformed-policy and unsupported-S3 guarantees
-are considered complete.
+Unmatched requests default to implicit deny and a valid explicit `Deny`
+overrides `Allow`. The parser rejects malformed JSON/policy structure, unknown
+policy elements and condition keys, operator/key type mismatches, and malformed
+bool/null/numeric/date operands before a policy can be installed.
 
 The supported surface is the S3 data-plane core that vbuckets can enforce from
 the incoming request:
@@ -146,12 +158,12 @@ the incoming request:
   bool, null, numeric, and date comparisons.
 - CreateBucket policies may use `s3:LocationConstraint` when the request body
   includes a location constraint.
-- The target mapping between S3 actions and exact operations is defined by the
-  matrix above. Phase 1 will make requests outside that grammar fail before
-  proxying; the current branch does not yet provide that exactness guarantee.
+- The mapping between S3 actions and exact operations is defined by the matrix
+  above. Requests outside that grammar fail before virtual bucket lookup, IAM
+  evaluation, or proxying.
 - CopyObject is supported only within the same virtual bucket. Cross-bucket,
   cross-vbucket, ARN/access-point/absolute URL, and multipart copy requests are
-  denied before proxying.
+  rejected as unsupported before proxying.
 - Unsupported identity-policy features such as `Principal`, policy variables,
   resource policies, session policies, object-tag condition keys, and KMS
   enforcement are rejected or denied.

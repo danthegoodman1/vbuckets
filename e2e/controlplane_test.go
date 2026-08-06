@@ -404,7 +404,7 @@ func TestE2E_ControlPlane_CopyObjectSameVirtualBucket(t *testing.T) {
 		CopySource: aws.String("other-virtual-bucket/" + sourceKey),
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AccessDenied")
+	assert.Contains(t, err.Error(), "InvalidRequest")
 }
 
 func TestE2E_ControlPlane_ListObjectsPrefixIsolation(t *testing.T) {

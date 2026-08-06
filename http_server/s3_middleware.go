@@ -10,28 +10,18 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/rs/zerolog"
 )
 
 type contextKey string
-type s3Operation string
 
 const (
-	ctxVBucketConfig            contextKey = "vbucketConfig"
-	ctxAuthInfo                 contextKey = "authInfo"
-	ctxBucketName               contextKey = "bucketName"
-	ctxObjectKey                contextKey = "objectKey"
-	ctxIsVHost                  contextKey = "isVHost"
-	ctxS3Operation              contextKey = "s3Operation"
-	ctxCreateLocationConstraint contextKey = "createLocationConstraint"
-)
-
-const (
-	s3OperationProxy        s3Operation = "proxy"
-	s3OperationCreateBucket s3Operation = "createBucket"
-	s3OperationListBuckets  s3Operation = "listBuckets"
+	ctxVBucketConfig   contextKey = "vbucketConfig"
+	ctxAuthInfo        contextKey = "authInfo"
+	ctxS3OperationPlan contextKey = "s3OperationPlan"
 )
 
 func getVBucketConfig(ctx context.Context) *VBucketConfig {
@@ -45,30 +35,36 @@ func getAuthInfo(ctx context.Context) *AuthInfo {
 }
 
 func getBucketName(ctx context.Context) string {
-	v, _ := ctx.Value(ctxBucketName).(string)
-	return v
+	plan := getS3OperationPlan(ctx)
+	if plan == nil {
+		return ""
+	}
+	return plan.bucket
 }
 
 func getObjectKey(ctx context.Context) string {
-	v, _ := ctx.Value(ctxObjectKey).(string)
-	return v
+	plan := getS3OperationPlan(ctx)
+	if plan == nil {
+		return ""
+	}
+	return plan.objectKey
 }
 
 func getIsVHost(ctx context.Context) bool {
-	v, _ := ctx.Value(ctxIsVHost).(bool)
-	return v
-}
-
-func getS3Operation(ctx context.Context) s3Operation {
-	v, _ := ctx.Value(ctxS3Operation).(s3Operation)
-	if v == "" {
-		return s3OperationProxy
-	}
-	return v
+	plan := getS3OperationPlan(ctx)
+	return plan != nil && plan.isVHost
 }
 
 func getCreateLocationConstraint(ctx context.Context) string {
-	v, _ := ctx.Value(ctxCreateLocationConstraint).(string)
+	plan := getS3OperationPlan(ctx)
+	if plan == nil {
+		return ""
+	}
+	return plan.locationConstraint
+}
+
+func getS3OperationPlan(ctx context.Context) *S3OperationPlan {
+	v, _ := ctx.Value(ctxS3OperationPlan).(*S3OperationPlan)
 	return v
 }
 
@@ -86,13 +82,17 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 
 			// --- Phase 1: authenticate the request ---
 
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
+			authHeaders := r.Header.Values("Authorization")
+			if len(authHeaders) == 0 || authHeaders[0] == "" {
 				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Missing Authorization header")
 				return
 			}
+			if len(authHeaders) != 1 {
+				writeS3Error(w, http.StatusBadRequest, "AuthorizationHeaderMalformed", "Authorization header must occur exactly once")
+				return
+			}
 
-			authInfo, err := parseAuthorizationHeader(authHeader)
+			authInfo, err := parseAuthorizationHeader(authHeaders[0])
 			if err != nil {
 				logger.Warn().Err(err).Msg("failed to parse authorization header")
 				writeS3Error(w, http.StatusBadRequest, "AuthorizationHeaderMalformed", err.Error())
@@ -124,6 +124,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 					writeS3Error(w, http.StatusForbidden, "AccessDenied", "There were headers present in the request which were not signed.")
 					return
 				}
+				if errors.Is(err, errUnsupportedAuthMode) {
+					writeS3Error(w, http.StatusBadRequest, "InvalidRequest", err.Error())
+					return
+				}
 				writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 				return
 			}
@@ -136,14 +140,31 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to resolve bucket")
 				return
 			}
-			if isListBucketsRequest(r, bucket, objectKey) {
-				if err := AuthorizeS3Request(virtualCreds.IAMPolicy, r, authInfo, "", "", ""); err != nil {
+			plan, err := planS3Operation(r, bucket, objectKey)
+			if err != nil {
+				logger.Warn().Err(err).Msg("unsupported or malformed S3 request")
+				writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "The requested S3 operation or request shape is not supported.")
+				return
+			}
+			plan = plan.withRequestMetadata(isVHost, "")
+			if plan.bodyKind == bodyCompleteMultipartXML {
+				plan, err = plan.withCompleteMultipartBody(r.Body)
+				if err != nil {
+					logger.Warn().Err(err).Msg("invalid CompleteMultipartUpload body")
+					writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "Invalid CompleteMultipartUpload body.")
+					return
+				}
+			}
+
+			if plan.kind == operationListBuckets {
+				plan = plan.withAuthorizationContext("", time.Now().UTC())
+				if err := AuthorizeS3Plan(virtualCreds.IAMPolicy, plan); err != nil {
 					logger.Warn().Err(err).Msg("IAM permission check failed")
 					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 					return
 				}
 
-				ctx := withS3RequestContext(r.Context(), nil, authInfo, "", "", isVHost, s3OperationListBuckets, "")
+				ctx := withS3RequestContext(r.Context(), nil, authInfo, plan)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -153,7 +174,7 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				return
 			}
 
-			if isCreateBucketRequest(r, objectKey) {
+			if plan.kind == operationCreateBucket {
 				if !isValidBucketName(bucket) {
 					writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "The specified bucket is not valid.")
 					return
@@ -164,13 +185,15 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 					writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid CreateBucketConfiguration")
 					return
 				}
-				if err := AuthorizeS3Request(virtualCreds.IAMPolicy, r, authInfo, bucket, objectKey, locationConstraint); err != nil {
+				plan = plan.withRequestMetadata(isVHost, locationConstraint)
+				plan = plan.withAuthorizationContext(locationConstraint, time.Now().UTC())
+				if err := AuthorizeS3Plan(virtualCreds.IAMPolicy, plan); err != nil {
 					logger.Warn().Err(err).Msg("IAM permission check failed")
 					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 					return
 				}
 
-				ctx := withS3RequestContext(r.Context(), nil, authInfo, bucket, objectKey, isVHost, s3OperationCreateBucket, locationConstraint)
+				ctx := withS3RequestContext(r.Context(), nil, authInfo, plan)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -182,35 +205,24 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				return
 			}
 
-			if err := AuthorizeS3Request(virtualCreds.IAMPolicy, r, authInfo, bucket, objectKey, ""); err != nil {
+			plan = plan.withAuthorizationContext("", time.Now().UTC())
+			if err := AuthorizeS3Plan(virtualCreds.IAMPolicy, plan); err != nil {
 				logger.Warn().Err(err).Msg("IAM permission check failed")
 				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}
 
-			ctx := withS3RequestContext(r.Context(), vbConfig, authInfo, bucket, objectKey, isVHost, s3OperationProxy, "")
+			ctx := withS3RequestContext(r.Context(), vbConfig, authInfo, plan)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-func withS3RequestContext(ctx context.Context, vbConfig *VBucketConfig, authInfo *AuthInfo, bucket, objectKey string, isVHost bool, operation s3Operation, locationConstraint string) context.Context {
+func withS3RequestContext(ctx context.Context, vbConfig *VBucketConfig, authInfo *AuthInfo, plan *S3OperationPlan) context.Context {
 	ctx = context.WithValue(ctx, ctxVBucketConfig, vbConfig)
 	ctx = context.WithValue(ctx, ctxAuthInfo, authInfo)
-	ctx = context.WithValue(ctx, ctxBucketName, bucket)
-	ctx = context.WithValue(ctx, ctxObjectKey, objectKey)
-	ctx = context.WithValue(ctx, ctxIsVHost, isVHost)
-	ctx = context.WithValue(ctx, ctxS3Operation, operation)
-	ctx = context.WithValue(ctx, ctxCreateLocationConstraint, locationConstraint)
+	ctx = context.WithValue(ctx, ctxS3OperationPlan, plan)
 	return ctx
-}
-
-func isListBucketsRequest(r *http.Request, bucket, objectKey string) bool {
-	return r.Method == http.MethodGet && bucket == "" && objectKey == "" && queryHasOnlyIgnoredKeys(r.URL.Query())
-}
-
-func isCreateBucketRequest(r *http.Request, objectKey string) bool {
-	return r.Method == http.MethodPut && objectKey == "" && !isCopyObjectRequest(r) && queryHasOnlyIgnoredKeys(r.URL.Query())
 }
 
 const maxCreateBucketConfigBytes = 1 << 20

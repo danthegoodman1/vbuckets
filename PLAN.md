@@ -106,14 +106,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: Typed immutable operation plan | Gap: request meaning is currently recomputed across `s3_middleware.go`, `iam.go`, `s3_proxy.go`, `s3_list_rewrite.go`, and `s3_copy.go`. |
-| Incomplete | Work | 1B: Exact operation grammar | Gap: F1 permits unknown or conflicting query shapes to fall through to supported IAM actions. |
-| Incomplete | Work | 1C: Strict SigV4 envelope | Gap: F3; normal SDK tests do not cover missing host, duplicate values, or scope mismatches. |
-| Incomplete | Work | 1D: Explicit unsupported auth/header modes | Missing: defined behavior for session tokens, signed trailers, chunk signatures, and client auth metadata ownership. |
-| Incomplete | Work | 1E: Compile-time IAM operand validation | Gap: F4; invalid bool/null/numeric/date deny operands are accepted and evaluated later. |
-| Incomplete | Work | 1F: Typed S3 error taxonomy | Missing: one mapping for malformed, unsupported, unauthenticated, unauthorized, not found, unavailable, and upstream failure classes. |
-| Incomplete | Test | 1G: Exhaustive, adversarial, and fuzz coverage | Missing: matrix-derived tests and fuzz corpora described above. |
-| Incomplete | Gate | Authorized operation equals forwarded operation | Missing: proof that every accepted plan's IAM actions and eventual upstream wire shape are inseparable. |
+| Complete | Work | 1A: Typed immutable operation plan | `S3OperationPlan` is built once with private operation, virtual resource, original query, defensive header/query snapshots, body kind/control bytes, IAM checks/context, parsed copy-source metadata, and response profile. Middleware, IAM, dispatch, and proxy consume plan-owned values; mutation tests prove the request and returned IAM contexts cannot alter it. |
+| Complete | Work | 1B: Exact operation grammar | `TestS3OperationContract` covers all 21 rows and matrix-derived matching/mismatched/duplicate `x-id`, unknown-query, allowed-query, body-kind, streaming, and header-combination tables. Empty rows reject known and chunked/unknown bodies; CreateBucket and CompleteMultipart XML are bounded/parsed before mapping; directive/checksum/SSE-C/ACL conflicts and unsupported object-lock/KMS forms fail closed. Invalid shapes fail before `LookupVBucket` in `TestS3Auth_UnsupportedShapeFailsBeforeVBucketLookup`. |
+| Complete | Work | 1C: Strict SigV4 envelope | Adversarial tests prove required host/date coverage, canonical signed-header order/uniqueness, scope binding, fixed service/terminator/signature forms, authentication-header singleton rules, altered host rejection, and AWS SDK-compatible whitespace/all-value canonicalization. |
+| Complete | Work | 1D: Explicit unsupported auth/header modes | Session tokens, signed trailers, SigV4 streaming payloads, multipart-copy headers, KMS-specific inputs, and object-lock inputs return a controlled unsupported request error; ordinary unsigned-payload SDK and Garage flows remain green. |
+| Complete | Work | 1E: Compile-time IAM operand validation | `TestParsePolicyJSONRejectsMalformedTypedConditionOperands` proves malformed explicit-deny bool/null/numeric/date values are rejected; S3 policy compilation also rejects operator/key type mismatches. |
+| Incomplete | Work | 1F: Typed S3 error taxonomy | Request-shape/authentication classes now have one HTTP-edge translation (`InvalidRequest`, auth-specific SigV4 errors, or authorization denial). Not-found, unavailable, and upstream/control-plane failure classification remains in Phase 4 scope. |
+| Complete | Test | 1G: Exhaustive, adversarial, and fuzz coverage | Matrix, request-body/header rejection, immutability, AWS signer-oracle, policy, middleware-boundary, and fuzz seed suites cover F1/F3/F4. Raw-path namespace and response properties remain assigned to Phase 2. |
+| Complete | Gate | Authorized operation equals forwarded operation | IAM checks/context and downstream method, headers, content length/body kind, raw query, copy/list metadata, and response profile come from the same defensive plan. `go test ./... -count=1`, `go vet ./...`, and `go test -race ./... -short -count=1` passed on 2026-08-06, including Garage and control-plane E2E. |
 
 ## Phase 2: Enforce the Virtual Namespace in Both Directions
 

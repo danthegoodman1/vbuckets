@@ -1,6 +1,7 @@
 package http_server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -132,5 +133,65 @@ func TestHandleS3Request_CopyObjectRewritesSourceAndDestination(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.True(t, upstreamCalled)
+}
+
+func TestHandleS3Request_CompleteMultipartReplaysExactValidatedBody(t *testing.T) {
+	wantBody := []byte("  <CompleteMultipartUpload>\n" +
+		"    <Part><PartNumber>1</PartNumber><ETag>\"etag-1\"</ETag></Part>\n" +
+		"    <Part><PartNumber>2</PartNumber><ETag>\"etag-2\"</ETag></Part>\n" +
+		"  </CompleteMultipartUpload>\n")
+	var upstreamCalled bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/real-bucket/tenant-abc/video.mp4", r.URL.Path)
+		assert.Equal(t, "upload-1", r.URL.Query().Get("uploadId"))
+		assert.Equal(t, int64(len(wantBody)), r.ContentLength)
+		gotBody, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.True(t, bytes.Equal(wantBody, gotBody), "validated control XML must reach upstream byte-for-byte")
+
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	resolver := &testResolver{
+		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
+			if accessKeyID != testAccessKey {
+				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+			}
+			return &VirtualCredentials{SecretKey: testSecretKey, IAMPolicy: testAllowAllPolicy}, nil
+		},
+		baseHost: func(_ context.Context, hostname string) (string, bool, error) {
+			return "", false, nil
+		},
+		vbucket: func(_ context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
+			return &VBucketConfig{
+				RealEndpoint:     upstream.URL,
+				RealBucket:       "real-bucket",
+				RealAccessKey:    "real-access",
+				RealSecretKey:    "real-secret",
+				RealRegion:       "us-east-1",
+				PathPrefix:       "tenant-abc",
+				RealUsePathStyle: true,
+			}, nil
+		},
+	}
+
+	router := chi.NewRouter()
+	RegisterS3Routes(resolver)(router)
+	proxy := httptest.NewServer(router)
+	t.Cleanup(proxy.Close)
+
+	req := signedRequest(t, http.MethodPost, proxy.URL+"/"+testBucket+"/video.mp4?uploadId=upload-1", wantBody, unsignedPayload, validCreds)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, string(responseBody))
 	assert.True(t, upstreamCalled)
 }
