@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,8 @@ import (
 )
 
 const unsignedPayload = "UNSIGNED-PAYLOAD"
+
+var accessKeyIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
 var (
 	errRequestTimeTooSkewed   = errors.New("request time too skewed")
@@ -66,6 +69,9 @@ func parseAuthorizationHeader(header string) (*AuthInfo, error) {
 			}
 			if _, err := time.Parse("20060102", credParts[1]); err != nil {
 				return nil, fmt.Errorf("malformed credential date: %s", credParts[1])
+			}
+			if !accessKeyIDPattern.MatchString(credParts[0]) {
+				return nil, fmt.Errorf("access key ID must contain 1 to 128 letters, digits, dots, underscores, or hyphens")
 			}
 			info.AccessKeyID = credParts[0]
 			info.Date = credParts[1]
@@ -130,7 +136,7 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string) string {
 	b.WriteString(r.Method)
 	b.WriteByte('\n')
 
-	// S3 uses raw path (no double-encoding of path segments)
+	// S3 uses the wire-escaped path without generic SigV4 double escaping.
 	path := r.URL.EscapedPath()
 	if path == "" {
 		path = "/"
@@ -298,16 +304,19 @@ func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string
 	}
 
 	canonicalRequest := buildCanonicalRequest(r, authInfo.SignedHeaders)
-
-	stringToSign := buildStringToSign(datetime, authInfo.Scope, canonicalRequest)
 	signingKey := computeSigningKey(secretKey, authInfo.Date, authInfo.Region, authInfo.Service)
-	expectedSig := fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
+	expectedSig := signatureForCanonicalRequest(datetime, authInfo.Scope, canonicalRequest, signingKey)
 
 	if !hmac.Equal([]byte(expectedSig), []byte(authInfo.Signature)) {
 		return fmt.Errorf("signature mismatch")
 	}
 
 	return nil
+}
+
+func signatureForCanonicalRequest(datetime, scope, canonicalRequest string, signingKey []byte) string {
+	stringToSign := buildStringToSign(datetime, scope, canonicalRequest)
+	return fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
 }
 
 func requireSingletonHeader(r *http.Request, name string) error {

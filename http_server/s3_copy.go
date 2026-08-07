@@ -48,6 +48,9 @@ func parseCopySource(raw, expectedBucket string) (*copySource, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode copy source key: %w", err)
 	}
+	if err := validateVirtualObjectKey(key); err != nil {
+		return nil, fmt.Errorf("copy source key is unsafe: %w", err)
+	}
 	if bucket != expectedBucket {
 		return nil, fmt.Errorf("copy source bucket %q does not match destination bucket %q", bucket, expectedBucket)
 	}

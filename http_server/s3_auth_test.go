@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ const (
 const allowAllS3PolicyJSON = `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}`
 
 var testAllowAllPolicy = mustParseTestPolicy(allowAllS3PolicyJSON)
+var testRoutingTokenKey = []byte("0123456789abcdef0123456789abcdef")
 
 func mustParseTestPolicy(policyJSON string) *iam.Policy {
 	policy, err := ParseS3IAMPolicyJSON(policyJSON)
@@ -85,7 +87,7 @@ func newTestResolver() *testResolver {
 			return &VBucketConfig{}, nil
 		},
 		create: func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
-			return &VBucketConfig{}, nil
+			return validTestVBucketConfig(), nil
 		},
 		list: func(_ context.Context, accessKeyID string) ([]ListedVBucket, error) {
 			return nil, nil
@@ -160,7 +162,9 @@ func signedRequestAtTimeWithHeaders(t *testing.T, method, url string, body []byt
 		req.Header.Set(key, value)
 	}
 
-	signer := awsv4.NewSigner()
+	signer := awsv4.NewSigner(func(options *awsv4.SignerOptions) {
+		options.DisableURIPathEscaping = true
+	})
 	require.NoError(t, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", testRegion, signedAt))
 
 	return req
@@ -360,6 +364,59 @@ func TestParseAuthorizationHeaderRejectsInvalidCredentialScopeAndSignature(t *te
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestParseAuthorizationHeaderRejectsUnsafeAccessKeyIDs(t *testing.T) {
+	for name, accessKeyID := range map[string]string{
+		"oversized": strings.Repeat("a", 129),
+		"control":   "AKID\nINJECTED",
+		"comma":     "AKID,INJECTED",
+		"equals":    "AKID=INJECTED",
+		"space":     "AKID INJECTED",
+	} {
+		t.Run(name, func(t *testing.T) {
+			header := "AWS4-HMAC-SHA256 Credential=" + accessKeyID + "/20260806/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=" + strings.Repeat("a", 64)
+			_, err := parseAuthorizationHeader(header)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestSigV4S3CanonicalPathBindsEscapedWireIdentity(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	for name, target := range map[string]string{
+		"encoded slash":   "https://s3.example.com/test-bucket/a%2Fb",
+		"literal percent": "https://s3.example.com/test-bucket/a%25b",
+		"unicode":         "https://s3.example.com/test-bucket/snowman-\u2603",
+	} {
+		t.Run(name+" accepted", func(t *testing.T) {
+			req := signedRequestAtTime(t, http.MethodGet, target, nil, unsignedPayload, validCreds, signedAt)
+			require.NoError(t, verifySignatureAtTime(req, parsedAuthInfo(t, req), testSecretKey, signedAt, time.Minute))
+		})
+	}
+
+	t.Run("encoded slash cannot become a path separator", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/a%2Fb", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		req.URL.RawPath = ""
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+
+	t.Run("percent escape case is signed", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/a%2Fb", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		req.URL.RawPath = strings.Replace(req.URL.RawPath, "%2F", "%2f", 1)
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+
+	t.Run("literal percent identity cannot change", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/a%25b", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		changed, err := url.Parse("https://s3.example.com/test-bucket/a%2525b")
+		require.NoError(t, err)
+		req.URL = changed
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
 }
 
 func TestSigV4_RejectsUnsupportedSessionTokenAndTrailerModes(t *testing.T) {

@@ -150,6 +150,7 @@ func setupE2EWithPolicy(t *testing.T, policy *iam.Policy) *e2eEnv {
 				RealRegion:       "us-east-1",
 				PathPrefix:       "tenant-abc",
 				RealUsePathStyle: true,
+				RoutingTokenKey:  testRoutingTokenKey,
 			}, nil
 		},
 	}

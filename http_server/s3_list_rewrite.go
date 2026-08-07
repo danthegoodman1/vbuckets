@@ -1,91 +1,50 @@
 package http_server
 
 import (
-	"encoding/xml"
-	"io"
 	"net/url"
 	"strings"
 )
 
-// rewriteListQueryForPrefix prepends pathPrefix to the prefix, start-after,
-// and marker query parameters used by ListObjects V1/V2.
-func rewriteListQueryForPrefix(rawQuery string, pathPrefix string) string {
+func rewriteOutboundQuery(kind S3OperationKind, rawQuery, pathPrefix string, prefixKeyFields bool, cfg *VBucketConfig) (string, error) {
 	q, _ := url.ParseQuery(rawQuery)
-
-	q.Set("prefix", pathPrefix+q.Get("prefix"))
-
-	if sa := q.Get("start-after"); sa != "" {
-		q.Set("start-after", pathPrefix+sa)
-	}
-	if m := q.Get("marker"); m != "" {
-		q.Set("marker", pathPrefix+m)
+	if prefixKeyFields && pathPrefix != "" {
+		q.Set("prefix", pathPrefix+q.Get("prefix"))
 	}
 
-	return q.Encode()
-}
-
-func listResponseUsesURLEncoding(rawQuery string) bool {
-	q, _ := url.ParseQuery(rawQuery)
-	return q.Get("encoding-type") == "url"
-}
-
-// rewriteListResponse rewrites a ListObjects V1/V2 XML response:
-//   - strips pathPrefix from object keys, prefix echo, and common prefixes
-//   - replaces the echoed bucket name with the virtual bucket name
-//
-// Uses streaming XML token rewriting so unknown elements are preserved.
-func rewriteListResponse(in io.Reader, out io.Writer, pathPrefix, virtualBucket string, urlEncoded bool) error {
-	decoder := xml.NewDecoder(in)
-	encoder := xml.NewEncoder(out)
-	var stack []string
-
-	for {
-		token, err := decoder.Token()
-		if err == io.EOF {
-			break
+	var keyFields []string
+	switch kind {
+	case operationListObjects:
+		keyFields = []string{"marker"}
+	case operationListObjectsV2:
+		keyFields = []string{"start-after"}
+	case operationListMultipartUploads:
+		keyFields = []string{"key-marker"}
+	}
+	for _, field := range keyFields {
+		if value := q.Get(field); value != "" && pathPrefix != "" {
+			q.Set(field, pathPrefix+value)
 		}
-		if err != nil {
-			return err
-		}
-
-		switch t := token.(type) {
-		case xml.StartElement:
-			stack = append(stack, t.Name.Local)
-			if err := encoder.EncodeToken(t); err != nil {
-				return err
-			}
-		case xml.EndElement:
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-			if err := encoder.EncodeToken(t); err != nil {
-				return err
-			}
-		case xml.CharData:
-			path := strings.Join(stack, "/")
-			text := string(t)
-			switch path {
-			case "ListBucketResult/Name":
-				text = virtualBucket
-			case "ListBucketResult/Prefix",
-				"ListBucketResult/StartAfter",
-				"ListBucketResult/Marker",
-				"ListBucketResult/NextMarker",
-				"ListBucketResult/CommonPrefixes/Prefix",
-				"ListBucketResult/Contents/Key":
-				text = stripListPathPrefix(text, pathPrefix, urlEncoded)
-			}
-			if err := encoder.EncodeToken(xml.CharData(text)); err != nil {
-				return err
-			}
-		default:
-			if err := encoder.EncodeToken(t); err != nil {
-				return err
+	}
+	if cfg != nil {
+		for _, field := range []struct {
+			name string
+			kind string
+		}{
+			{name: "continuation-token", kind: "continuation"},
+			{name: "upload-id-marker", kind: "upload"},
+			{name: "uploadId", kind: "upload"},
+			{name: "versionId", kind: "version"},
+		} {
+			if value := q.Get(field.name); value != "" {
+				decoded, err := decodeOpaqueToken(cfg, field.kind, value)
+				if err != nil {
+					return "", err
+				}
+				q.Set(field.name, decoded)
 			}
 		}
 	}
-
-	return encoder.Flush()
+	return q.Encode(), nil
 }
 
 func stripListPathPrefix(text, pathPrefix string, urlEncoded bool) string {

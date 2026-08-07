@@ -285,17 +285,28 @@ func (x *LookupVBucketRequest) GetBucketName() string {
 }
 
 type LookupVBucketResponse struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	RealEndpoint     string                 `protobuf:"bytes,1,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
-	RealBucket       string                 `protobuf:"bytes,2,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
-	RealAccessKey    string                 `protobuf:"bytes,3,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
-	RealSecretKey    string                 `protobuf:"bytes,4,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
-	RealRegion       string                 `protobuf:"bytes,5,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
-	PathPrefix       string                 `protobuf:"bytes,6,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
-	RealUsePathStyle bool                   `protobuf:"varint,7,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
-	Ttl              *durationpb.Duration   `protobuf:"bytes,8,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RealEndpoint  string                 `protobuf:"bytes,1,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
+	RealBucket    string                 `protobuf:"bytes,2,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
+	RealAccessKey string                 `protobuf:"bytes,3,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
+	RealSecretKey string                 `protobuf:"bytes,4,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
+	RealRegion    string                 `protobuf:"bytes,5,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
+	// The control plane owns namespace allocation. For mappings sharing a real
+	// endpoint and bucket, path_prefix values must be normalized and pairwise
+	// non-overlapping; an empty prefix reserves the whole real bucket exclusively.
+	PathPrefix       string               `protobuf:"bytes,6,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
+	RealUsePathStyle bool                 `protobuf:"varint,7,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
+	Ttl              *durationpb.Duration `protobuf:"bytes,8,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	// Required stable 32-byte random key used only to encrypt mapping-scoped
+	// routing tokens. The control plane must keep it unchanged across proxy
+	// replicas, restarts, and upstream credential rotation while the real
+	// storage namespace is unchanged. The control plane MUST generate a new key
+	// whenever real_endpoint, real_bucket, or path_prefix changes. Rotating it
+	// invalidates outstanding virtual continuation, upload, and version IDs and
+	// therefore requires an explicit drain window.
+	RoutingTokenKey []byte `protobuf:"bytes,9,opt,name=routing_token_key,json=routingTokenKey,proto3" json:"routing_token_key,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *LookupVBucketResponse) Reset() {
@@ -384,6 +395,13 @@ func (x *LookupVBucketResponse) GetTtl() *durationpb.Duration {
 	return nil
 }
 
+func (x *LookupVBucketResponse) GetRoutingTokenKey() []byte {
+	if x != nil {
+		return x.RoutingTokenKey
+	}
+	return nil
+}
+
 type CreateVBucketRequest struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	AccessKeyId        string                 `protobuf:"bytes,1,opt,name=access_key_id,json=accessKeyId,proto3" json:"access_key_id,omitempty"`
@@ -445,17 +463,20 @@ func (x *CreateVBucketRequest) GetLocationConstraint() string {
 }
 
 type CreateVBucketResponse struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	RealEndpoint     string                 `protobuf:"bytes,1,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
-	RealBucket       string                 `protobuf:"bytes,2,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
-	RealAccessKey    string                 `protobuf:"bytes,3,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
-	RealSecretKey    string                 `protobuf:"bytes,4,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
-	RealRegion       string                 `protobuf:"bytes,5,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
-	PathPrefix       string                 `protobuf:"bytes,6,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
-	RealUsePathStyle bool                   `protobuf:"varint,7,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
-	Ttl              *durationpb.Duration   `protobuf:"bytes,8,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RealEndpoint  string                 `protobuf:"bytes,1,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
+	RealBucket    string                 `protobuf:"bytes,2,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
+	RealAccessKey string                 `protobuf:"bytes,3,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
+	RealSecretKey string                 `protobuf:"bytes,4,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
+	RealRegion    string                 `protobuf:"bytes,5,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
+	// Same namespace-allocation contract as LookupVBucketResponse.path_prefix.
+	PathPrefix       string               `protobuf:"bytes,6,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
+	RealUsePathStyle bool                 `protobuf:"varint,7,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
+	Ttl              *durationpb.Duration `protobuf:"bytes,8,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	// Same lifetime and stability contract as LookupVBucketResponse.
+	RoutingTokenKey []byte `protobuf:"bytes,9,opt,name=routing_token_key,json=routingTokenKey,proto3" json:"routing_token_key,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CreateVBucketResponse) Reset() {
@@ -540,6 +561,13 @@ func (x *CreateVBucketResponse) GetRealUsePathStyle() bool {
 func (x *CreateVBucketResponse) GetTtl() *durationpb.Duration {
 	if x != nil {
 		return x.Ttl
+	}
+	return nil
+}
+
+func (x *CreateVBucketResponse) GetRoutingTokenKey() []byte {
+	if x != nil {
+		return x.RoutingTokenKey
 	}
 	return nil
 }
@@ -984,16 +1012,19 @@ type VBucketDelta struct {
 	BucketName  string                 `protobuf:"bytes,2,opt,name=bucket_name,json=bucketName,proto3" json:"bucket_name,omitempty"`
 	Remove      bool                   `protobuf:"varint,3,opt,name=remove,proto3" json:"remove,omitempty"`
 	// Fields below are only set on upsert (remove == false).
-	RealEndpoint     string               `protobuf:"bytes,4,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
-	RealBucket       string               `protobuf:"bytes,5,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
-	RealAccessKey    string               `protobuf:"bytes,6,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
-	RealSecretKey    string               `protobuf:"bytes,7,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
-	RealRegion       string               `protobuf:"bytes,8,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
+	RealEndpoint  string `protobuf:"bytes,4,opt,name=real_endpoint,json=realEndpoint,proto3" json:"real_endpoint,omitempty"`
+	RealBucket    string `protobuf:"bytes,5,opt,name=real_bucket,json=realBucket,proto3" json:"real_bucket,omitempty"`
+	RealAccessKey string `protobuf:"bytes,6,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
+	RealSecretKey string `protobuf:"bytes,7,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
+	RealRegion    string `protobuf:"bytes,8,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
+	// Same namespace-allocation contract as LookupVBucketResponse.path_prefix.
 	PathPrefix       string               `protobuf:"bytes,9,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
 	RealUsePathStyle bool                 `protobuf:"varint,10,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
 	Ttl              *durationpb.Duration `protobuf:"bytes,11,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Same lifetime and stability contract as LookupVBucketResponse.
+	RoutingTokenKey []byte `protobuf:"bytes,12,opt,name=routing_token_key,json=routingTokenKey,proto3" json:"routing_token_key,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *VBucketDelta) Reset() {
@@ -1103,6 +1134,13 @@ func (x *VBucketDelta) GetTtl() *durationpb.Duration {
 	return nil
 }
 
+func (x *VBucketDelta) GetRoutingTokenKey() []byte {
+	if x != nil {
+		return x.RoutingTokenKey
+	}
+	return nil
+}
+
 var File_v1_controlplane_proto protoreflect.FileDescriptor
 
 const file_v1_controlplane_proto_rawDesc = "" +
@@ -1124,7 +1162,7 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\x14LookupVBucketRequest\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\x12\x1f\n" +
 	"\vbucket_name\x18\x02 \x01(\tR\n" +
-	"bucketName\"\xcb\x02\n" +
+	"bucketName\"\xf7\x02\n" +
 	"\x15LookupVBucketResponse\x12#\n" +
 	"\rreal_endpoint\x18\x01 \x01(\tR\frealEndpoint\x12\x1f\n" +
 	"\vreal_bucket\x18\x02 \x01(\tR\n" +
@@ -1136,12 +1174,13 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\vpath_prefix\x18\x06 \x01(\tR\n" +
 	"pathPrefix\x12-\n" +
 	"\x13real_use_path_style\x18\a \x01(\bR\x10realUsePathStyle\x12+\n" +
-	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\x8c\x01\n" +
+	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\x12*\n" +
+	"\x11routing_token_key\x18\t \x01(\fR\x0froutingTokenKey\"\x8c\x01\n" +
 	"\x14CreateVBucketRequest\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\x12\x1f\n" +
 	"\vbucket_name\x18\x02 \x01(\tR\n" +
 	"bucketName\x12/\n" +
-	"\x13location_constraint\x18\x03 \x01(\tR\x12locationConstraint\"\xcb\x02\n" +
+	"\x13location_constraint\x18\x03 \x01(\tR\x12locationConstraint\"\xf7\x02\n" +
 	"\x15CreateVBucketResponse\x12#\n" +
 	"\rreal_endpoint\x18\x01 \x01(\tR\frealEndpoint\x12\x1f\n" +
 	"\vreal_bucket\x18\x02 \x01(\tR\n" +
@@ -1153,7 +1192,8 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\vpath_prefix\x18\x06 \x01(\tR\n" +
 	"pathPrefix\x12-\n" +
 	"\x13real_use_path_style\x18\a \x01(\bR\x10realUsePathStyle\x12+\n" +
-	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"9\n" +
+	"\x03ttl\x18\b \x01(\v2\x19.google.protobuf.DurationR\x03ttl\x12*\n" +
+	"\x11routing_token_key\x18\t \x01(\fR\x0froutingTokenKey\"9\n" +
 	"\x13ListVBucketsRequest\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\"r\n" +
 	"\x0eVBucketSummary\x12\x1f\n" +
@@ -1180,7 +1220,7 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"\x06remove\x18\x02 \x01(\bR\x06remove\x12\x1b\n" +
 	"\tbase_host\x18\x03 \x01(\tR\bbaseHost\x12\x14\n" +
 	"\x05found\x18\x04 \x01(\bR\x05found\x12+\n" +
-	"\x03ttl\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\x9f\x03\n" +
+	"\x03ttl\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\xcb\x03\n" +
 	"\fVBucketDelta\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\x12\x1f\n" +
 	"\vbucket_name\x18\x02 \x01(\tR\n" +
@@ -1197,7 +1237,8 @@ const file_v1_controlplane_proto_rawDesc = "" +
 	"pathPrefix\x12-\n" +
 	"\x13real_use_path_style\x18\n" +
 	" \x01(\bR\x10realUsePathStyle\x12+\n" +
-	"\x03ttl\x18\v \x01(\v2\x19.google.protobuf.DurationR\x03ttl2\xa0\x04\n" +
+	"\x03ttl\x18\v \x01(\v2\x19.google.protobuf.DurationR\x03ttl\x12*\n" +
+	"\x11routing_token_key\x18\f \x01(\fR\x0froutingTokenKey2\xa0\x04\n" +
 	"\fControlPlane\x12b\n" +
 	"\x11LookupCredentials\x12%.vbuckets.v1.LookupCredentialsRequest\x1a&.vbuckets.v1.LookupCredentialsResponse\x12Y\n" +
 	"\x0eLookupBaseHost\x12\".vbuckets.v1.LookupBaseHostRequest\x1a#.vbuckets.v1.LookupBaseHostResponse\x12V\n" +

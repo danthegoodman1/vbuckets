@@ -142,6 +142,7 @@ func (s *testControlPlane) CreateVBucket(_ context.Context, req *apiv1.CreateVBu
 		RealRegion:       resp.RealRegion,
 		PathPrefix:       resp.PathPrefix,
 		RealUsePathStyle: resp.RealUsePathStyle,
+		RoutingTokenKey:  resp.RoutingTokenKey,
 		Ttl:              resp.Ttl,
 	}, nil
 }
@@ -183,6 +184,7 @@ func (s *testControlPlane) vbucketResponse(pathPrefix string) *apiv1.LookupVBuck
 		RealRegion:       "us-east-1",
 		PathPrefix:       pathPrefix,
 		RealUsePathStyle: true,
+		RoutingTokenKey:  []byte("0123456789abcdef0123456789abcdef"),
 		Ttl:              durationpb.New(5 * time.Minute),
 	}
 }

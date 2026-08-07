@@ -276,6 +276,7 @@ func TestMapS3IAMChecks_FailsClosedOnAmbiguousQueryShapes(t *testing.T) {
 		{name: "duplicate multipart flag", method: http.MethodPost, target: "/test-bucket/a.txt?uploads&uploads", bucket: testBucket, objectKey: "a.txt"},
 		{name: "invalid part number", method: http.MethodGet, target: "/test-bucket/a.txt?partNumber=0", bucket: testBucket, objectKey: "a.txt"},
 		{name: "invalid max keys", method: http.MethodGet, target: "/test-bucket?max-keys=lots", bucket: testBucket},
+		{name: "zero max uploads", method: http.MethodGet, target: "/test-bucket?uploads&max-uploads=0", bucket: testBucket},
 		{name: "invalid fetch owner", method: http.MethodGet, target: "/test-bucket?list-type=2&fetch-owner=yes", bucket: testBucket},
 		{name: "invalid encoding type", method: http.MethodGet, target: "/test-bucket?encoding-type=xml", bucket: testBucket},
 		{name: "object lock header", method: http.MethodPut, target: "/test-bucket/a.txt", bucket: testBucket, objectKey: "a.txt", headers: map[string]string{"x-amz-object-lock-mode": "GOVERNANCE"}},
@@ -1099,6 +1100,66 @@ func TestS3Auth_ListBucketsInterceptsWithoutVBucketLookup(t *testing.T) {
 	assert.False(t, vbucketLookupCalled)
 }
 
+func TestS3Auth_ListBucketsRejectsInvalidControlPlaneNamesBeforeCommit(t *testing.T) {
+	for name, buckets := range map[string][]ListedVBucket{
+		"invalid name":          {{Name: "bad\nbucket", CreationDate: time.Now()}},
+		"duplicate":             {{Name: "alpha", CreationDate: time.Now()}, {Name: "alpha", CreationDate: time.Now()}},
+		"missing creation date": {{Name: "alpha"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resolver := newTestResolver()
+			resolver.list = func(_ context.Context, _ string) ([]ListedVBucket, error) {
+				return buckets, nil
+			}
+			handler := S3Auth(resolver)(handleS3Request(resolver))
+			server := httptest.NewServer(handler)
+			t.Cleanup(server.Close)
+
+			req := signedRequest(t, http.MethodGet, server.URL+"/", nil, unsignedPayload, validCreds)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+			assert.Contains(t, string(body), "<Code>InternalError</Code>")
+			assert.NotContains(t, string(body), "<ListAllMyBucketsResult")
+			assert.NotContains(t, string(body), "bad")
+		})
+	}
+}
+
+func TestS3AuthRejectsInvalidVirtualBucketBeforeLookup(t *testing.T) {
+	for _, test := range []struct {
+		name, target string
+		baseHost     string
+	}{
+		{name: "path style", target: "http://s3.example.test/Bad_Bucket/key"},
+		{name: "vhost style", target: "http://Bad_Bucket.s3.example.test/key", baseHost: "s3.example.test"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resolver := newTestResolver()
+			lookupCalled := false
+			resolver.baseHost = func(_ context.Context, _ string) (string, bool, error) {
+				return test.baseHost, test.baseHost != "", nil
+			}
+			resolver.vbucket = func(_ context.Context, _, _ string) (*VBucketConfig, error) {
+				lookupCalled = true
+				return nil, errors.New("must not be reached")
+			}
+			handler := S3Auth(resolver)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Error("downstream handler must not be reached")
+			}))
+			req := signedRequest(t, http.MethodGet, test.target, nil, unsignedPayload, validCreds)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), "<Code>InvalidBucketName</Code>")
+			assert.False(t, lookupCalled)
+		})
+	}
+}
+
 func TestS3Auth_CreateBucketInterceptsWithoutVBucketLookup(t *testing.T) {
 	resolver := newTestResolver()
 	var vbucketLookupCalled bool
@@ -1111,7 +1172,7 @@ func TestS3Auth_CreateBucketInterceptsWithoutVBucketLookup(t *testing.T) {
 		require.Equal(t, testAccessKey, accessKeyID)
 		gotBucket = bucketName
 		gotLocation = locationConstraint
-		return &VBucketConfig{}, nil
+		return validTestVBucketConfig(), nil
 	}
 
 	handler := S3Auth(resolver)(handleS3Request(resolver))
@@ -1132,6 +1193,27 @@ func TestS3Auth_CreateBucketInterceptsWithoutVBucketLookup(t *testing.T) {
 	assert.Equal(t, "new-bucket", gotBucket)
 	assert.Equal(t, "us-west-2", gotLocation)
 	assert.False(t, vbucketLookupCalled)
+}
+
+func TestS3Auth_CreateBucketRejectsInvalidReturnedMappingBeforeSuccess(t *testing.T) {
+	resolver := newTestResolver()
+	resolver.create = func(_ context.Context, _, _, _ string) (*VBucketConfig, error) {
+		return &VBucketConfig{RealEndpoint: "https://origin.example.com"}, nil
+	}
+	handler := S3Auth(resolver)(handleS3Request(resolver))
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	req := signedRequest(t, http.MethodPut, server.URL+"/new-bucket", nil, unsignedPayload, validCreds)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"))
+	assert.Contains(t, string(body), "<Code>InternalError</Code>")
+	assert.NotContains(t, string(body), "<CreateBucketResult")
 }
 
 func TestS3Auth_CreateBucketDeniedDoesNotMutate(t *testing.T) {
@@ -1173,7 +1255,7 @@ func TestS3Client_CreateBucketAndListBuckets(t *testing.T) {
 	var buckets []ListedVBucket
 	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
 		buckets = append(buckets, ListedVBucket{Name: bucketName, CreationDate: created})
-		return &VBucketConfig{}, nil
+		return validTestVBucketConfig(), nil
 	}
 	resolver.list = func(_ context.Context, accessKeyID string) ([]ListedVBucket, error) {
 		return buckets, nil

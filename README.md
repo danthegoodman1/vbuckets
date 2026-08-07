@@ -21,6 +21,10 @@ Designed for whitelabeling -- give tenants their own bucket names, access keys, 
 
 Clients connect with virtual credentials and virtual bucket names. vbuckets verifies the SigV4 signature (including request-time skew checks), resolves the virtual bucket to a real backend (bucket, endpoint, region, credentials, optional path prefix), checks IAM permissions, then re-signs and proxies the request. Incoming requests must use `x-amz-content-sha256: UNSIGNED-PAYLOAD` so uploads can stream through the proxy without buffering. SigV4 signed-header names must be lowercase, sorted, and unique; `host` and `x-amz-date` are required, all values of a signed header are canonicalized and verified, and any other `x-amz-*` request header except `x-amz-content-sha256` must also be signed. `CreateBucket` and `ListBuckets` are intercepted by vbuckets and sent to the control plane instead of the origin service. Supports both virtual-hosted (`bucket.s3.example.com/key`) and path-style (`s3.example.com/bucket/key`) addressing in both directions.
 
+Credential issuers must use virtual access-key IDs matching
+`[A-Za-z0-9._-]{1,128}`. The same bounded grammar is enforced before a key can
+reach control-plane/cache lookup or synthesized XML.
+
 ## Lookup functions
 
 The auth middleware is split into two phases with three distinct lookups, each independently cacheable:
@@ -29,8 +33,8 @@ The auth middleware is split into two phases with three distinct lookups, each i
 |---|---|---|
 | `LookupCredentials` | access key ID | secret key, IAM policy, TTL |
 | `LookupBaseHost` | request hostname | base domain (if registered), TTL |
-| `LookupVBucket` | access key ID + bucket name | real endpoint, bucket, region, path prefix, addressing style, TTL |
-| `CreateVBucket` | access key ID + bucket name + location constraint | real endpoint, bucket, region, path prefix, addressing style, TTL |
+| `LookupVBucket` | access key ID + bucket name | real endpoint, bucket, region, path prefix, addressing style, stable routing-token key, TTL |
+| `CreateVBucket` | access key ID + bucket name + location constraint | real endpoint, bucket, region, path prefix, addressing style, stable routing-token key, TTL |
 | `ListVBuckets` | access key ID | visible virtual bucket names and creation dates |
 
 `LookupBaseHost` determines whether an incoming request is virtual-hosted style (`bucket.s3.example.com`) or path style (`s3.example.com/bucket`) by checking if the hostname is (or is a subdomain of) a registered base domain. The set of base domains changes extremely rarely, so this is aggressively cacheable.
@@ -39,16 +43,12 @@ The auth middleware is split into two phases with three distinct lookups, each i
 
 ## Target S3 operation and virtualization contract
 
-This matrix is the enforced acceptance contract for the request planner and
-the acceptance contract for the remaining Phase 2 namespace transforms. Today,
-requests are decoded once into a typed operation plan, and unknown, duplicate,
-conflicting, or operation-mismatched query/header shapes fail before virtual
-bucket mapping or IAM evaluation. Prefix rewriting is still applied too broadly
-to bucket-level requests, only successful ListObjects XML has a namespace-aware response
-transform, upstream multipart/error/redirect metadata may pass through, and
-hop-by-hop filtering does not yet remove headers named by `Connection`. Until
-Phase 2 closes those response and rewrite gaps, deployments must not rely on the
-complete no-leak/prefix-isolation properties below.
+This matrix is the enforced acceptance and virtualization contract. Requests
+are decoded once into a typed operation plan; unknown, duplicate, conflicting,
+or operation-mismatched query/header shapes fail before virtual bucket mapping
+or IAM evaluation. The same plan selects the exact outbound path/query rewrite,
+safe request headers, response schema, request-echo checks, required response
+fields, and namespace transforms.
 
 The supported request surface is deliberately exact. A request uses only one row;
 unknown query keys, duplicate singleton keys, conflicting subresources or
@@ -61,7 +61,9 @@ currently valid representative shapes are checked by
 [`TestS3OperationContract`](./http_server/s3_contract_test.go).
 Numeric pagination and part fields must contain an in-range decimal integer;
 `fetch-owner` is `true` or `false`, and the only supported `encoding-type` is
-`url`.
+`url`. `max-uploads` is 1 through 1000. Empty R6 marker elements are accepted
+for an initial nontruncated listing, but actual multipart upload IDs remain
+nonempty authenticated tokens.
 
 The signing headers described above are required on
 every row. Ordinary HTTP content, range, and conditional headers are allowed
@@ -110,7 +112,7 @@ the checksum algorithm; multiple or inconsistent checksum families are rejected.
 `response-content-disposition`, `response-content-encoding`,
 `response-content-language`, `response-content-type`, and `response-expires`.
 
-The target response profiles are part of the same acceptance boundary:
+The response profiles are part of the same acceptance boundary:
 
 | Profile | Required behavior |
 |---|---|
@@ -127,17 +129,40 @@ The target response profiles are part of the same acceptance boundary:
 
 For every target profile, non-success XML, redirects, and headers must follow
 one global rule: configured real endpoint, bucket, region routing data, access
-keys, and path prefix must never be client-visible. Phase 2 will validate and
-transform namespace-bearing control XML before committing response headers
-while keeping unbounded object and list bodies streaming. It must strip
-hop-by-hop headers, headers named by `Connection`, unsafe trailers, upstream
-endpoint headers, and stale length/checksum metadata after a body transform.
+keys, and path prefix must never be client-visible through proxy-owned S3
+metadata. Namespace-bearing bounded control XML is validated and transformed
+before response headers commit. Large list XML is root-preflighted and
+stream-transformed: a malformed tail can end an already-started 2xx response,
+but a namespace-bearing scalar is accumulated and validated before that scalar
+is emitted. Object bytes and user-controlled object metadata remain deliberately
+byte-transparent and are not content-redacted merely because they contain a
+configured string. Hop-by-hop headers, `Connection`-nominated headers, unsafe
+trailers, routing-owned backend metadata, and stale representation validators
+are removed. Origin redirects are translated to a controlled 502 rather than
+followed or exposed; 304 remains an empty response with safe headers.
 
-Under the completed contract, a mapping's path prefix is applied only to object
+Backend Owner and Initiator account identities in R5/R6/R8 are replaced with a
+stable virtual bucket-scoped identity: both `ID` and `DisplayName` equal the
+virtual bucket name. With `fetch-owner=true`, each listed object must carry an
+Owner for the proxy to replace. Multipart upload, continuation, and version IDs
+are authenticated opaque `vb1` routing tokens; raw origin IDs and cross-mapping
+replay fail before origin access. The token domain is bound to the normalized
+endpoint/bucket/prefix as well as the control-plane key, so endpoint retargeting
+fails closed even before the required key rotation. CompleteMultipartUpload
+`Location` is a safe relative URI: `/{bucket}/{escaped-key}` for path-style
+requests and `/{escaped-key}` for virtual-hosted requests. The entire logical
+key is AWS percent-encoded, including `/`, so a leading-slash key cannot create
+a `//host` network-path reference. Deployments that require an
+absolute public Location need a future trusted public-base configuration; the
+proxy never trusts arbitrary forwarded host/scheme headers for this purpose.
+
+A mapping's path prefix is applied only to object
 keys and key-bearing list/multipart fields; bucket-level requests stay at the
-real bucket root. The Phase 2 gate will prove that two virtual buckets sharing
-one backend have disjoint request namespaces and cannot infer each other's
-configured identifiers from successes, errors, or redirects.
+real bucket root. Two virtual buckets sharing one backend have disjoint request
+namespaces and cannot use one another's routing tokens. Request-echo fields in
+list responses must exactly match the rewritten request (including documented
+numeric defaults), while result keys/next markers need only remain inside the
+configured prefix.
 
 ## IAM
 
@@ -187,6 +212,26 @@ service ControlPlane {
 
 The unary RPCs handle on-demand lookups and intercepted create/list operations. Lookup and create responses include a `ttl` field that controls how long the proxy caches that entry.
 
+The control plane owns real namespace allocation. Mappings that share a real
+endpoint and real bucket MUST use normalized, pairwise non-overlapping path
+prefixes; an empty prefix reserves that real bucket exclusively. Each mapping
+also carries a required persisted 32-byte random `routing_token_key`. Replicas
+must return the same key across lookups, restarts, and upstream credential
+rotation while the real endpoint/bucket/prefix namespace is unchanged. The
+control plane MUST generate a new key whenever any of those namespace fields
+changes; old continuation/upload/version IDs then fail authentication, so a
+planned change may need a drain window. Never derive this key from upstream
+credentials or fall back when it is absent.
+
+Roll out control-plane storage and population of `routing_token_key` for lookup,
+create, and delta responses—and verify replica agreement—before upgrading
+proxies. Missing or malformed keys fail closed. Mapping validation also requires
+an HTTP(S) endpoint without credentials/path/query/fragment, an S3-valid real
+bucket, bounded credentials/region, and a safe normalized prefix. IP-literal
+origins require path-style addressing. Virtual-hosted HTTPS mappings with dotted
+real bucket names or custom endpoints remain the deployer's DNS/certificate
+responsibility.
+
 ### Delta stream
 
 `ListenForDeltas` is a server-streaming RPC that pushes cache updates to the proxy. When credentials are revoked, bucket mappings change, or base hosts are added/removed, the control plane sends a `Delta` message with the full updated value (upsert) or a removal flag.
@@ -216,6 +261,12 @@ contract is:
 ### Caching
 
 Lookup results and deltas are cached locally, going to the control plane as needed. Three independent caches (credentials, base hosts, vbuckets) each use per-entry TTLs from the control plane. Cache misses trigger the unary gRPC lookup; concurrent requests for the same key are deduplicated automatically to protect the control plane from thundering herds.
+
+Production control-plane lookup/create/delta insertion validates and
+defensively clones mappings; the proxy revalidates values returned through the
+public `Resolver` interface as a fail-closed adapter boundary. A future domain
+API can replace this mutable DTO with an immutable validated mapping and remove
+the redundant hot-path parsing/cloning without weakening custom Resolver safety.
 
 ## Development toolchain
 

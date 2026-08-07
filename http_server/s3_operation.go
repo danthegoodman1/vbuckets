@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/danthegoodman1/vbuckets/iam"
 )
@@ -154,6 +156,13 @@ func planS3Operation(r *http.Request, bucket, objectKey string) (planned *S3Oper
 		planned.signedAt = firstHeaderValue(planned.forwardHeaders, "x-amz-date")
 		planned.iamContext = buildS3IAMWireContext(planned)
 	}()
+	if objectKey != "" {
+		if err := validateVirtualObjectKey(objectKey); err != nil {
+			return nil, malformedS3Request(r, "invalid object key: %v", err)
+		}
+	} else if bucket != "" && strings.HasSuffix(r.URL.Path, "/") && r.URL.Path != "/" {
+		return nil, malformedS3Request(r, "trailing-slash empty object keys are not supported")
+	}
 
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -334,6 +343,26 @@ func planS3Operation(r *http.Request, bucket, objectKey string) (planned *S3Oper
 	return nil, unsupportedS3Operation(r)
 }
 
+func validateVirtualObjectKey(objectKey string) error {
+	if !utf8.ValidString(objectKey) {
+		return fmt.Errorf("object key must be valid UTF-8")
+	}
+	if strings.ContainsRune(objectKey, '\x00') || strings.ContainsRune(objectKey, '\\') {
+		return fmt.Errorf("NUL and backslash are not supported")
+	}
+	for _, character := range objectKey {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("control characters are not supported")
+		}
+	}
+	for _, segment := range strings.Split(objectKey, "/") {
+		if segment == "." || segment == ".." {
+			return fmt.Errorf("dot path segments are not supported")
+		}
+	}
+	return nil
+}
+
 func validateQueryForOperation(plan *S3OperationPlan) error {
 	if _, ok := plan.query["encoding-type"]; ok && plan.query.Get("encoding-type") != "url" {
 		return fmt.Errorf("encoding-type must be url")
@@ -341,12 +370,19 @@ func validateQueryForOperation(plan *S3OperationPlan) error {
 	if value, ok := plan.query["fetch-owner"]; ok && value[0] != "true" && value[0] != "false" {
 		return fmt.Errorf("fetch-owner must be true or false")
 	}
+	for _, name := range []string{"prefix", "marker", "start-after", "key-marker"} {
+		if value, ok := plan.query[name]; ok && value[0] != "" {
+			if err := validateVirtualObjectKey(value[0]); err != nil {
+				return fmt.Errorf("%s contains an unsafe virtual key: %w", name, err)
+			}
+		}
+	}
 	for _, field := range []struct {
 		name     string
 		min, max int
 	}{
 		{name: "max-keys", min: 0, max: 1000},
-		{name: "max-uploads", min: 0, max: 1000},
+		{name: "max-uploads", min: 1, max: 1000},
 		{name: "max-parts", min: 0, max: 1000},
 		{name: "part-number-marker", min: 0, max: 10000},
 	} {
@@ -506,7 +542,62 @@ func validateHeadersForOperation(r *http.Request, kind S3OperationKind) error {
 			return fmt.Errorf("header %q is not valid for %s", lower, kind)
 		}
 	}
+	return validateGenericHeadersForOperation(r.Header, kind)
+}
+
+func validateGenericHeadersForOperation(headers http.Header, kind S3OperationKind) error {
+	for name := range headers {
+		canonical := http.CanonicalHeaderKey(name)
+		lower := strings.ToLower(canonical)
+		if strings.HasPrefix(lower, "x-amz-") {
+			continue
+		}
+		switch canonical {
+		case "Authorization", "Accept", "Accept-Encoding", "User-Agent", "Content-Length",
+			"Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+			"Amz-Sdk-Invocation-Id", "Amz-Sdk-Request", "Traceparent", "Tracestate":
+			continue
+		case "Cookie", "Cookie2", "Forwarded", "Origin", "Proxy-Authorization", "Proxy-Connection",
+			"X-Http-Method-Override", "X-Method-Override", "X-Original-Url", "X-Rewrite-Url":
+			return fmt.Errorf("header %q is not supported", lower)
+		}
+		if strings.HasPrefix(lower, "x-forwarded-") {
+			return fmt.Errorf("header %q is not supported", lower)
+		}
+		if objectReadHeaderAllowed(kind, canonical) || objectBodyHeaderAllowed(kind, canonical) {
+			continue
+		}
+		return fmt.Errorf("header %q is not valid for %s", lower, kind)
+	}
 	return nil
+}
+
+func objectReadHeaderAllowed(kind S3OperationKind, header string) bool {
+	if kind != operationGetObject && kind != operationGetObjectVersion && kind != operationHeadObject && kind != operationHeadObjectVersion {
+		return false
+	}
+	switch header {
+	case "Range", "If-Match", "If-Modified-Since", "If-None-Match", "If-Unmodified-Since", "If-Range":
+		return true
+	default:
+		return false
+	}
+}
+
+func objectBodyHeaderAllowed(kind S3OperationKind, header string) bool {
+	switch kind {
+	case operationCreateBucket, operationPutObject, operationPutObjectACL, operationPutObjectTagging,
+		operationCopyObject, operationCreateMultipartUpload, operationUploadPart, operationCompleteMultipartUpload:
+	default:
+		return false
+	}
+	switch header {
+	case "Cache-Control", "Content-Disposition", "Content-Encoding", "Content-Language",
+		"Content-Md5", "Content-Type", "Expect", "Expires":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateChecksumHeadersForOperation(headers http.Header, kind S3OperationKind) error {

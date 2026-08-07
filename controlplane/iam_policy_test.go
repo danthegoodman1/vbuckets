@@ -21,6 +21,8 @@ import (
 
 const controlPlaneAllowAllPolicyJSON = `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}`
 
+var controlPlaneRoutingTokenKey = []byte("0123456789abcdef0123456789abcdef")
+
 type fakeControlPlaneClient struct {
 	lookupCredentials func(ctx context.Context, in *apiv1.LookupCredentialsRequest, opts ...grpc.CallOption) (*apiv1.LookupCredentialsResponse, error)
 	lookupBaseHost    func(ctx context.Context, in *apiv1.LookupBaseHostRequest, opts ...grpc.CallOption) (*apiv1.LookupBaseHostResponse, error)
@@ -176,6 +178,7 @@ func TestLookupCaches_InvalidTTLsAreNotCached(t *testing.T) {
 						RealRegion:       "us-east-1",
 						PathPrefix:       "tenant",
 						RealUsePathStyle: true,
+						RoutingTokenKey:  controlPlaneRoutingTokenKey,
 						Ttl:              tt.ttl,
 					}, nil
 				},
@@ -280,6 +283,7 @@ func TestHandleDelta_InvalidTTLsInvalidateAndDoNotPanic(t *testing.T) {
 					RealRegion:       "us-east-1",
 					PathPrefix:       "tenant",
 					RealUsePathStyle: true,
+					RoutingTokenKey:  controlPlaneRoutingTokenKey,
 					Ttl:              tt.ttl,
 				}}})
 			})
@@ -303,6 +307,7 @@ func TestCreateVBucket_WarmsCache(t *testing.T) {
 				RealRegion:       "us-east-1",
 				PathPrefix:       "tenants/access-key/new-bucket",
 				RealUsePathStyle: true,
+				RoutingTokenKey:  controlPlaneRoutingTokenKey,
 				Ttl:              durationpb.New(time.Minute),
 			}, nil
 		},
@@ -330,6 +335,7 @@ func TestCreateVBucket_InvalidTTLSkipsCacheWarm(t *testing.T) {
 						RealRegion:       "us-east-1",
 						PathPrefix:       "tenant",
 						RealUsePathStyle: true,
+						RoutingTokenKey:  controlPlaneRoutingTokenKey,
 						Ttl:              tt.ttl,
 					}, nil
 				},
@@ -342,6 +348,102 @@ func TestCreateVBucket_InvalidTTLSkipsCacheWarm(t *testing.T) {
 			require.False(t, ok)
 		})
 	}
+}
+
+func TestVBucketMappingsAreValidatedBeforeEveryCacheInsertion(t *testing.T) {
+	t.Run("lookup does not cache invalid mapping", func(t *testing.T) {
+		var calls atomic.Int64
+		c := newTestClientWithFake(&fakeControlPlaneClient{
+			lookupVBucket: func(_ context.Context, _ *apiv1.LookupVBucketRequest, _ ...grpc.CallOption) (*apiv1.LookupVBucketResponse, error) {
+				calls.Add(1)
+				return &apiv1.LookupVBucketResponse{
+					RealEndpoint: "https://user:secret@s3.example.com/path", RealBucket: "real-bucket",
+					RealAccessKey: "real-access", RealSecretKey: "real-secret", RealRegion: "us-east-1",
+					PathPrefix: "tenant", RealUsePathStyle: true, RoutingTokenKey: controlPlaneRoutingTokenKey,
+					Ttl: durationpb.New(time.Minute),
+				}, nil
+			},
+		})
+		for range 2 {
+			_, err := c.LookupVBucket(context.Background(), "access-key", "bucket")
+			require.Error(t, err)
+		}
+		require.Equal(t, int64(2), calls.Load())
+		_, found := c.caches.vbuckets.GetIfPresent(vbucketCacheKey("access-key", "bucket"))
+		require.False(t, found)
+	})
+
+	t.Run("create does not warm invalid mapping", func(t *testing.T) {
+		c := newTestClientWithFake(&fakeControlPlaneClient{
+			createVBucket: func(_ context.Context, _ *apiv1.CreateVBucketRequest, _ ...grpc.CallOption) (*apiv1.CreateVBucketResponse, error) {
+				return &apiv1.CreateVBucketResponse{
+					RealEndpoint: "https://s3.example.com", RealBucket: "real-bucket",
+					RealAccessKey: "", RealSecretKey: "real-secret", RealRegion: "us-east-1",
+					PathPrefix: "tenant", RealUsePathStyle: true, RoutingTokenKey: controlPlaneRoutingTokenKey,
+					Ttl: durationpb.New(time.Minute),
+				}, nil
+			},
+		})
+		_, err := c.CreateVBucket(context.Background(), "access-key", "bucket", "")
+		require.Error(t, err)
+		_, found := c.caches.vbuckets.GetIfPresent(vbucketCacheKey("access-key", "bucket"))
+		require.False(t, found)
+	})
+
+	t.Run("invalid delta invalidates previous mapping", func(t *testing.T) {
+		c := NewClient("test-control-plane", zerolog.Nop())
+		key := vbucketCacheKey("access-key", "bucket")
+		c.caches.vbuckets.Set(key, cachedVBucket{VBucketConfig: &http_server.VBucketConfig{RealBucket: "old-real"}, TTL: time.Minute})
+		c.handleDelta(&apiv1.Delta{Delta: &apiv1.Delta_Vbucket{Vbucket: &apiv1.VBucketDelta{
+			AccessKeyId: "access-key", BucketName: "bucket", RealEndpoint: "https://s3.example.com",
+			RealBucket: "real-bucket", RealAccessKey: "real-access", RealSecretKey: "real-secret", RealRegion: "us-east-1",
+			PathPrefix: "tenant/../other", RealUsePathStyle: true, RoutingTokenKey: controlPlaneRoutingTokenKey,
+			Ttl: durationpb.New(time.Minute),
+		}}})
+		_, found := c.caches.vbuckets.GetIfPresent(key)
+		require.False(t, found)
+	})
+}
+
+func TestVBucketCacheDoesNotExposeMutableMappingAliases(t *testing.T) {
+	t.Run("lookup result", func(t *testing.T) {
+		var calls atomic.Int64
+		c := newTestClientWithFake(&fakeControlPlaneClient{lookupVBucket: func(_ context.Context, _ *apiv1.LookupVBucketRequest, _ ...grpc.CallOption) (*apiv1.LookupVBucketResponse, error) {
+			calls.Add(1)
+			return &apiv1.LookupVBucketResponse{
+				RealEndpoint: "https://s3.example.com", RealBucket: "real-bucket", RealAccessKey: "real-access",
+				RealSecretKey: "real-secret", RealRegion: "us-east-1", PathPrefix: "tenant",
+				RealUsePathStyle: true, RoutingTokenKey: controlPlaneRoutingTokenKey, Ttl: durationpb.New(time.Minute),
+			}, nil
+		}})
+		first, err := c.LookupVBucket(context.Background(), "access-key", "bucket")
+		require.NoError(t, err)
+		first.RealBucket = "poisoned"
+		first.RoutingTokenKey[0] ^= 0xff
+		second, err := c.LookupVBucket(context.Background(), "access-key", "bucket")
+		require.NoError(t, err)
+		require.Equal(t, int64(1), calls.Load())
+		require.Equal(t, "real-bucket", second.RealBucket)
+		require.Equal(t, controlPlaneRoutingTokenKey, second.RoutingTokenKey)
+	})
+
+	t.Run("create result", func(t *testing.T) {
+		c := newTestClientWithFake(&fakeControlPlaneClient{createVBucket: func(_ context.Context, _ *apiv1.CreateVBucketRequest, _ ...grpc.CallOption) (*apiv1.CreateVBucketResponse, error) {
+			return &apiv1.CreateVBucketResponse{
+				RealEndpoint: "https://s3.example.com", RealBucket: "real-bucket", RealAccessKey: "real-access",
+				RealSecretKey: "real-secret", RealRegion: "us-east-1", PathPrefix: "tenant",
+				RealUsePathStyle: true, RoutingTokenKey: controlPlaneRoutingTokenKey, Ttl: durationpb.New(time.Minute),
+			}, nil
+		}})
+		created, err := c.CreateVBucket(context.Background(), "access-key", "bucket", "")
+		require.NoError(t, err)
+		created.PathPrefix = "poisoned"
+		created.RoutingTokenKey[0] ^= 0xff
+		cached, found := c.caches.vbuckets.GetIfPresent(vbucketCacheKey("access-key", "bucket"))
+		require.True(t, found)
+		require.Equal(t, "tenant", cached.PathPrefix)
+		require.Equal(t, controlPlaneRoutingTokenKey, cached.RoutingTokenKey)
+	})
 }
 
 func TestCreateVBucket_MapsControlPlaneErrors(t *testing.T) {
@@ -390,4 +492,23 @@ func TestListVBuckets_ConvertsSummaries(t *testing.T) {
 		Name:         "bucket-a",
 		CreationDate: created,
 	}}, buckets)
+}
+
+func TestListVBuckets_RejectsMissingOrInvalidCreationDates(t *testing.T) {
+	for name, summary := range map[string]*apiv1.VBucketSummary{
+		"nil summary":  nil,
+		"missing date": {BucketName: "bucket-a"},
+		"invalid date": {BucketName: "bucket-a", CreationDate: &timestamppb.Timestamp{Seconds: 253402300800}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newTestClientWithFake(&fakeControlPlaneClient{
+				listVBuckets: func(_ context.Context, _ *apiv1.ListVBucketsRequest, _ ...grpc.CallOption) (*apiv1.ListVBucketsResponse, error) {
+					return &apiv1.ListVBucketsResponse{Buckets: []*apiv1.VBucketSummary{summary}}, nil
+				},
+			})
+			buckets, err := c.ListVBuckets(context.Background(), "access-key")
+			require.Error(t, err)
+			require.Nil(t, buckets)
+		})
+	}
 }

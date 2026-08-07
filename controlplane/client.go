@@ -279,17 +279,24 @@ func (c *Client) handleDelta(delta *apiv1.Delta) {
 				c.logger.Error().Err(err).Str("key", key).Msg("invalid vbucket TTL in delta")
 				return
 			}
+			cfg, err := http_server.NormalizeVBucketConfig(&http_server.VBucketConfig{
+				RealEndpoint:     vb.RealEndpoint,
+				RealBucket:       vb.RealBucket,
+				RealAccessKey:    vb.RealAccessKey,
+				RealSecretKey:    vb.RealSecretKey,
+				RealRegion:       vb.RealRegion,
+				PathPrefix:       vb.PathPrefix,
+				RealUsePathStyle: vb.RealUsePathStyle,
+				RoutingTokenKey:  vb.RoutingTokenKey,
+			})
+			if err != nil {
+				c.caches.vbuckets.Invalidate(key)
+				c.logger.Error().Err(err).Str("key", key).Msg("invalid vbucket mapping in delta")
+				return
+			}
 			c.caches.vbuckets.Set(key, cachedVBucket{
-				VBucketConfig: &http_server.VBucketConfig{
-					RealEndpoint:     vb.RealEndpoint,
-					RealBucket:       vb.RealBucket,
-					RealAccessKey:    vb.RealAccessKey,
-					RealSecretKey:    vb.RealSecretKey,
-					RealRegion:       vb.RealRegion,
-					PathPrefix:       vb.PathPrefix,
-					RealUsePathStyle: vb.RealUsePathStyle,
-				},
-				TTL: ttl,
+				VBucketConfig: cfg,
+				TTL:           ttl,
 			})
 			c.logger.Debug().Str("key", key).Msg("vbucket upserted via delta")
 		}
@@ -404,17 +411,22 @@ func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName stri
 		if err != nil {
 			return cachedVBucket{}, err
 		}
+		cfg, err := http_server.NormalizeVBucketConfig(&http_server.VBucketConfig{
+			RealEndpoint:     resp.RealEndpoint,
+			RealBucket:       resp.RealBucket,
+			RealAccessKey:    resp.RealAccessKey,
+			RealSecretKey:    resp.RealSecretKey,
+			RealRegion:       resp.RealRegion,
+			PathPrefix:       resp.PathPrefix,
+			RealUsePathStyle: resp.RealUsePathStyle,
+			RoutingTokenKey:  resp.RoutingTokenKey,
+		})
+		if err != nil {
+			return cachedVBucket{}, fmt.Errorf("invalid LookupVBucket mapping: %w", err)
+		}
 		return cachedVBucket{
-			VBucketConfig: &http_server.VBucketConfig{
-				RealEndpoint:     resp.RealEndpoint,
-				RealBucket:       resp.RealBucket,
-				RealAccessKey:    resp.RealAccessKey,
-				RealSecretKey:    resp.RealSecretKey,
-				RealRegion:       resp.RealRegion,
-				PathPrefix:       resp.PathPrefix,
-				RealUsePathStyle: resp.RealUsePathStyle,
-			},
-			TTL: ttl,
+			VBucketConfig: cfg,
+			TTL:           ttl,
 		}, nil
 	})
 
@@ -422,7 +434,7 @@ func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName stri
 	if err != nil {
 		return nil, err
 	}
-	return result.VBucketConfig, nil
+	return result.VBucketConfig.Clone(), nil
 }
 
 func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*http_server.VBucketConfig, error) {
@@ -439,7 +451,7 @@ func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, loc
 		return nil, mapCreateVBucketError(err)
 	}
 
-	cfg := &http_server.VBucketConfig{
+	cfg, err := http_server.NormalizeVBucketConfig(&http_server.VBucketConfig{
 		RealEndpoint:     resp.RealEndpoint,
 		RealBucket:       resp.RealBucket,
 		RealAccessKey:    resp.RealAccessKey,
@@ -447,16 +459,20 @@ func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, loc
 		RealRegion:       resp.RealRegion,
 		PathPrefix:       resp.PathPrefix,
 		RealUsePathStyle: resp.RealUsePathStyle,
+		RoutingTokenKey:  resp.RoutingTokenKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("invalid CreateVBucket mapping: %w", err)
 	}
 	if ttl, err := cacheTTL("CreateVBucket response", resp.Ttl); err != nil {
 		c.logger.Error().Err(err).Str("accessKeyID", accessKeyID).Str("bucket", bucketName).Msg("skipping vbucket cache warm due to invalid TTL")
 	} else {
 		c.caches.vbuckets.Set(vbucketCacheKey(accessKeyID, bucketName), cachedVBucket{
-			VBucketConfig: cfg,
+			VBucketConfig: cfg.Clone(),
 			TTL:           ttl,
 		})
 	}
-	return cfg, nil
+	return cfg.Clone(), nil
 }
 
 func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) ([]http_server.ListedVBucket, error) {
@@ -473,10 +489,13 @@ func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) ([]http_s
 
 	buckets := make([]http_server.ListedVBucket, 0, len(resp.Buckets))
 	for _, bucket := range resp.Buckets {
-		listed := http_server.ListedVBucket{Name: bucket.BucketName}
-		if bucket.CreationDate != nil {
-			listed.CreationDate = bucket.CreationDate.AsTime()
+		if bucket == nil || bucket.CreationDate == nil {
+			return nil, fmt.Errorf("invalid ListVBuckets response: bucket summary and creation date are required")
 		}
+		if err := bucket.CreationDate.CheckValid(); err != nil {
+			return nil, fmt.Errorf("invalid ListVBuckets creation date for %q: %w", bucket.BucketName, err)
+		}
+		listed := http_server.ListedVBucket{Name: bucket.BucketName, CreationDate: bucket.CreationDate.AsTime()}
 		buckets = append(buckets, listed)
 	}
 	return buckets, nil

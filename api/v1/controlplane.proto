@@ -61,9 +61,20 @@ message LookupVBucketResponse {
   string real_access_key = 3;
   string real_secret_key = 4;
   string real_region = 5;
+  // The control plane owns namespace allocation. For mappings sharing a real
+  // endpoint and bucket, path_prefix values must be normalized and pairwise
+  // non-overlapping; an empty prefix reserves the whole real bucket exclusively.
   string path_prefix = 6;
   bool real_use_path_style = 7;
   google.protobuf.Duration ttl = 8;
+  // Required stable 32-byte random key used only to encrypt mapping-scoped
+  // routing tokens. The control plane must keep it unchanged across proxy
+  // replicas, restarts, and upstream credential rotation while the real
+  // storage namespace is unchanged. The control plane MUST generate a new key
+  // whenever real_endpoint, real_bucket, or path_prefix changes. Rotating it
+  // invalidates outstanding virtual continuation, upload, and version IDs and
+  // therefore requires an explicit drain window.
+  bytes routing_token_key = 9;
 }
 
 message CreateVBucketRequest {
@@ -78,9 +89,12 @@ message CreateVBucketResponse {
   string real_access_key = 3;
   string real_secret_key = 4;
   string real_region = 5;
+  // Same namespace-allocation contract as LookupVBucketResponse.path_prefix.
   string path_prefix = 6;
   bool real_use_path_style = 7;
   google.protobuf.Duration ttl = 8;
+  // Same lifetime and stability contract as LookupVBucketResponse.
+  bytes routing_token_key = 9;
 }
 
 message ListVBucketsRequest {
@@ -143,7 +157,10 @@ message VBucketDelta {
   string real_access_key = 6;
   string real_secret_key = 7;
   string real_region = 8;
+  // Same namespace-allocation contract as LookupVBucketResponse.path_prefix.
   string path_prefix = 9;
   bool real_use_path_style = 10;
   google.protobuf.Duration ttl = 11;
+  // Same lifetime and stability contract as LookupVBucketResponse.
+  bytes routing_token_key = 12;
 }

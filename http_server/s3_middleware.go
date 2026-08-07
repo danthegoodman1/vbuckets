@@ -140,6 +140,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to resolve bucket")
 				return
 			}
+			if bucket != "" && !isValidBucketName(bucket) {
+				writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "The specified bucket is not valid.")
+				return
+			}
 			plan, err := planS3Operation(r, bucket, objectKey)
 			if err != nil {
 				logger.Warn().Err(err).Msg("unsupported or malformed S3 request")
@@ -175,10 +179,6 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 			}
 
 			if plan.kind == operationCreateBucket {
-				if !isValidBucketName(bucket) {
-					writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "The specified bucket is not valid.")
-					return
-				}
 				locationConstraint, err := parseCreateBucketLocationConstraint(r.Body)
 				if err != nil {
 					logger.Warn().Err(err).Msg("failed to parse CreateBucketConfiguration")

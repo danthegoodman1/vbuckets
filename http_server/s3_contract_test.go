@@ -138,6 +138,90 @@ func TestS3OperationContractRejectsUnknownQueryAcrossAllRows(t *testing.T) {
 	}
 }
 
+func TestS3OperationContractRejectsUnsafeDecodedObjectKeySegments(t *testing.T) {
+	for _, target := range []string{
+		"/bucket/../other", "/bucket/%2e%2e/other", "/bucket/.%2e/other",
+		"/bucket/./key", "/bucket/%2E/key", "/bucket/back%5Cslash",
+		"/bucket/nul%00byte", "/bucket/",
+	} {
+		t.Run(target, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, target, nil)
+			require.NoError(t, err)
+			object := strings.TrimPrefix(req.URL.Path, "/bucket/")
+			_, err = planS3Operation(req, "bucket", object)
+			require.Error(t, err)
+		})
+	}
+	for name, object := range map[string]string{
+		"unicode control": "dir/evil\u0085key",
+		"invalid utf8":    "dir/" + string([]byte{0xff}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, "/bucket/key", nil)
+			require.NoError(t, err)
+			_, err = planS3Operation(req, "bucket", object)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestS3OperationContractRejectsUnsafeKeyBearingListQueries(t *testing.T) {
+	for _, target := range []string{
+		"/bucket?prefix=dir%2F..%2Fsecret",
+		"/bucket?marker=dir%5Csecret",
+		"/bucket?list-type=2&start-after=evil%C2%85key",
+		"/bucket?uploads&key-marker=dir%2F.%2Fsecret",
+	} {
+		t.Run(target, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, target, nil)
+			require.NoError(t, err)
+			_, err = planS3Operation(req, "bucket", "")
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestS3RequestTransformClassifierCoversContractAndFailsClosed(t *testing.T) {
+	for _, entry := range s3OperationContract {
+		req, err := http.NewRequest(entry.method, entry.target, nil)
+		require.NoError(t, err)
+		req.Header = entry.headers.Clone()
+		plan, err := planS3Operation(req, entry.bucket, entry.object)
+		require.NoError(t, err, entry.id)
+		_, err = classifyS3RequestTransform(plan.kind)
+		require.NoError(t, err, entry.id)
+	}
+	_, err := classifyS3RequestTransform(S3OperationKind("future-operation"))
+	require.Error(t, err)
+}
+
+func TestS3OperationContractEnforcesGenericHeaderSemantics(t *testing.T) {
+	for _, header := range []string{"Cookie", "Forwarded", "Origin", "Proxy-Authorization", "X-Forwarded-Host", "X-Http-Method-Override", "X-Custom-Semantics"} {
+		t.Run("reject "+header, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, "/bucket/key", nil)
+			require.NoError(t, err)
+			req.Header.Set(header, "value")
+			_, err = planS3Operation(req, "bucket", "key")
+			require.Error(t, err)
+		})
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "/bucket/key", nil)
+	require.NoError(t, err)
+	req.Header.Set("Range", "bytes=0-10")
+	req.Header.Set("If-Range", `"etag"`)
+	req.Header.Set("Accept-Encoding", "gzip")
+	_, err = planS3Operation(req, "bucket", "key")
+	require.NoError(t, err)
+
+	req, err = http.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("body"))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Content-Disposition", `attachment; filename="key"`)
+	_, err = planS3Operation(req, "bucket", "key")
+	require.NoError(t, err)
+}
+
 func TestS3OperationContractAcceptsAllowedQueryCombinations(t *testing.T) {
 	tests := []struct {
 		name   string

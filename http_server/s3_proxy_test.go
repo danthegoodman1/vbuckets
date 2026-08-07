@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"testing"
 
@@ -18,7 +19,7 @@ import (
 func TestHandleS3Request_ListRewriteStreaming_RemovesStaleContentLength(t *testing.T) {
 	upstreamXML := `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult>
-  <Name>really-long-real-bucket-name-for-testing</Name>
+  <Name>real-bucket</Name>
   <Contents><Key>tenant-abc/a/very/long/object/name/that-will-shrink.txt</Key></Contents>
 </ListBucketResult>`
 	upstreamContentLength := strconv.Itoa(len(upstreamXML))
@@ -49,6 +50,7 @@ func TestHandleS3Request_ListRewriteStreaming_RemovesStaleContentLength(t *testi
 				RealRegion:       "us-east-1",
 				PathPrefix:       "tenant-abc",
 				RealUsePathStyle: true,
+				RoutingTokenKey:  testRoutingTokenKey,
 			}, nil
 		},
 	}
@@ -90,9 +92,11 @@ func TestHandleS3Request_CopyObjectRewritesSourceAndDestination(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`<CopyObjectResult><ETag>"abc123"</ETag></CopyObjectResult>`))
+		_, _ = w.Write([]byte(`<CopyObjectResult><ETag>"abc123"</ETag><LastModified>2026-08-06T00:00:00Z</LastModified></CopyObjectResult>`))
 	}))
 	t.Cleanup(upstream.Close)
+	virtualVersion, err := encodeOpaqueToken(&VBucketConfig{RealEndpoint: upstream.URL, RealBucket: "real-bucket", PathPrefix: "tenant-abc", RoutingTokenKey: testRoutingTokenKey}, "version", "v/1")
+	require.NoError(t, err)
 
 	resolver := &testResolver{
 		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
@@ -113,6 +117,7 @@ func TestHandleS3Request_CopyObjectRewritesSourceAndDestination(t *testing.T) {
 				RealRegion:       "us-east-1",
 				PathPrefix:       "tenant-abc",
 				RealUsePathStyle: true,
+				RoutingTokenKey:  testRoutingTokenKey,
 			}, nil
 		},
 	}
@@ -123,7 +128,7 @@ func TestHandleS3Request_CopyObjectRewritesSourceAndDestination(t *testing.T) {
 	t.Cleanup(proxy.Close)
 
 	req := signedRequestWithHeaders(t, http.MethodPut, proxy.URL+"/"+testBucket+"/dest.txt", nil, unsignedPayload, validCreds, map[string]string{
-		copySourceHeader: "/" + testBucket + "/source%20one.txt?versionId=v/1",
+		copySourceHeader: "/" + testBucket + "/source%20one.txt?versionId=" + url.QueryEscape(virtualVersion),
 	})
 
 	resp, err := http.DefaultClient.Do(req)
@@ -154,9 +159,11 @@ func TestHandleS3Request_CompleteMultipartReplaysExactValidatedBody(t *testing.T
 
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><ETag>"complete"</ETag></CompleteMultipartUploadResult>`))
+		_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><Location>origin-location</Location><Bucket>real-bucket</Bucket><Key>tenant-abc/video.mp4</Key><ETag>"complete"</ETag></CompleteMultipartUploadResult>`))
 	}))
 	t.Cleanup(upstream.Close)
+	virtualUploadID, err := encodeOpaqueToken(&VBucketConfig{RealEndpoint: upstream.URL, RealBucket: "real-bucket", PathPrefix: "tenant-abc", RoutingTokenKey: testRoutingTokenKey}, "upload", "upload-1")
+	require.NoError(t, err)
 
 	resolver := &testResolver{
 		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
@@ -177,6 +184,7 @@ func TestHandleS3Request_CompleteMultipartReplaysExactValidatedBody(t *testing.T
 				RealRegion:       "us-east-1",
 				PathPrefix:       "tenant-abc",
 				RealUsePathStyle: true,
+				RoutingTokenKey:  testRoutingTokenKey,
 			}, nil
 		},
 	}
@@ -186,7 +194,7 @@ func TestHandleS3Request_CompleteMultipartReplaysExactValidatedBody(t *testing.T
 	proxy := httptest.NewServer(router)
 	t.Cleanup(proxy.Close)
 
-	req := signedRequest(t, http.MethodPost, proxy.URL+"/"+testBucket+"/video.mp4?uploadId=upload-1", wantBody, unsignedPayload, validCreds)
+	req := signedRequest(t, http.MethodPost, proxy.URL+"/"+testBucket+"/video.mp4?uploadId="+url.QueryEscape(virtualUploadID), wantBody, unsignedPayload, validCreds)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
@@ -194,4 +202,43 @@ func TestHandleS3Request_CompleteMultipartReplaysExactValidatedBody(t *testing.T
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode, string(responseBody))
 	assert.True(t, upstreamCalled)
+}
+
+func TestCopyOutboundRequestHeadersUsesExplicitSafeContract(t *testing.T) {
+	source := http.Header{
+		"Connection":             {"Range, X-Amz-Meta-Nominated"},
+		"Range":                  {"bytes=0-10"},
+		"X-Amz-Meta-Nominated":   {"drop-me"},
+		"X-Amz-Meta-Keep":        {"keep-me"},
+		"Content-Type":           {"application/octet-stream"},
+		"If-Match":               {`"etag"`},
+		"If-Range":               {`"etag"`},
+		"Accept-Encoding":        {"gzip"},
+		"Cookie":                 {"session=secret"},
+		"Forwarded":              {"for=internal"},
+		"X-Forwarded-Host":       {"internal.example"},
+		"X-Http-Method-Override": {"DELETE"},
+		"Proxy-Authorization":    {"secret"},
+	}
+	destination := make(http.Header)
+	copyOutboundRequestHeaders(source, destination, operationGetObject)
+
+	assert.Empty(t, destination.Get("Connection"))
+	assert.Empty(t, destination.Get("Range"), "Connection-nominated headers are hop-by-hop")
+	assert.Empty(t, destination.Get("X-Amz-Meta-Nominated"))
+	assert.Empty(t, destination.Get("Cookie"))
+	assert.Empty(t, destination.Get("Forwarded"))
+	assert.Empty(t, destination.Get("X-Forwarded-Host"))
+	assert.Empty(t, destination.Get("X-Http-Method-Override"))
+	assert.Empty(t, destination.Get("Proxy-Authorization"))
+	assert.Equal(t, `"etag"`, destination.Get("If-Match"))
+	assert.Equal(t, `"etag"`, destination.Get("If-Range"))
+	assert.Equal(t, "gzip", destination.Get("Accept-Encoding"))
+	assert.Empty(t, destination.Get("Content-Type"))
+
+	putDestination := make(http.Header)
+	copyOutboundRequestHeaders(source, putDestination, operationPutObject)
+	assert.Equal(t, "keep-me", putDestination.Get("X-Amz-Meta-Keep"))
+	assert.Equal(t, "application/octet-stream", putDestination.Get("Content-Type"))
+	assert.Empty(t, putDestination.Get("Accept-Encoding"))
 }

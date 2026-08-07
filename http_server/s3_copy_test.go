@@ -65,6 +65,12 @@ func TestParseCopySourceRejectsUnsupportedForms(t *testing.T) {
 		{name: "unsupported query", raw: "test-bucket/source.txt?partNumber=1"},
 		{name: "empty version", raw: "test-bucket/source.txt?versionId="},
 		{name: "duplicate version", raw: "test-bucket/source.txt?versionId=v1&versionId=v2"},
+		{name: "dot traversal", raw: "test-bucket/../secret"},
+		{name: "encoded dot traversal", raw: "test-bucket/%2e%2e/secret"},
+		{name: "encoded backslash", raw: "test-bucket/dir%5Csecret"},
+		{name: "encoded control", raw: "test-bucket/dir%00secret"},
+		{name: "encoded unicode control", raw: "test-bucket/dir%C2%85secret"},
+		{name: "encoded invalid utf8", raw: "test-bucket/dir%FFsecret"},
 	}
 
 	for _, tt := range tests {
