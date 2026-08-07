@@ -94,14 +94,16 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 
 			authInfo, err := parseAuthorizationHeader(authHeaders[0])
 			if err != nil {
-				logger.Warn().Err(err).Msg("failed to parse authorization header")
+				// Parser errors may quote attacker-controlled credential material.
+				// Keep the precise client response, but never copy it into logs.
+				logger.Warn().Msg("failed to parse authorization header")
 				writeS3Error(w, http.StatusBadRequest, "AuthorizationHeaderMalformed", err.Error())
 				return
 			}
 
 			virtualCreds, err := resolver.LookupCredentials(r.Context(), authInfo.AccessKeyID)
 			if err != nil {
-				logger.Warn().Err(err).Str("accessKeyID", authInfo.AccessKeyID).Msg("credential lookup failed")
+				logger.Warn().Msg("credential lookup failed")
 				if errors.Is(err, iam.ErrInvalidPolicy) {
 					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 					return
@@ -200,7 +202,7 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 
 			vbConfig, err := resolver.LookupVBucket(r.Context(), authInfo.AccessKeyID, bucket)
 			if err != nil {
-				logger.Warn().Err(err).Str("accessKeyID", authInfo.AccessKeyID).Str("bucket", bucket).Msg("vbucket lookup failed")
+				logger.Warn().Msg("vbucket lookup failed")
 				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}

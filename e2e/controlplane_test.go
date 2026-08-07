@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http/httptest"
@@ -81,41 +82,43 @@ type testControlPlane struct {
 	policyJSON     string
 	mu             sync.Mutex
 	createdBuckets map[string]time.Time
+	revision       uint64
+	changes        chan *apiv1.WatchEvent
 }
 
 func (s *testControlPlane) LookupCredentials(_ context.Context, req *apiv1.LookupCredentialsRequest) (*apiv1.LookupCredentialsResponse, error) {
+	s.mu.Lock()
+	revision := s.revision
+	s.mu.Unlock()
 	if req.AccessKeyId != e2eVirtualAccessKey {
-		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
+		return &apiv1.LookupCredentialsResponse{Revision: revision, NegativeTtl: durationpb.New(time.Minute)}, nil
 	}
 	return &apiv1.LookupCredentialsResponse{
 		SecretKey:     e2eVirtualSecretKey,
 		IamPolicyJson: s.policyJSON,
 		Ttl:           durationpb.New(5 * time.Minute),
-	}, nil
-}
-
-func (s *testControlPlane) LookupBaseHost(_ context.Context, _ *apiv1.LookupBaseHostRequest) (*apiv1.LookupBaseHostResponse, error) {
-	return &apiv1.LookupBaseHostResponse{
-		Found: false,
-		Ttl:   durationpb.New(5 * time.Minute),
+		Found:         true,
+		Revision:      revision,
 	}, nil
 }
 
 func (s *testControlPlane) LookupVBucket(_ context.Context, req *apiv1.LookupVBucketRequest) (*apiv1.LookupVBucketResponse, error) {
+	s.mu.Lock()
+	revision := s.revision
 	if req.AccessKeyId != e2eVirtualAccessKey {
-		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
+		s.mu.Unlock()
+		return &apiv1.LookupVBucketResponse{Revision: revision, NegativeTtl: durationpb.New(time.Minute)}, nil
 	}
 	if req.BucketName == e2eVirtualBucket {
-		return s.vbucketResponse("tenant-abc"), nil
+		s.mu.Unlock()
+		return s.vbucketResponse("tenant-abc", revision), nil
 	}
-
-	s.mu.Lock()
 	_, found := s.createdBuckets[req.BucketName]
 	s.mu.Unlock()
 	if !found {
-		return nil, status.Errorf(codes.NotFound, "unknown bucket: %s", req.BucketName)
+		return &apiv1.LookupVBucketResponse{Revision: revision, NegativeTtl: durationpb.New(time.Minute)}, nil
 	}
-	return s.vbucketResponse("created/" + req.BucketName), nil
+	return s.vbucketResponse("created/"+req.BucketName, revision), nil
 }
 
 func (s *testControlPlane) CreateVBucket(_ context.Context, req *apiv1.CreateVBucketRequest) (*apiv1.CreateVBucketResponse, error) {
@@ -124,27 +127,20 @@ func (s *testControlPlane) CreateVBucket(_ context.Context, req *apiv1.CreateVBu
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if req.BucketName == e2eVirtualBucket {
+		s.mu.Unlock()
 		return nil, status.Errorf(codes.AlreadyExists, "bucket already owned: %s", req.BucketName)
 	}
 	if _, exists := s.createdBuckets[req.BucketName]; exists {
+		s.mu.Unlock()
 		return nil, status.Errorf(codes.AlreadyExists, "bucket already owned: %s", req.BucketName)
 	}
 	s.createdBuckets[req.BucketName] = time.Now().UTC()
-
-	resp := s.vbucketResponse("created/" + req.BucketName)
-	return &apiv1.CreateVBucketResponse{
-		RealEndpoint:     resp.RealEndpoint,
-		RealBucket:       resp.RealBucket,
-		RealAccessKey:    resp.RealAccessKey,
-		RealSecretKey:    resp.RealSecretKey,
-		RealRegion:       resp.RealRegion,
-		PathPrefix:       resp.PathPrefix,
-		RealUsePathStyle: resp.RealUsePathStyle,
-		RoutingTokenKey:  resp.RoutingTokenKey,
-		Ttl:              resp.Ttl,
-	}, nil
+	s.revision++
+	revision := s.revision
+	s.mu.Unlock()
+	s.changes <- &apiv1.WatchEvent{Revision: revision, Cursor: fmt.Sprintf("cursor-%d", revision), Event: &apiv1.WatchEvent_Vbucket{Vbucket: &apiv1.VBucketDelta{AccessKeyId: req.AccessKeyId, BucketName: req.BucketName}}}
+	return &apiv1.CreateVBucketResponse{Revision: revision}, nil
 }
 
 func (s *testControlPlane) ListVBuckets(_ context.Context, req *apiv1.ListVBucketsRequest) (*apiv1.ListVBucketsResponse, error) {
@@ -156,6 +152,7 @@ func (s *testControlPlane) ListVBuckets(_ context.Context, req *apiv1.ListVBucke
 	defer s.mu.Unlock()
 
 	resp := &apiv1.ListVBucketsResponse{
+		Revision: s.revision,
 		Buckets: []*apiv1.VBucketSummary{{
 			BucketName:   e2eVirtualBucket,
 			CreationDate: timestamppb.New(time.Unix(0, 0).UTC()),
@@ -175,7 +172,7 @@ func (s *testControlPlane) ListVBuckets(_ context.Context, req *apiv1.ListVBucke
 	return resp, nil
 }
 
-func (s *testControlPlane) vbucketResponse(pathPrefix string) *apiv1.LookupVBucketResponse {
+func (s *testControlPlane) vbucketResponse(pathPrefix string, revision uint64) *apiv1.LookupVBucketResponse {
 	return &apiv1.LookupVBucketResponse{
 		RealEndpoint:     s.garageEndpoint,
 		RealBucket:       garageBucket,
@@ -186,12 +183,39 @@ func (s *testControlPlane) vbucketResponse(pathPrefix string) *apiv1.LookupVBuck
 		RealUsePathStyle: true,
 		RoutingTokenKey:  []byte("0123456789abcdef0123456789abcdef"),
 		Ttl:              durationpb.New(5 * time.Minute),
+		Found:            true,
+		Revision:         revision,
 	}
 }
 
-func (s *testControlPlane) ListenForDeltas(_ *apiv1.ListenForDeltasRequest, stream apiv1.ControlPlane_ListenForDeltasServer) error {
-	<-stream.Context().Done()
-	return stream.Context().Err()
+func (s *testControlPlane) WatchState(_ *apiv1.WatchStateRequest, stream apiv1.ControlPlane_WatchStateServer) error {
+	s.mu.Lock()
+	revision := s.revision
+	s.mu.Unlock()
+	if err := stream.Send(&apiv1.WatchEvent{Revision: revision, Event: &apiv1.WatchEvent_SnapshotBegin{SnapshotBegin: &apiv1.SnapshotBegin{}}}); err != nil {
+		return err
+	}
+	cursor := fmt.Sprintf("cursor-%d", revision)
+	if err := stream.Send(&apiv1.WatchEvent{Revision: revision, Cursor: cursor, Event: &apiv1.WatchEvent_SynchronizationBarrier{SynchronizationBarrier: &apiv1.SynchronizationBarrier{}}}); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case event := <-s.changes:
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+			revision, cursor = event.Revision, event.Cursor
+		case <-ticker.C:
+			if err := stream.Send(&apiv1.WatchEvent{Revision: revision, Cursor: cursor, Event: &apiv1.WatchEvent_Heartbeat{Heartbeat: &apiv1.Heartbeat{}}}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func garageCmd(t *testing.T, ctx context.Context, ctr testcontainers.Container, args ...string) string {
@@ -263,10 +287,12 @@ func setupE2EWithPolicyJSON(t *testing.T, policyJSON string) *e2eEnv {
 		garageEndpoint: garageEndpoint,
 		policyJSON:     policyJSON,
 		createdBuckets: make(map[string]time.Time),
+		revision:       1,
+		changes:        make(chan *apiv1.WatchEvent, 16),
 	})
 	go grpcServer.Serve(lis)
 	t.Cleanup(func() {
-		// Cancel context first so the ListenForDeltas stream unblocks,
+		// Cancel context first so the WatchState stream unblocks,
 		// then GracefulStop can drain cleanly.
 		cancel()
 		grpcServer.GracefulStop()

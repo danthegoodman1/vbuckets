@@ -1,526 +1,246 @@
 package controlplane
 
 import (
-	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"fmt"
-	"os"
-	"strings"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
 	"github.com/danthegoodman1/vbuckets/env"
-	"github.com/maypok86/otter/v2"
+	"github.com/danthegoodman1/vbuckets/http_server"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/durationpb"
-
-	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
-	"github.com/danthegoodman1/vbuckets/http_server"
 )
+
+type State string
+
+const (
+	StateStartup       State = "startup"
+	StateConnecting    State = "connecting"
+	StateSynchronizing State = "synchronizing"
+	StateReady         State = "ready"
+	StateDisconnected  State = "disconnected"
+	StateShutdown      State = "shutdown"
+)
+
+type ClientOptions struct {
+	UnaryTimeout           time.Duration
+	WatchSilenceTimeout    time.Duration
+	SynchronizationTimeout time.Duration
+	ReconnectMinBackoff    time.Duration
+	ReconnectMaxBackoff    time.Duration
+	CredentialMissRate     float64
+	CredentialMissBurst    int
+	CredentialMissInFlight int
+	VBucketMissRate        float64
+	VBucketMissBurst       int
+	VBucketMissInFlight    int
+}
+
+func defaultClientOptions() ClientOptions {
+	return ClientOptions{
+		UnaryTimeout:           2 * time.Second,
+		WatchSilenceTimeout:    10 * time.Second,
+		SynchronizationTimeout: 30 * time.Second,
+		ReconnectMinBackoff:    250 * time.Millisecond,
+		ReconnectMaxBackoff:    30 * time.Second,
+		CredentialMissRate:     100,
+		CredentialMissBurst:    100,
+		CredentialMissInFlight: 32,
+		VBucketMissRate:        100,
+		VBucketMissBurst:       100,
+		VBucketMissInFlight:    32,
+	}
+}
+
+type metricCounters struct {
+	cacheHits             atomic.Uint64
+	cacheMisses           atomic.Uint64
+	negativeHits          atomic.Uint64
+	evictions             atomic.Uint64
+	loadCoalesced         atomic.Uint64
+	rejectedMisses        atomic.Uint64
+	rejectedVBucketMisses atomic.Uint64
+	watchGaps             atomic.Uint64
+	watchReconnects       atomic.Uint64
+	rpcCalls              atomic.Uint64
+	rpcFailures           atomic.Uint64
+	rpcLatencyNanos       atomic.Uint64
+
+	mu          sync.Mutex
+	lastRPCCode string
+}
+
+type ClientStats struct {
+	CacheHits                uint64        `json:"cache_hits"`
+	CacheMisses              uint64        `json:"cache_misses"`
+	NegativeHits             uint64        `json:"negative_hits"`
+	Evictions                uint64        `json:"evictions"`
+	LoadCoalesced            uint64        `json:"load_coalesced"`
+	RejectedCredentialMisses uint64        `json:"rejected_credential_misses"`
+	RejectedVBucketMisses    uint64        `json:"rejected_vbucket_misses"`
+	WatchGaps                uint64        `json:"watch_gaps"`
+	WatchReconnects          uint64        `json:"watch_reconnects"`
+	RPCCalls                 uint64        `json:"rpc_calls"`
+	RPCFailures              uint64        `json:"rpc_failures"`
+	LastRPCLatency           time.Duration `json:"last_rpc_latency"`
+	LastRPCCode              string        `json:"last_rpc_code"`
+	CredentialEntries        int           `json:"credential_entries"`
+	BaseHostEntries          int           `json:"base_host_entries"`
+	VBucketEntries           int           `json:"vbucket_entries"`
+}
+
+type SyncStatus struct {
+	State                State       `json:"state"`
+	Ready                bool        `json:"ready"`
+	Revision             uint64      `json:"revision"`
+	CursorPresent        bool        `json:"cursor_present"`
+	BarrierRequired      bool        `json:"barrier_required"`
+	LastGapRevision      uint64      `json:"last_gap_revision,omitempty"`
+	RequiredRevision     uint64      `json:"required_revision,omitempty"`
+	LastTransitionUTC    time.Time   `json:"last_transition_utc"`
+	LastDisconnectReason string      `json:"last_disconnect_reason,omitempty"`
+	Stats                ClientStats `json:"stats"`
+}
+
+type snapshotState struct {
+	revision       uint64
+	expectedCursor string
+	previousCursor string
+	baseHosts      map[string]uint64
+}
 
 type Client struct {
 	url    string
 	logger zerolog.Logger
+	opts   ClientOptions
 	caches *caches
 
 	mu     sync.RWMutex
 	conn   *grpc.ClientConn
 	client apiv1.ControlPlaneClient
-}
 
-type controlPlaneDialConfig struct {
-	SecurityMode  string
-	TLSCAFile     string
-	TLSServerName string
-	TLSCertFile   string
-	TLSKeyFile    string
-	BearerToken   string
+	syncMu               sync.RWMutex
+	state                State
+	revision             uint64
+	cursor               string
+	epoch                uint64
+	snapshot             *snapshotState
+	lastGap              uint64
+	requiredRevision     uint64
+	lastTransition       time.Time
+	synchronizingSince   time.Time
+	baseHosts            map[string]uint64
+	baseHostMax          int
+	barrierRequired      bool
+	lastDisconnectReason string
+
+	credentialLoads      loadGroup[string, cachedCredentials]
+	vbucketLoads         loadGroup[string, cachedVBucket]
+	metrics              metricCounters
+	credentialAdmission  missAdmission
+	vbucketAdmission     missAdmission
+	randFloat            func() float64
+	now                  func() time.Time
+	resync               chan struct{}
+	afterCacheRead       func()
+	afterListParse       func()
+	afterDisconnectState func()
+	stateChanged         chan struct{}
 }
 
 func NewClient(url string, logger zerolog.Logger) *Client {
-	return &Client{
-		url:    url,
-		logger: logger.With().Str("component", "controlplane").Logger(),
-		caches: newCaches(),
+	return NewClientWithOptions(url, logger, defaultClientOptions())
+}
+
+func NewClientWithOptions(url string, logger zerolog.Logger, opts ClientOptions) *Client {
+	now := time.Now
+	defaults := defaultClientOptions()
+	if opts.UnaryTimeout <= 0 {
+		opts.UnaryTimeout = defaults.UnaryTimeout
+	}
+	if opts.WatchSilenceTimeout <= 0 {
+		opts.WatchSilenceTimeout = defaults.WatchSilenceTimeout
+	}
+	if opts.SynchronizationTimeout <= 0 {
+		opts.SynchronizationTimeout = defaults.SynchronizationTimeout
+	}
+	if opts.ReconnectMinBackoff <= 0 {
+		opts.ReconnectMinBackoff = defaults.ReconnectMinBackoff
+	}
+	if opts.ReconnectMaxBackoff <= 0 {
+		opts.ReconnectMaxBackoff = defaults.ReconnectMaxBackoff
+	}
+	if opts.ReconnectMaxBackoff < opts.ReconnectMinBackoff {
+		opts.ReconnectMaxBackoff = opts.ReconnectMinBackoff
+	}
+	if opts.CredentialMissRate <= 0 {
+		opts.CredentialMissRate = defaults.CredentialMissRate
+	}
+	if opts.CredentialMissBurst <= 0 {
+		opts.CredentialMissBurst = defaults.CredentialMissBurst
+	}
+	if opts.CredentialMissInFlight <= 0 {
+		opts.CredentialMissInFlight = defaults.CredentialMissInFlight
+	}
+	if opts.VBucketMissRate <= 0 {
+		opts.VBucketMissRate = defaults.VBucketMissRate
+	}
+	if opts.VBucketMissBurst <= 0 {
+		opts.VBucketMissBurst = defaults.VBucketMissBurst
+	}
+	if opts.VBucketMissInFlight <= 0 {
+		opts.VBucketMissInFlight = defaults.VBucketMissInFlight
+	}
+	c := &Client{
+		url: url, logger: logger.With().Str("component", "controlplane").Logger(), opts: opts,
+		state: StateStartup, lastTransition: now().UTC(), randFloat: rand.Float64, now: now,
+		baseHosts: make(map[string]uint64), baseHostMax: env.CacheMaxBaseHosts,
+		barrierRequired: true,
+		resync:          make(chan struct{}, 1),
+		stateChanged:    make(chan struct{}, 1),
+	}
+	c.caches = newCaches(func() { c.metrics.evictions.Add(1) }, func() time.Time { return c.now() })
+	c.credentialAdmission = newMissAdmission(opts.CredentialMissRate, opts.CredentialMissBurst, opts.CredentialMissInFlight, c.now())
+	c.vbucketAdmission = newMissAdmission(opts.VBucketMissRate, opts.VBucketMissBurst, opts.VBucketMissInFlight, c.now())
+	return c
+}
+
+func (c *Client) Ready() bool {
+	c.syncMu.RLock()
+	defer c.syncMu.RUnlock()
+	return c.state == StateReady
+}
+
+func (c *Client) ReadinessSnapshot() http_server.ReadinessSnapshot {
+	status := c.Status()
+	return http_server.ReadinessSnapshot{Ready: status.Ready, State: string(status.State), Revision: status.Revision, CursorPresent: status.CursorPresent, BarrierRequired: status.BarrierRequired, RequiredRevision: status.RequiredRevision, LastGapRevision: status.LastGapRevision, LastTransitionUTC: status.LastTransitionUTC, LastDisconnectReason: status.LastDisconnectReason, Stats: status.Stats}
+}
+
+func (c *Client) Status() SyncStatus {
+	c.syncMu.RLock()
+	status := SyncStatus{State: c.state, Ready: c.state == StateReady, Revision: c.revision, CursorPresent: c.cursor != "", BarrierRequired: c.barrierRequired, LastGapRevision: c.lastGap, RequiredRevision: c.requiredRevision, LastTransitionUTC: c.lastTransition, LastDisconnectReason: c.lastDisconnectReason}
+	c.syncMu.RUnlock()
+	status.Stats = c.Stats()
+	return status
+}
+
+func (c *Client) Stats() ClientStats {
+	c.metrics.mu.Lock()
+	lastCode := c.metrics.lastRPCCode
+	c.metrics.mu.Unlock()
+	return ClientStats{
+		CacheHits: c.metrics.cacheHits.Load(), CacheMisses: c.metrics.cacheMisses.Load(), NegativeHits: c.metrics.negativeHits.Load(),
+		Evictions: c.metrics.evictions.Load(), LoadCoalesced: c.metrics.loadCoalesced.Load(), RejectedCredentialMisses: c.metrics.rejectedMisses.Load(), RejectedVBucketMisses: c.metrics.rejectedVBucketMisses.Load(),
+		WatchGaps: c.metrics.watchGaps.Load(), WatchReconnects: c.metrics.watchReconnects.Load(), RPCCalls: c.metrics.rpcCalls.Load(),
+		RPCFailures: c.metrics.rpcFailures.Load(), LastRPCLatency: time.Duration(c.metrics.rpcLatencyNanos.Load()), LastRPCCode: lastCode,
+		CredentialEntries: c.caches.credentials.Len(), BaseHostEntries: c.baseHostCount(), VBucketEntries: c.caches.vbuckets.Len(),
 	}
 }
 
-// Run maintains the connection to the control plane and listens for deltas.
-// It reconnects automatically on failure with a backoff.
-func (c *Client) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			c.connect(ctx)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(5 * time.Second):
-			}
-		}
-	}
-}
-
-func (c *Client) connect(ctx context.Context) {
-	cfg := controlPlaneDialConfigFromEnv()
-	c.logger.Info().Str("url", c.url).Str("securityMode", normalizeSecurityMode(cfg.SecurityMode)).Msg("connecting to control plane")
-
-	dialOptions, err := buildDialOptions(cfg)
-	if err != nil {
-		c.logger.Error().Err(err).Msg("invalid control plane connection configuration")
-		return
-	}
-
-	conn, err := grpc.NewClient(c.url, dialOptions...)
-	if err != nil {
-		c.logger.Error().Err(err).Msg("failed to create grpc client")
-		return
-	}
-	defer func() {
-		conn.Close()
-		c.mu.Lock()
-		c.conn = nil
-		c.client = nil
-		c.mu.Unlock()
-	}()
-
-	client := apiv1.NewControlPlaneClient(conn)
-
-	c.mu.Lock()
-	c.conn = conn
-	c.client = client
-	c.mu.Unlock()
-
-	c.logger.Info().Msg("connected to control plane")
-
-	stream, err := client.ListenForDeltas(ctx, &apiv1.ListenForDeltasRequest{})
-	if err != nil {
-		c.logger.Error().Err(err).Msg("failed to open delta stream")
-		return
-	}
-
-	for {
-		delta, err := stream.Recv()
-		if err != nil {
-			c.logger.Error().Err(err).Msg("delta stream error")
-			return
-		}
-		c.handleDelta(delta)
-	}
-}
-
-func controlPlaneDialConfigFromEnv() controlPlaneDialConfig {
-	return controlPlaneDialConfig{
-		SecurityMode:  env.ControlPlaneSecurityMode,
-		TLSCAFile:     env.ControlPlaneTLSCAFile,
-		TLSServerName: env.ControlPlaneTLSServerName,
-		TLSCertFile:   env.ControlPlaneTLSCertFile,
-		TLSKeyFile:    env.ControlPlaneTLSKeyFile,
-		BearerToken:   env.ControlPlaneAuthBearerToken,
-	}
-}
-
-func normalizeSecurityMode(mode string) string {
-	mode = strings.TrimSpace(strings.ToLower(mode))
-	if mode == "" {
-		return "insecure"
-	}
-	return mode
-}
-
-func buildDialOptions(cfg controlPlaneDialConfig) ([]grpc.DialOption, error) {
-	transportCredentials, err := buildTransportCredentials(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	options := []grpc.DialOption{
-		grpc.WithTransportCredentials(transportCredentials),
-	}
-
-	if token := strings.TrimSpace(cfg.BearerToken); token != "" {
-		options = append(options,
-			grpc.WithUnaryInterceptor(bearerAuthUnaryInterceptor(token)),
-			grpc.WithStreamInterceptor(bearerAuthStreamInterceptor(token)),
-		)
-	}
-
-	return options, nil
-}
-
-func buildTransportCredentials(cfg controlPlaneDialConfig) (credentials.TransportCredentials, error) {
-	switch normalizeSecurityMode(cfg.SecurityMode) {
-	case "insecure":
-		return insecure.NewCredentials(), nil
-
-	case "tls", "mtls":
-		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-		if cfg.TLSServerName != "" {
-			tlsConfig.ServerName = cfg.TLSServerName
-		}
-
-		if cfg.TLSCAFile != "" {
-			caPEM, err := os.ReadFile(cfg.TLSCAFile)
-			if err != nil {
-				return nil, fmt.Errorf("read control plane CA file: %w", err)
-			}
-			roots := x509.NewCertPool()
-			if !roots.AppendCertsFromPEM(caPEM) {
-				return nil, fmt.Errorf("parse control plane CA file: no valid certificates found")
-			}
-			tlsConfig.RootCAs = roots
-		}
-
-		if normalizeSecurityMode(cfg.SecurityMode) == "mtls" {
-			if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
-				return nil, fmt.Errorf("CONTROL_PLANE_TLS_CERT_FILE and CONTROL_PLANE_TLS_KEY_FILE are required for mtls mode")
-			}
-			certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-			if err != nil {
-				return nil, fmt.Errorf("load control plane client certificate: %w", err)
-			}
-			tlsConfig.Certificates = []tls.Certificate{certificate}
-		}
-
-		return credentials.NewTLS(tlsConfig), nil
-
-	default:
-		return nil, fmt.Errorf("unsupported CONTROL_PLANE_SECURITY_MODE %q", cfg.SecurityMode)
-	}
-}
-
-func bearerAuthUnaryInterceptor(token string) grpc.UnaryClientInterceptor {
-	return func(ctx context.Context, method string, req any, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		return invoker(withBearerToken(ctx, token), method, req, reply, cc, opts...)
-	}
-}
-
-func bearerAuthStreamInterceptor(token string) grpc.StreamClientInterceptor {
-	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		return streamer(withBearerToken(ctx, token), desc, cc, method, opts...)
-	}
-}
-
-func withBearerToken(ctx context.Context, token string) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
-}
-
-func (c *Client) handleDelta(delta *apiv1.Delta) {
-	switch d := delta.Delta.(type) {
-	case *apiv1.Delta_Credentials:
-		cd := d.Credentials
-		if cd.Remove {
-			c.caches.credentials.Invalidate(cd.AccessKeyId)
-			c.logger.Debug().Str("accessKeyID", cd.AccessKeyId).Msg("credential removed via delta")
-		} else {
-			policy, err := http_server.ParseS3IAMPolicyJSON(cd.IamPolicyJson)
-			if err != nil {
-				c.caches.credentials.Invalidate(cd.AccessKeyId)
-				c.logger.Error().Err(err).Str("accessKeyID", cd.AccessKeyId).Msg("invalid credential IAM policy in delta")
-				return
-			}
-			ttl, err := cacheTTL("credentials delta", cd.Ttl)
-			if err != nil {
-				c.caches.credentials.Invalidate(cd.AccessKeyId)
-				c.logger.Error().Err(err).Str("accessKeyID", cd.AccessKeyId).Msg("invalid credential TTL in delta")
-				return
-			}
-			c.caches.credentials.Set(cd.AccessKeyId, cachedCredentials{
-				VirtualCredentials: &http_server.VirtualCredentials{
-					SecretKey: cd.SecretKey,
-					IAMPolicy: policy,
-				},
-				TTL: ttl,
-			})
-			c.logger.Debug().Str("accessKeyID", cd.AccessKeyId).Msg("credential upserted via delta")
-		}
-
-	case *apiv1.Delta_BaseHost:
-		bh := d.BaseHost
-		if bh.Remove {
-			c.caches.baseHosts.Invalidate(bh.Hostname)
-			c.logger.Debug().Str("hostname", bh.Hostname).Msg("base host removed via delta")
-		} else {
-			ttl, err := cacheTTL("base host delta", bh.Ttl)
-			if err != nil {
-				c.caches.baseHosts.Invalidate(bh.Hostname)
-				c.logger.Error().Err(err).Str("hostname", bh.Hostname).Msg("invalid base host TTL in delta")
-				return
-			}
-			c.caches.baseHosts.Set(bh.Hostname, cachedBaseHost{
-				BaseHost: bh.BaseHost,
-				Found:    bh.Found,
-				TTL:      ttl,
-			})
-			c.logger.Debug().Str("hostname", bh.Hostname).Msg("base host upserted via delta")
-		}
-
-	case *apiv1.Delta_Vbucket:
-		vb := d.Vbucket
-		key := vbucketCacheKey(vb.AccessKeyId, vb.BucketName)
-		if vb.Remove {
-			c.caches.vbuckets.Invalidate(key)
-			c.logger.Debug().Str("key", key).Msg("vbucket removed via delta")
-		} else {
-			ttl, err := cacheTTL("vbucket delta", vb.Ttl)
-			if err != nil {
-				c.caches.vbuckets.Invalidate(key)
-				c.logger.Error().Err(err).Str("key", key).Msg("invalid vbucket TTL in delta")
-				return
-			}
-			cfg, err := http_server.NormalizeVBucketConfig(&http_server.VBucketConfig{
-				RealEndpoint:     vb.RealEndpoint,
-				RealBucket:       vb.RealBucket,
-				RealAccessKey:    vb.RealAccessKey,
-				RealSecretKey:    vb.RealSecretKey,
-				RealRegion:       vb.RealRegion,
-				PathPrefix:       vb.PathPrefix,
-				RealUsePathStyle: vb.RealUsePathStyle,
-				RoutingTokenKey:  vb.RoutingTokenKey,
-			})
-			if err != nil {
-				c.caches.vbuckets.Invalidate(key)
-				c.logger.Error().Err(err).Str("key", key).Msg("invalid vbucket mapping in delta")
-				return
-			}
-			c.caches.vbuckets.Set(key, cachedVBucket{
-				VBucketConfig: cfg,
-				TTL:           ttl,
-			})
-			c.logger.Debug().Str("key", key).Msg("vbucket upserted via delta")
-		}
-
-	default:
-		c.logger.Warn().Msg("received unknown delta type")
-	}
-}
-
-func cacheTTL(source string, ttl *durationpb.Duration) (time.Duration, error) {
-	if ttl == nil {
-		return 0, fmt.Errorf("%s TTL is required", source)
-	}
-	if err := ttl.CheckValid(); err != nil {
-		return 0, fmt.Errorf("%s TTL is invalid: %w", source, err)
-	}
-	duration := ttl.AsDuration()
-	if duration <= 0 {
-		return 0, fmt.Errorf("%s TTL must be positive", source)
-	}
-	return duration, nil
-}
-
-func (c *Client) getClient() apiv1.ControlPlaneClient {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.client
-}
-
-func (c *Client) LookupCredentials(ctx context.Context, accessKeyID string) (*http_server.VirtualCredentials, error) {
-	loader := otter.LoaderFunc[string, cachedCredentials](func(ctx context.Context, key string) (cachedCredentials, error) {
-		client := c.getClient()
-		if client == nil {
-			return cachedCredentials{}, errNotConnected
-		}
-		resp, err := client.LookupCredentials(ctx, &apiv1.LookupCredentialsRequest{
-			AccessKeyId: key,
-		})
-		if err != nil {
-			return cachedCredentials{}, err
-		}
-		ttl, err := cacheTTL("LookupCredentials response", resp.Ttl)
-		if err != nil {
-			return cachedCredentials{}, err
-		}
-		policy, err := http_server.ParseS3IAMPolicyJSON(resp.IamPolicyJson)
-		if err != nil {
-			return cachedCredentials{}, err
-		}
-		return cachedCredentials{
-			VirtualCredentials: &http_server.VirtualCredentials{
-				SecretKey: resp.SecretKey,
-				IAMPolicy: policy,
-			},
-			TTL: ttl,
-		}, nil
-	})
-
-	result, err := c.caches.credentials.Get(ctx, accessKeyID, loader)
-	if err != nil {
-		return nil, err
-	}
-	return result.VirtualCredentials, nil
-}
-
-func (c *Client) LookupBaseHost(ctx context.Context, hostname string) (string, bool, error) {
-	loader := otter.LoaderFunc[string, cachedBaseHost](func(ctx context.Context, key string) (cachedBaseHost, error) {
-		client := c.getClient()
-		if client == nil {
-			return cachedBaseHost{}, errNotConnected
-		}
-		resp, err := client.LookupBaseHost(ctx, &apiv1.LookupBaseHostRequest{
-			Hostname: key,
-		})
-		if err != nil {
-			return cachedBaseHost{}, err
-		}
-		ttl, err := cacheTTL("LookupBaseHost response", resp.Ttl)
-		if err != nil {
-			return cachedBaseHost{}, err
-		}
-		return cachedBaseHost{
-			BaseHost: resp.BaseHost,
-			Found:    resp.Found,
-			TTL:      ttl,
-		}, nil
-	})
-
-	result, err := c.caches.baseHosts.Get(ctx, hostname, loader)
-	if err != nil {
-		return "", false, err
-	}
-	return result.BaseHost, result.Found, nil
-}
-
-func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*http_server.VBucketConfig, error) {
-	key := vbucketCacheKey(accessKeyID, bucketName)
-
-	loader := otter.LoaderFunc[string, cachedVBucket](func(ctx context.Context, key string) (cachedVBucket, error) {
-		client := c.getClient()
-		if client == nil {
-			return cachedVBucket{}, errNotConnected
-		}
-		resp, err := client.LookupVBucket(ctx, &apiv1.LookupVBucketRequest{
-			AccessKeyId: accessKeyID,
-			BucketName:  bucketName,
-		})
-		if err != nil {
-			return cachedVBucket{}, err
-		}
-		ttl, err := cacheTTL("LookupVBucket response", resp.Ttl)
-		if err != nil {
-			return cachedVBucket{}, err
-		}
-		cfg, err := http_server.NormalizeVBucketConfig(&http_server.VBucketConfig{
-			RealEndpoint:     resp.RealEndpoint,
-			RealBucket:       resp.RealBucket,
-			RealAccessKey:    resp.RealAccessKey,
-			RealSecretKey:    resp.RealSecretKey,
-			RealRegion:       resp.RealRegion,
-			PathPrefix:       resp.PathPrefix,
-			RealUsePathStyle: resp.RealUsePathStyle,
-			RoutingTokenKey:  resp.RoutingTokenKey,
-		})
-		if err != nil {
-			return cachedVBucket{}, fmt.Errorf("invalid LookupVBucket mapping: %w", err)
-		}
-		return cachedVBucket{
-			VBucketConfig: cfg,
-			TTL:           ttl,
-		}, nil
-	})
-
-	result, err := c.caches.vbuckets.Get(ctx, key, loader)
-	if err != nil {
-		return nil, err
-	}
-	return result.VBucketConfig.Clone(), nil
-}
-
-func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*http_server.VBucketConfig, error) {
-	client := c.getClient()
-	if client == nil {
-		return nil, errNotConnected
-	}
-	resp, err := client.CreateVBucket(ctx, &apiv1.CreateVBucketRequest{
-		AccessKeyId:        accessKeyID,
-		BucketName:         bucketName,
-		LocationConstraint: locationConstraint,
-	})
-	if err != nil {
-		return nil, mapCreateVBucketError(err)
-	}
-
-	cfg, err := http_server.NormalizeVBucketConfig(&http_server.VBucketConfig{
-		RealEndpoint:     resp.RealEndpoint,
-		RealBucket:       resp.RealBucket,
-		RealAccessKey:    resp.RealAccessKey,
-		RealSecretKey:    resp.RealSecretKey,
-		RealRegion:       resp.RealRegion,
-		PathPrefix:       resp.PathPrefix,
-		RealUsePathStyle: resp.RealUsePathStyle,
-		RoutingTokenKey:  resp.RoutingTokenKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("invalid CreateVBucket mapping: %w", err)
-	}
-	if ttl, err := cacheTTL("CreateVBucket response", resp.Ttl); err != nil {
-		c.logger.Error().Err(err).Str("accessKeyID", accessKeyID).Str("bucket", bucketName).Msg("skipping vbucket cache warm due to invalid TTL")
-	} else {
-		c.caches.vbuckets.Set(vbucketCacheKey(accessKeyID, bucketName), cachedVBucket{
-			VBucketConfig: cfg.Clone(),
-			TTL:           ttl,
-		})
-	}
-	return cfg.Clone(), nil
-}
-
-func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) ([]http_server.ListedVBucket, error) {
-	client := c.getClient()
-	if client == nil {
-		return nil, errNotConnected
-	}
-	resp, err := client.ListVBuckets(ctx, &apiv1.ListVBucketsRequest{
-		AccessKeyId: accessKeyID,
-	})
-	if err != nil {
-		return nil, mapListVBucketsError(err)
-	}
-
-	buckets := make([]http_server.ListedVBucket, 0, len(resp.Buckets))
-	for _, bucket := range resp.Buckets {
-		if bucket == nil || bucket.CreationDate == nil {
-			return nil, fmt.Errorf("invalid ListVBuckets response: bucket summary and creation date are required")
-		}
-		if err := bucket.CreationDate.CheckValid(); err != nil {
-			return nil, fmt.Errorf("invalid ListVBuckets creation date for %q: %w", bucket.BucketName, err)
-		}
-		listed := http_server.ListedVBucket{Name: bucket.BucketName, CreationDate: bucket.CreationDate.AsTime()}
-		buckets = append(buckets, listed)
-	}
-	return buckets, nil
-}
-
-func mapCreateVBucketError(err error) error {
-	switch status.Code(err) {
-	case codes.AlreadyExists:
-		return fmt.Errorf("%w: %v", http_server.ErrVBucketAlreadyOwnedByYou, err)
-	case codes.Aborted, codes.FailedPrecondition:
-		return fmt.Errorf("%w: %v", http_server.ErrVBucketAlreadyExists, err)
-	case codes.InvalidArgument:
-		return fmt.Errorf("%w: %v", http_server.ErrInvalidVBucketArgument, err)
-	case codes.PermissionDenied, codes.Unauthenticated, codes.NotFound:
-		return fmt.Errorf("%w: %v", http_server.ErrVBucketAccessDenied, err)
-	default:
-		return err
-	}
-}
-
-func mapListVBucketsError(err error) error {
-	switch status.Code(err) {
-	case codes.PermissionDenied, codes.Unauthenticated, codes.NotFound:
-		return fmt.Errorf("%w: %v", http_server.ErrVBucketAccessDenied, err)
-	default:
-		return err
-	}
+func (c *Client) baseHostCount() int {
+	c.syncMu.RLock()
+	defer c.syncMu.RUnlock()
+	return len(c.baseHosts)
 }

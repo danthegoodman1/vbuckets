@@ -30,7 +30,7 @@ func main() {
 	go cpClient.Run(ctx)
 	logger.Info().Str("url", env.ControlPlaneURL).Msg("control plane client configured")
 
-	server := http_server.NewServer(env.HTTPListenAddress, nil, http_server.RegisterS3Routes(cpClient))
+	server := http_server.NewServerWithReadiness(env.HTTPListenAddress, nil, http_server.RegisterS3Routes(cpClient), cpClient)
 
 	go func() {
 		logger.Info().Str("addr", server.Addr()).Msg("starting HTTP server")

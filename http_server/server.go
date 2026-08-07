@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/danthegoodman1/vbuckets/env"
 	"github.com/go-chi/chi/v5"
@@ -25,7 +26,28 @@ type Server struct {
 
 type RegisterRoutes func(r chi.Router)
 
+type ReadinessSnapshot struct {
+	Ready                bool      `json:"ready"`
+	State                string    `json:"state"`
+	Revision             uint64    `json:"revision"`
+	CursorPresent        bool      `json:"cursor_present"`
+	BarrierRequired      bool      `json:"barrier_required"`
+	RequiredRevision     uint64    `json:"required_revision,omitempty"`
+	LastGapRevision      uint64    `json:"last_gap_revision,omitempty"`
+	LastTransitionUTC    time.Time `json:"last_transition_utc"`
+	LastDisconnectReason string    `json:"last_disconnect_reason,omitempty"`
+	Stats                any       `json:"stats,omitempty"`
+}
+
+type ReadinessProvider interface {
+	ReadinessSnapshot() ReadinessSnapshot
+}
+
 func NewServer(addr string, grpcServer *grpc.Server, registerRoutes RegisterRoutes) *Server {
+	return NewServerWithReadiness(addr, grpcServer, registerRoutes, nil)
+}
+
+func NewServerWithReadiness(addr string, grpcServer *grpc.Server, registerRoutes RegisterRoutes, readiness ReadinessProvider) *Server {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Logger)
@@ -33,6 +55,7 @@ func NewServer(addr string, grpcServer *grpc.Server, registerRoutes RegisterRout
 	r.Use(middleware.RequestID)
 
 	r.Get("/hc", HealthCheck)
+	r.Get("/ready", ReadinessCheck(readiness))
 
 	if registerRoutes != nil {
 		registerRoutes(r)
@@ -67,6 +90,21 @@ func NewServer(addr string, grpcServer *grpc.Server, registerRoutes RegisterRout
 	}
 
 	return s
+}
+
+func ReadinessCheck(readiness ReadinessProvider) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if readiness == nil {
+			writeJSON(r.Context(), w, http.StatusOK, map[string]any{"status": "ready", "state": "standalone"})
+			return
+		}
+		snapshot := readiness.ReadinessSnapshot()
+		status := http.StatusServiceUnavailable
+		if snapshot.Ready {
+			status = http.StatusOK
+		}
+		writeJSON(r.Context(), w, status, snapshot)
+	}
 }
 
 // grpcHTTPMux returns a handler that routes gRPC requests to the gRPC server

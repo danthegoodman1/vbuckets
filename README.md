@@ -27,19 +27,25 @@ reach control-plane/cache lookup or synthesized XML.
 
 ## Lookup functions
 
-The auth middleware is split into two phases with three distinct lookups, each independently cacheable:
+The auth middleware is split into two phases. Credentials and mappings use
+revisioned unary lookups; request hosts are matched locally against the
+watch-owned base-domain registry:
 
 | Lookup | Input | Returns |
 |---|---|---|
 | `LookupCredentials` | access key ID | secret key, IAM policy, TTL |
-| `LookupBaseHost` | request hostname | base domain (if registered), TTL |
+| Local base-domain match | request hostname | longest registered base-domain suffix |
 | `LookupVBucket` | access key ID + bucket name | real endpoint, bucket, region, path prefix, addressing style, stable routing-token key, TTL |
-| `CreateVBucket` | access key ID + bucket name + location constraint | real endpoint, bucket, region, path prefix, addressing style, stable routing-token key, TTL |
+| `CreateVBucket` | access key ID + bucket name + location constraint | committed global revision |
 | `ListVBuckets` | access key ID | visible virtual bucket names and creation dates |
 
-`LookupBaseHost` determines whether an incoming request is virtual-hosted style (`bucket.s3.example.com`) or path style (`s3.example.com/bucket`) by checking if the hostname is (or is a subdomain of) a registered base domain. The set of base domains changes extremely rarely, so this is aggressively cacheable.
+The local base-domain match determines whether an incoming request is
+virtual-hosted style (`bucket.s3.example.com`) or path style
+(`s3.example.com/bucket`). `WatchState` supplies the bounded normalized-domain
+set, and matching probes DNS-label suffixes longest-first without creating
+attacker-controlled per-host cache entries.
 
-**Phase 1 (authentication)** runs `LookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the request shape and checks IAM permissions. Object and bucket-object operations use `LookupBaseHost` + `LookupVBucket` before proxying. `CreateBucket` uses `CreateVBucket`, and `ListBuckets` uses `ListVBuckets`; neither operation is forwarded to the origin service.
+**Phase 1 (authentication)** runs `LookupCredentials` and verifies the SigV4 signature before any bucket resolution happens. **Phase 2 (authorization)** resolves the request shape and checks IAM permissions. Object and bucket-object operations use the local base-domain registry plus `LookupVBucket` before proxying. `CreateBucket` uses `CreateVBucket`, and `ListBuckets` uses `ListVBuckets`; neither operation is forwarded to the origin service.
 
 ## Target S3 operation and virtualization contract
 
@@ -202,15 +208,21 @@ You implement the `ControlPlane` service:
 ```protobuf
 service ControlPlane {
   rpc LookupCredentials(LookupCredentialsRequest) returns (LookupCredentialsResponse);
-  rpc LookupBaseHost(LookupBaseHostRequest) returns (LookupBaseHostResponse);
   rpc LookupVBucket(LookupVBucketRequest) returns (LookupVBucketResponse);
   rpc CreateVBucket(CreateVBucketRequest) returns (CreateVBucketResponse);
   rpc ListVBuckets(ListVBucketsRequest) returns (ListVBucketsResponse);
-  rpc ListenForDeltas(ListenForDeltasRequest) returns (stream Delta);
+  rpc WatchState(WatchStateRequest) returns (stream WatchEvent);
 }
 ```
 
-The unary RPCs handle on-demand lookups and intercepted create/list operations. Lookup and create responses include a `ttl` field that controls how long the proxy caches that entry.
+Every unary request carries `minimum_revision`, and every response carries the
+revision at which it was evaluated. Credential and vbucket lookup responses are
+explicit unions: `found=true` requires the complete positive payload and a
+positive `ttl`; `found=false` forbids positive fields and requires a positive
+`negative_ttl`. Service failures are never converted into cached negatives.
+`CreateVBucket` returns only a committed revision strictly greater than the
+request minimum; routing is loaded later through `LookupVBucket` after the watch
+catches up.
 
 The control plane owns real namespace allocation. Mappings that share a real
 endpoint and real bucket MUST use normalized, pairwise non-overlapping path
@@ -223,26 +235,28 @@ changes; old continuation/upload/version IDs then fail authentication, so a
 planned change may need a drain window. Never derive this key from upstream
 credentials or fall back when it is absent.
 
-Roll out control-plane storage and population of `routing_token_key` for lookup,
-create, and delta responses—and verify replica agreement—before upgrading
-proxies. Missing or malformed keys fail closed. Mapping validation also requires
+Roll out control-plane storage and population of `routing_token_key` for lookup
+responses—and verify replica agreement—before upgrading proxies. Missing or
+malformed keys fail closed. Mapping validation also requires
 an HTTP(S) endpoint without credentials/path/query/fragment, an S3-valid real
 bucket, bounded credentials/region, and a safe normalized prefix. IP-literal
 origins require path-style addressing. Virtual-hosted HTTPS mappings with dotted
 real bucket names or custom endpoints remain the deployer's DNS/certificate
 responsibility.
 
-### Delta stream
+### Revisioned watch and freshness contract
 
-`ListenForDeltas` is a server-streaming RPC that pushes cache updates to the proxy. When credentials are revoked, bucket mappings change, or base hosts are added/removed, the control plane sends a `Delta` message with the full updated value (upsert) or a removal flag.
+`WatchState` begins with either a complete base-domain snapshot or a contiguous
+replay from the requested `(after_revision, resume_cursor)`. The control plane
+then sends a synchronization barrier for the exact accepted pair before live
+events. Every persisted revision has one canonical opaque cursor. Live
+credential and vbucket events contain only cache keys and invalidation/removal
+intent—never secrets, policies, backend credentials, or mappings. The proxy
+clears those bounded caches on snapshots and reloads entries through revisioned
+unary calls. Base-domain snapshots are staged privately and swapped atomically
+at their barrier.
 
-Each delta also carries a `ttl` so the control plane controls per-entry cache lifetimes even for pushed data.
-
-The current pre-release v1 messages do not carry a revision, resume cursor, or
-initial synchronization barrier. Its delta stream is therefore best-effort:
-it shortens ordinary propagation but cannot claim “no stale windows.” Before
-the control-plane API is production-ready, its revisioned synchronization
-contract is:
+The enforced synchronization contract is:
 
 - Revisions are monotonic. Neither an older unary lookup nor a reordered event
   may replace or be returned after a newer revision has been observed.
@@ -251,16 +265,56 @@ contract is:
 - A missing revision, invalid resume cursor, disconnect, or stream failure
   makes the proxy unsynchronized immediately. Readiness fails and authorization
   and routing decisions fail closed until a new barrier is established.
-- Cache TTL is a memory/load policy, not a revocation guarantee. Maximum
-  revocation exposure is measured as stream-failure detection time plus
-  control-plane resynchronization time; both components must be observable and
-  bounded by deployment configuration.
+- Cache TTL is a memory/load policy, not a revocation guarantee. After the proxy
+  detects an event or stream failure it fails new authorization/routing
+  decisions closed until resynchronized. When frames stop, the 10-second watch
+  silence timeout bounds detection for *new* resolver decisions. Requests whose
+  authorization already completed are not cancelled; because streaming HTTP
+  read/write timeouts default to zero, their lifetime is not yet a hard-bounded
+  revocation interval. Healthy-control-plane resynchronization latency is
+  measured separately. Phase 4 must add request lifetime/cancellation policy
+  before claiming an end-to-end hard revocation bound.
 - Negative lookup results are revisioned and cached separately from service
   failures. Unavailable/internal responses are never converted into negatives.
 
+The watch must emit heartbeats more frequently than the 10-second silence
+timeout. A snapshot/replay or post-create catch-up must reach a valid barrier
+within the separate 30-second synchronization timeout; traffic cannot extend
+that absolute bound. Unary RPCs have a 2-second proxy-owned deadline. Reconnects
+use jittered exponential backoff from 250 ms to 30 seconds. These defaults are
+currently client options; Phase 4 moves them into validated process config.
+
+`/hc` is process liveness. `/ready` returns 200 only in `ready` and otherwise
+503 with one atomic JSON snapshot containing state, revision, cursor presence,
+`barrier_required`, required catch-up revision, last gap/disconnect reason,
+transition time, cache counts, last RPC status/latency, watch reconnects/gaps, cache
+hits/misses/negatives/evictions/coalescing, and separate rejected credential and
+vbucket misses.
+
+### Pre-release control-plane migration
+
+This is an intentional breaking change to the pre-release v1 API; it is not
+rolling-compatible. Use either a coordinated maintenance cutover or bring up a
+parallel control-plane endpoint with compatible new proxies, switch traffic,
+and only then retire the legacy deployment. Never connect a legacy proxy to the
+new service or a new proxy to the legacy service. A separately versioned service
+would be required for an ordinary mixed-version rolling migration. Remove
+`LookupBaseHost` and `ListenForDeltas`; add
+`WatchState`, a durable monotonic revision/cursor log, exact snapshot/replay
+barriers, and heartbeats. Add minimum/revision and found/positive-or-negative
+TTL fields to unary DTOs. Make `CreateVBucket` revision-only and retain its
+backend mapping in control-plane storage for later lookup. Do not mix old and
+new generated clients or servers: protobuf field numbers that formerly carried
+sensitive pushed payloads are reserved to prevent accidental reuse.
+
 ### Caching
 
-Lookup results and deltas are cached locally, going to the control plane as needed. Three independent caches (credentials, base hosts, vbuckets) each use per-entry TTLs from the control plane. Cache misses trigger the unary gRPC lookup; concurrent requests for the same key are deduplicated automatically to protect the control plane from thundering herds.
+Credential and vbucket lookup results use bounded O(1) LRU/TTL caches with
+separate positive and negative TTLs. Base domains use a bounded watch-owned set
+with no independent expiry while synchronized. Same-key unary misses are
+coalesced, callers can cancel independently, and credential/vbucket novel-key
+misses have separate token-bucket and in-flight admission bounds (defaults:
+100 requests/second, burst 100, 32 in flight for each type).
 
 Production control-plane lookup/create/delta insertion validates and
 defensively clones mappings; the proxy revalidates values returned through the
@@ -291,7 +345,7 @@ results.
 | `HTTP_ADDRESS` | `:8080` | Listen address for the HTTP/S3 proxy |
 | `SIGV4_MAX_CLOCK_SKEW` | `15m` | Max allowed absolute skew for `X-Amz-Date` before returning `RequestTimeTooSkewed` |
 | `CACHE_MAX_CREDENTIALS` | `10000` | Max entries in the credentials cache |
-| `CACHE_MAX_BASE_HOSTS` | `10000` | Max entries in the base host cache |
+| `CACHE_MAX_BASE_HOSTS` | `10000` | Max entries in the watch-owned base-domain registry |
 | `CACHE_MAX_VBUCKETS` | `10000` | Max entries in the vbucket cache |
 
 ### Control plane security

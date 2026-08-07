@@ -1168,11 +1168,11 @@ func TestS3Auth_CreateBucketInterceptsWithoutVBucketLookup(t *testing.T) {
 		vbucketLookupCalled = true
 		return nil, errors.New("should not lookup vbucket")
 	}
-	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
+	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) error {
 		require.Equal(t, testAccessKey, accessKeyID)
 		gotBucket = bucketName
 		gotLocation = locationConstraint
-		return validTestVBucketConfig(), nil
+		return nil
 	}
 
 	handler := S3Auth(resolver)(handleS3Request(resolver))
@@ -1195,27 +1195,6 @@ func TestS3Auth_CreateBucketInterceptsWithoutVBucketLookup(t *testing.T) {
 	assert.False(t, vbucketLookupCalled)
 }
 
-func TestS3Auth_CreateBucketRejectsInvalidReturnedMappingBeforeSuccess(t *testing.T) {
-	resolver := newTestResolver()
-	resolver.create = func(_ context.Context, _, _, _ string) (*VBucketConfig, error) {
-		return &VBucketConfig{RealEndpoint: "https://origin.example.com"}, nil
-	}
-	handler := S3Auth(resolver)(handleS3Request(resolver))
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	req := signedRequest(t, http.MethodPut, server.URL+"/new-bucket", nil, unsignedPayload, validCreds)
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
-	assert.Empty(t, resp.Header.Get("Location"))
-	assert.Contains(t, string(body), "<Code>InternalError</Code>")
-	assert.NotContains(t, string(body), "<CreateBucketResult")
-}
-
 func TestS3Auth_CreateBucketDeniedDoesNotMutate(t *testing.T) {
 	resolver := newTestResolver()
 	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
@@ -1231,9 +1210,9 @@ func TestS3Auth_CreateBucketDeniedDoesNotMutate(t *testing.T) {
 		}, nil
 	}
 	var createCalled bool
-	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
+	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) error {
 		createCalled = true
-		return &VBucketConfig{}, nil
+		return nil
 	}
 
 	handler := S3Auth(resolver)(handleS3Request(resolver))
@@ -1253,9 +1232,9 @@ func TestS3Client_CreateBucketAndListBuckets(t *testing.T) {
 	resolver := newTestResolver()
 	created := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	var buckets []ListedVBucket
-	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
+	resolver.create = func(_ context.Context, accessKeyID, bucketName, locationConstraint string) error {
 		buckets = append(buckets, ListedVBucket{Name: bucketName, CreationDate: created})
-		return validTestVBucketConfig(), nil
+		return nil
 	}
 	resolver.list = func(_ context.Context, accessKeyID string) ([]ListedVBucket, error) {
 		return buckets, nil

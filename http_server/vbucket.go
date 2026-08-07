@@ -31,7 +31,7 @@ type Resolver interface {
 	LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
 	LookupBaseHost(ctx context.Context, hostname string) (string, bool, error)
 	LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
-	CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error)
+	CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error
 	ListVBuckets(ctx context.Context, accessKeyID string) ([]ListedVBucket, error)
 }
 
@@ -183,9 +183,12 @@ type ListedVBucket struct {
 // Path style:           BASE_HOST/bucket/key (or unknown host)
 func resolveBucket(resolver Resolver, r *http.Request) (bucket, objectKey string, isVHost bool, err error) {
 	host := r.Host
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		host = host[:idx]
+	if parsedHost, _, splitErr := net.SplitHostPort(host); splitErr == nil {
+		host = parsedHost
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.Trim(host, "[]")
 	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
 
 	baseHost, found, err := resolver.LookupBaseHost(r.Context(), host)
 	if err != nil {

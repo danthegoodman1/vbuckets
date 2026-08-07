@@ -1,11 +1,44 @@
 package http_server
 
 import (
+	"context"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestResolveBucketCanonicalAuthority(t *testing.T) {
+	tests := []struct {
+		name, host, path, baseHost, wantBucket, wantKey string
+		wantVHost                                       bool
+	}{
+		{name: "uppercase trailing dot vhost", host: "BUCKET.Deep.S3.EXAMPLE.COM.:443", path: "/key", baseHost: "s3.example.com", wantBucket: "bucket.deep", wantKey: "key", wantVHost: true},
+		{name: "ipv4 path style", host: "127.0.0.1:8080", path: "/bucket/key", wantBucket: "bucket", wantKey: "key"},
+		{name: "ipv6 path style", host: "[::1]:8080", path: "/bucket/key", wantBucket: "bucket", wantKey: "key"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolver := newTestResolver()
+			resolver.baseHost = func(_ context.Context, hostname string) (string, bool, error) {
+				if test.baseHost == "" {
+					return "", false, nil
+				}
+				require.Equal(t, strings.TrimSuffix(strings.ToLower(strings.Split(test.host, ":")[0]), "."), hostname)
+				return test.baseHost, true, nil
+			}
+			request := httptest.NewRequest("GET", "http://example.test"+test.path, nil)
+			request.Host = test.host
+			bucket, key, vhost, err := resolveBucket(resolver, request)
+			require.NoError(t, err)
+			require.Equal(t, test.wantBucket, bucket)
+			require.Equal(t, test.wantKey, key)
+			require.Equal(t, test.wantVHost, vhost)
+		})
+	}
+}
 
 func validTestVBucketConfig() *VBucketConfig {
 	return &VBucketConfig{

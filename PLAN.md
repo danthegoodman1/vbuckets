@@ -4,7 +4,7 @@
 
 Make vbuckets a fail-closed, streaming S3 virtualization boundary: a client-authorized virtual operation must be the same operation sent upstream, configured real bucket/endpoint/prefix identifiers may not escape through S3 protocol metadata, tenant prefixes must contain every supported operation, and control-plane state must have explicit, enforceable freshness semantics.
 
-Keep the current strengths—streaming object bodies, bounded/streaming list rewriting, compiled IAM policies, per-key TTLs, and singleflight lookups. Do not expand the S3 surface until the supported subset is exact and testable. Replace the README's impossible absolute “no stale windows” claim with a measurable guarantee: observed revisions never regress, stream gaps force fail-closed resynchronization, and revocation latency is bounded by documented stream failure detection rather than cache TTL.
+Keep the current strengths—streaming object bodies, bounded/streaming list rewriting, compiled IAM policies, per-key TTLs, and singleflight lookups. Do not expand the S3 surface until the supported subset is exact and testable. Replace the README's impossible absolute “no stale windows” claim with a measurable guarantee: observed revisions never regress, stream gaps force fail-closed resynchronization, and detection bounds apply to new resolver decisions rather than already-authorized unbounded streaming requests.
 
 ## Review Findings Driving Priority
 
@@ -168,12 +168,12 @@ Scope:
 - Make cache writes revision-aware so an older unary result or event can neither replace nor be returned after a newer revision has been observed.
 - Represent found/not-found plus separate positive/negative TTLs for credentials and vbuckets; cache legitimate negative results while never caching unavailable/internal failures.
 - Replace per-request full-hostname lookup/cache entries with a versioned local base-domain set and deterministic longest-suffix matching.
-- Add proxy-owned unary RPC deadlines, exponential backoff with jitter, explicit connection/sync state, and bounded admission/rate controls for novel credential IDs.
-- Expose cache hit/miss/negative-hit/eviction/load-coalescing metrics, watch revision/gap/reconnect state, RPC latency/status, and rejected-miss counts without logging secrets.
+- Add proxy-owned unary RPC deadlines, exponential backoff with jitter, explicit connection/sync state, and separate bounded admission/rate controls for novel credential and vbucket keys.
+- Expose cache hit/miss/negative-hit/eviction/load-coalescing metrics, watch revision/gap/reconnect state, last RPC latency/status, and rejected-miss counts without logging secrets.
 
 Out of scope:
 
-- Claiming zero propagation delay or serving stale authorization state for availability after the watch is known to be unsynchronized.
+- Claiming zero propagation delay, cancelling requests authorized before a revocation is detected, or serving stale authorization state for availability after the watch is known to be unsynchronized.
 
 Completion gate:
 A deterministic fault suite proves no revision regression, missed removal, stale post-barrier lookup result, or unbounded RPC amplification across disconnect/reconnect and randomized invalid-key traffic.
@@ -181,7 +181,7 @@ A deterministic fault suite proves no revision regression, missed removal, stale
 Testing plan:
 
 - Build a controllable fake control plane with revisions, blocked unary calls, watch gaps, duplicates, reordering attempts, disconnects, and snapshot/barrier events.
-- Add race/model tests for delta-versus-loader interleavings and property tests asserting monotonic returned revisions.
+- Add deterministic race/model tests for watch-versus-loader, cache-hit, list-parse, create, disconnect, and teardown interleavings.
 - Load-test repeated and random invalid access keys; assert configured bounds on control-plane QPS, in-flight lookups, memory, and recovery latency.
 - Add process-level readiness tests for startup, synced, disconnected, resynchronizing, and shutdown states.
 
@@ -189,15 +189,16 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: Revisioned lookup/watch protocol | Gap: F5; current messages have no revision, cursor, barrier, or gap signal. |
-| Incomplete | Work | 3B: Fail-closed synchronization state machine | Gap: `controlplane.Client` retains caches while the watch reconnects on a fixed five-second loop. |
-| Incomplete | Work | 3C: Monotonic cache wrapper | Missing: revision comparison spanning unary loaders, events, invalidation, and in-flight callers. |
-| Incomplete | Work | 3D: Negative credential/vbucket caching | Missing: found/not-found values and control-plane-selected negative TTLs; random invalid keys currently invoke loaders repeatedly. |
-| Incomplete | Work | 3E: Local base-domain registry | Gap: `LookupBaseHost` and its cache are keyed by each request hostname rather than the small registered domain set. |
-| Incomplete | Work | 3F: Deadlines, jittered retry, and miss admission | Missing: proxy-owned gRPC deadline and bounded novel-key load. |
-| Incomplete | Work | 3G: Cache/watch observability and readiness | Gap: `/hc` always reports 200 and exposes no synchronization state. |
-| Incomplete | Test | 3H: State-machine, race, and adversarial-load suite | Missing: disconnect/removal/reconnect, revision race, negative-cache, and random-key flood evidence. |
-| Incomplete | Gate | Bounded revocation and miss amplification | Missing: measured revocation/recovery bound and maximum control-plane QPS under the agreed load profile. |
+| Complete | Work | 3A: Revisioned lookup/watch protocol | `WatchState` now has canonical revision/cursor envelopes, snapshots, exact barriers, heartbeats, contiguous replay, strict protocol-fault handling, key-only credential/vbucket invalidations, and reserved legacy secret/mapping field numbers. Unary DTOs carry minimum/observed revisions and explicit positive/negative result shapes; create is committed-revision-only. |
+| Complete | Work | 3B: Fail-closed synchronization state machine | Startup, connecting, synchronizing, ready, disconnected, and shutdown are explicit. Disconnect, EOF, silence, synchronization timeout, revision gap, malformed frame, and future unary evidence fail readiness; replay cannot restore it before a barrier. Teardown marks disconnected before clearing the transport. |
+| Complete | Work | 3C: Monotonic cache and decision arbitration | Bounded local LRU/TTL storage has no loader side effects. Final revision/epoch checks linearize cache hits, unary completion, and list parsing with watch events; stale calls retry once at the newer revision. Cache-owned mappings and credentials are cloned before return. |
+| Complete | Work | 3D: Negative credential/vbucket caching | Valid `found=false` responses and hot removals use independent positive and negative TTLs; cold removals do not create attacker-cardinality entries; unavailable/internal failures are never cached. Expiry/reload uses an injected clock. |
+| Complete | Work | 3E: Local base-domain registry | A bounded normalized ASCII DNS set is staged privately during snapshots, atomically swapped at the barrier, updated only by the watch, and queried locally by longest DNS-label suffix in O(labels). Request-host cardinality cannot grow it. |
+| Complete | Work | 3F: Deadlines, jittered retry, and miss admission | All four unary RPCs receive a proxy-owned 2-second default deadline; watch reconnect uses 250 ms–30 s jittered exponential backoff; synchronization and silence have distinct absolute timers. Credential and vbucket misses each default to 100/s, burst 100, and 32 in flight, with admission before shared-RPC registration and caller-independent cancellation. |
+| Complete | Work | 3G: Cache/watch observability and readiness | `/hc` remains liveness; `/ready` atomically derives status/body from one typed snapshot and exposes lifecycle state, revision/cursor/barrier/target/gap/disconnect fields plus cache, watch, last-RPC, coalescing, eviction, negative-hit, and per-type rejection statistics. Capture regressions prove logs omit credential material, virtual identifiers embedded in resolver errors, malformed authorization contents, and raw watch-error text. |
+| Complete | Test | 3H: State-machine, race, and adversarial-load suite | Regression-first tests cover stale blocked unaries, future malformed DTOs before parsing, cache-hit/remove races, reconnect replay/barriers, gaps/duplicates/rollback/cursor faults, snapshot atomicity/bounds, EOF and teardown order, silence/sync deadlines, Create targets/terminal races, negative expiry, cold churn, cache ownership, cancellation/coalescing, every lifecycle readiness state, and separate random-key admission. The focused control-plane suite passed 20 repetitions and the final full-tree race gate passed. |
+| Complete | Decision | 3I: Intentional pre-release v1 API break | The default breaking gate remains strict. `make proto-breaking` intentionally reports deleted `Delta`, `ListenForDeltasRequest`, `LookupBaseHostRequest/Response`, both legacy RPCs, Create response fields 1–8, CredentialsDelta fields 3–5, BaseHostDelta fields 1/4/5, and VBucketDelta fields 4–11. README documents coordinated/parallel cutover and forbids mixed legacy/new deployments; no compatibility exception weakens the gate. |
+| Complete | Gate | Bounded new-decision failure detection and miss amplification | Deterministic 40 ms fault tests prove silence and absolute synchronization cutoffs fail new decisions closed; the configured random-key test admits exactly 4 credential and 3 vbucket RPCs while rejecting 46/47 concurrent novel keys. O(1) cache insertion measured 148–169 ns/op, 54 B/op, 1 alloc/op and 10,000-domain longest-suffix lookup 376–382 ns/op, 312 B/op, 6 allocs/op on Apple M3 Max (3 runs, 2026-08-06). Final gates: `go test ./... -count=1` including Garage E2E, `go vet ./...`, `go test -race ./... -short -count=1`, and `make proto-check` pass; `make proto-breaking` is the documented intentional failure in 3I. |
 
 ## Phase 4: Validate Operations, Simplify Ownership, and Qualify Performance
 

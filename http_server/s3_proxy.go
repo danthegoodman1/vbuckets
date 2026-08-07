@@ -67,19 +67,12 @@ func handleS3Request(resolver Resolver) http.HandlerFunc {
 }
 
 func handleCreateVBucket(resolver Resolver, w http.ResponseWriter, r *http.Request) {
-	logger := zerolog.Ctx(r.Context())
 	authInfo := getAuthInfo(r.Context())
 	bucket := getBucketName(r.Context())
 	locationConstraint := getCreateLocationConstraint(r.Context())
 
-	created, err := resolver.CreateVBucket(r.Context(), authInfo.AccessKeyID, bucket, locationConstraint)
-	if err != nil {
+	if err := resolver.CreateVBucket(r.Context(), authInfo.AccessKeyID, bucket, locationConstraint); err != nil {
 		writeCreateVBucketError(w, err)
-		return
-	}
-	if _, err := NormalizeVBucketConfig(created); err != nil {
-		logger.Error().Err(err).Msg("create returned an invalid upstream mapping")
-		writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket mapping")
 		return
 	}
 
@@ -111,17 +104,17 @@ func handleListVBuckets(resolver Resolver, w http.ResponseWriter, r *http.Reques
 	seen := make(map[string]struct{}, len(buckets))
 	for _, bucket := range buckets {
 		if !isValidBucketName(bucket.Name) {
-			logger.Error().Str("bucket", bucket.Name).Msg("control plane returned an invalid virtual bucket name")
+			logger.Error().Msg("control plane returned an invalid virtual bucket name")
 			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket listing")
 			return
 		}
 		if bucket.CreationDate.IsZero() {
-			logger.Error().Str("bucket", bucket.Name).Msg("control plane returned a missing virtual bucket creation date")
+			logger.Error().Msg("control plane returned a missing virtual bucket creation date")
 			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket listing")
 			return
 		}
 		if _, duplicate := seen[bucket.Name]; duplicate {
-			logger.Error().Str("bucket", bucket.Name).Msg("control plane returned a duplicate virtual bucket name")
+			logger.Error().Msg("control plane returned a duplicate virtual bucket name")
 			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket listing")
 			return
 		}

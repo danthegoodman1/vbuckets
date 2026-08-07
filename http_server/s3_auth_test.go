@@ -48,7 +48,7 @@ type testResolver struct {
 	credentials func(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
 	baseHost    func(ctx context.Context, hostname string) (string, bool, error)
 	vbucket     func(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
-	create      func(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error)
+	create      func(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error
 	list        func(ctx context.Context, accessKeyID string) ([]ListedVBucket, error)
 }
 
@@ -64,7 +64,7 @@ func (r *testResolver) LookupVBucket(ctx context.Context, accessKeyID, bucketNam
 	return r.vbucket(ctx, accessKeyID, bucketName)
 }
 
-func (r *testResolver) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
+func (r *testResolver) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error {
 	return r.create(ctx, accessKeyID, bucketName, locationConstraint)
 }
 
@@ -86,8 +86,8 @@ func newTestResolver() *testResolver {
 		vbucket: func(_ context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
 			return &VBucketConfig{}, nil
 		},
-		create: func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
-			return validTestVBucketConfig(), nil
+		create: func(_ context.Context, accessKeyID, bucketName, locationConstraint string) error {
+			return nil
 		},
 		list: func(_ context.Context, accessKeyID string) ([]ListedVBucket, error) {
 			return nil, nil
