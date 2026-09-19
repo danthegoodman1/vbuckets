@@ -409,6 +409,17 @@ For a Docker-free run, use `go test -race ./... -short -count=1`. The per-key
 IAM conformance and adversarial protocol tests run in this suite; S3Proxy
 covers ordinary SDK interoperability and does not replace those checks.
 
+The [CI workflow](./.github/workflows/ci.yml) runs the full suite with `-race`
+and S3Proxy on Linux amd64 and arm64, using the Go version in `go.mod`. It also
+checks formatting, vet, the build, protobuf lint, and generated-code consistency.
+The aggregate `CI` check requires every job to succeed, including both matrix
+entries, and runs on PRs targeting main, pushes to main, and merge queues.
+Configure main's branch protection to require this check from GitHub Actions
+and an up-to-date branch. Skipped, failed, and cancelled dependency jobs fail
+the aggregate gate. Protobuf compatibility remains a separate review decision:
+CI runs `make proto-check`, not the intentionally failing `make proto-breaking`
+comparison against legacy main described above.
+
 ### Configuration
 
 The binary loads supported settings once and validates them before starting any
