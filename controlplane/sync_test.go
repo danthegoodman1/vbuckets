@@ -217,11 +217,14 @@ func TestFutureUnaryEvidenceRecordsRequiredRevisionBeforePayloadParsing(t *testi
 	require.False(t, status.Ready)
 	require.Equal(t, uint64(12), status.RequiredRevision)
 
-	// A reconnect barrier at the old cut is valid stream synchronization, but
-	// cannot restore process readiness below the evidenced revision.
-	c.syncMu.Lock()
-	c.transitionLocked(StateSynchronizing)
-	c.syncMu.Unlock()
+	// Preserve the healthy stream and highest target, even for malformed
+	// future payloads. A lower target cannot shorten or restart catch-up.
+	require.Equal(t, StateSynchronizing, c.Status().State)
+	require.Empty(t, c.resync)
+	started := c.synchronizingSince
+	require.ErrorIs(t, c.checkUnaryRevision(11, 10), ErrRevisionRace)
+	require.Equal(t, uint64(12), c.Status().RequiredRevision)
+	require.Equal(t, started, c.synchronizingSince)
 	require.NoError(t, c.processWatch(barrier(10)))
 	require.False(t, c.Ready())
 	require.NoError(t, c.processWatch(credentialInvalidation(11, "other")))

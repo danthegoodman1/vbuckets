@@ -1,0 +1,41 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/danthegoodman1/vbuckets/http_server
+cpu: Apple M3 Max
+BenchmarkS3AuthenticatedRequest//bucket/key         	   64910	     18475 ns/op	   12050 B/op	     170 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	   67206	     17920 ns/op	   12050 B/op	     170 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	   68504	     18050 ns/op	   12050 B/op	     170 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	   67110	     18358 ns/op	   12050 B/op	     170 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	   65839	     18474 ns/op	   12050 B/op	     170 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	   63739	     18214 ns/op	   12050 B/op	     170 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	   67663	     17851 ns/op	   12050 B/op	     169 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   61224	     19937 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   60082	     19781 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   60099	     20155 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   59701	     19945 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   60502	     19212 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   67596	     19171 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	   60842	     19286 ns/op	   13762 B/op	     191 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  210237	      5703 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  210482	      5724 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  207367	      5712 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  207554	      5683 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  212446	      5668 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  211786	      5726 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkGetPlanAndAuthorization                    	  213855	      5726 ns/op	    5232 B/op	      67 allocs/op
+BenchmarkObjectStreaming/1048576                    	  114554	     10338 ns/op	101431.58 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/1048576                    	  115490	     10002 ns/op	104835.28 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/1048576                    	  128032	      9299 ns/op	112762.58 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/1048576                    	  130563	      9292 ns/op	112845.72 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/1048576                    	  128845	      9333 ns/op	112350.99 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/1048576                    	  128421	      9859 ns/op	106359.69 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/1048576                    	  135056	      9374 ns/op	111863.10 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3633	    335702 ns/op	199906.15 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3570	    334938 ns/op	200362.35 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3554	    328923 ns/op	204025.79 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3777	    326282 ns/op	205677.79 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3714	    334317 ns/op	200734.52 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3585	    334192 ns/op	200809.40 MB/s	   33112 B/op	       6 allocs/op
+BenchmarkObjectStreaming/67108864                   	    3632	    334807 ns/op	200440.49 MB/s	   33112 B/op	       6 allocs/op
+PASS
+ok  	github.com/danthegoodman1/vbuckets/http_server	46.215s

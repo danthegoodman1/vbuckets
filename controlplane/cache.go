@@ -125,8 +125,8 @@ type caches struct {
 
 func newCaches(onEvict func(), now func() time.Time) *caches {
 	return &caches{
-		credentials: newLocalCache[string, cachedCredentials](env.CacheMaxCredentials, onEvict, now),
-		vbuckets:    newLocalCache[string, cachedVBucket](env.CacheMaxVBuckets, onEvict, now),
+		credentials: newLocalCache[string, cachedCredentials](env.Current.Cache.MaxCredentials, onEvict, now),
+		vbuckets:    newLocalCache[string, cachedVBucket](env.Current.Cache.MaxVBuckets, onEvict, now),
 	}
 }
 

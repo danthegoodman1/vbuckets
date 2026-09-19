@@ -39,6 +39,18 @@ func (c *Client) stillCurrent(revision, epoch uint64) bool {
 	return c.state == StateReady && c.revision == revision && c.epoch == epoch
 }
 
+func (c *Client) BeginResolution() (http_server.ResolutionStamp, error) {
+	_, revision, epoch, err := c.lookupSnapshot()
+	return http_server.ResolutionStamp{Revision: revision, Epoch: epoch}, err
+}
+
+func (c *Client) ValidateResolution(stamp http_server.ResolutionStamp) error {
+	if !c.stillCurrent(stamp.Revision, stamp.Epoch) {
+		return ErrRevisionRace
+	}
+	return nil
+}
+
 func (c *Client) checkUnaryRevision(revision, expected uint64) error {
 	if revision == expected {
 		return nil
@@ -48,11 +60,13 @@ func (c *Client) checkUnaryRevision(revision, expected uint64) error {
 	if c.state == StateShutdown {
 		return ErrRevisionRace
 	}
-	if revision > c.revision {
-		c.requiredRevision = max(c.requiredRevision, revision)
-	}
-	if revision < expected || revision > c.revision {
+	if revision < expected {
 		c.requestResyncLocked()
+	} else if revision > c.revision {
+		c.requiredRevision = max(c.requiredRevision, revision)
+		if c.state == StateReady {
+			c.transitionLocked(StateSynchronizing)
+		}
 	}
 	return ErrRevisionRace
 }
@@ -74,7 +88,8 @@ func (c *Client) observeRPC(start time.Time, err error) {
 }
 
 func (c *Client) LookupCredentials(ctx context.Context, accessKeyID string) (*http_server.VirtualCredentials, error) {
-	return c.lookupCredentials(ctx, accessKeyID, true)
+	value, err := c.lookupCredentials(ctx, accessKeyID, true)
+	return value, mapResolverError(err)
 }
 
 func (c *Client) lookupCredentials(ctx context.Context, accessKeyID string, retry bool) (*http_server.VirtualCredentials, error) {
@@ -215,15 +230,15 @@ func (c *Client) LookupBaseHost(_ context.Context, hostname string) (string, boo
 		return "", false, nil
 	}
 	if len(host) == 0 || len(host) > 253 {
-		return "", false, fmt.Errorf("invalid request host")
+		return "", false, http_server.ErrInvalidVBucketArgument
 	}
 	for _, label := range strings.Split(host, ".") {
 		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return "", false, fmt.Errorf("invalid request host")
+			return "", false, http_server.ErrInvalidVBucketArgument
 		}
 		for _, character := range label {
 			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
-				return "", false, fmt.Errorf("invalid request host")
+				return "", false, http_server.ErrInvalidVBucketArgument
 			}
 		}
 	}
@@ -247,7 +262,8 @@ func (c *Client) LookupBaseHost(_ context.Context, hostname string) (string, boo
 }
 
 func (c *Client) LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*http_server.VBucketConfig, error) {
-	return c.lookupVBucket(ctx, accessKeyID, bucketName, true)
+	value, err := c.lookupVBucket(ctx, accessKeyID, bucketName, true)
+	return value, mapResolverError(err)
 }
 
 func (c *Client) lookupVBucket(ctx context.Context, accessKeyID, bucketName string, retry bool) (*http_server.VBucketConfig, error) {
@@ -374,7 +390,8 @@ func vbucketResponseEntry(resp *apiv1.LookupVBucketResponse) (cachedVBucket, err
 	return cachedVBucket{VBucketConfig: cfg, Found: true, Revision: resp.Revision, TTL: ttl}, nil
 }
 
-func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error {
+func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (err error) {
+	defer func() { err = mapResolverError(err) }()
 	client, revision, _, err := c.lookupSnapshot()
 	if err != nil {
 		return err
@@ -410,7 +427,8 @@ func (c *Client) CreateVBucket(ctx context.Context, accessKeyID, bucketName, loc
 	return nil
 }
 
-func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) ([]http_server.ListedVBucket, error) {
+func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) (buckets []http_server.ListedVBucket, err error) {
+	defer func() { err = mapResolverError(err) }()
 	client, revision, epoch, err := c.lookupSnapshot()
 	if err != nil {
 		return nil, err
@@ -435,7 +453,7 @@ func (c *Client) ListVBuckets(ctx context.Context, accessKeyID string) ([]http_s
 	if !c.stillCurrent(revision, epoch) {
 		return nil, ErrRevisionRace
 	}
-	buckets := make([]http_server.ListedVBucket, 0, len(resp.Buckets))
+	buckets = make([]http_server.ListedVBucket, 0, len(resp.Buckets))
 	for _, bucket := range resp.Buckets {
 		if bucket == nil || bucket.CreationDate == nil {
 			return nil, fmt.Errorf("invalid ListVBuckets response: bucket summary and creation date are required")

@@ -81,8 +81,10 @@ func writeVirtualizedUpstreamResponse(w http.ResponseWriter, r *http.Request, re
 			return err
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, err := io.Copy(w, resp.Body)
-		return err
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			return fmt.Errorf("%w: %w", http.ErrAbortHandler, err)
+		}
+		return nil
 	case responseSafeHeaders:
 		if err := copySafeResponseHeaders(resp.Header, w.Header(), cfg, plan, resp.StatusCode); err != nil {
 			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid upstream S3 response")
@@ -106,7 +108,10 @@ func writeVirtualizedUpstreamResponse(w http.ResponseWriter, r *http.Request, re
 		w.Header().Del("Content-Length")
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(resp.StatusCode)
-		return rewriteStreamingNamespaceResponse(body, w, plan, cfg, pathPrefix)
+		if err := rewriteStreamingNamespaceResponse(body, w, plan, cfg, pathPrefix); err != nil {
+			return fmt.Errorf("%w: %w", http.ErrAbortHandler, err)
+		}
+		return nil
 	case responseCreateMultipart, responseListParts, responseCompleteMultipart, responseCopyObject:
 		data, err := readBoundedControlXML(resp.Body)
 		if err != nil {

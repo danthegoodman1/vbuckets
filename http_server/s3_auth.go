@@ -242,7 +242,7 @@ func computeSigningKey(secret, date, region, service string) []byte {
 // signature derived from the provided secret key. The request body is never
 // read; clients must use UNSIGNED-PAYLOAD so streaming remains possible.
 func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string) error {
-	return verifySignatureAtTime(r, authInfo, secretKey, time.Now().UTC(), env.SigV4MaxClockSkew)
+	return verifySignatureAtTime(r, authInfo, secretKey, time.Now().UTC(), env.Current.S3.SigV4MaxClockSkew)
 }
 
 func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string, now time.Time, maxSkew time.Duration) error {

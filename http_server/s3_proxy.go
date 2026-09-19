@@ -25,17 +25,17 @@ var proxyClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   env.UpstreamDialTimeout,
+			Timeout:   env.Current.Upstream.DialTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		DisableCompression:    true,
-		MaxIdleConns:          env.UpstreamMaxIdleConns,
-		MaxIdleConnsPerHost:   env.UpstreamMaxIdleConnsPerHost,
-		IdleConnTimeout:       env.UpstreamIdleConnTimeout,
-		TLSHandshakeTimeout:   env.UpstreamTLSHandshakeTimeout,
-		ExpectContinueTimeout: env.UpstreamExpectContinueTimeout,
-		ResponseHeaderTimeout: env.UpstreamResponseHeaderTimeout,
+		MaxIdleConns:          env.Current.Upstream.MaxIdleConns,
+		MaxIdleConnsPerHost:   env.Current.Upstream.MaxIdleConnsPerHost,
+		IdleConnTimeout:       env.Current.Upstream.IdleConnTimeout,
+		TLSHandshakeTimeout:   env.Current.Upstream.TLSHandshakeTimeout,
+		ExpectContinueTimeout: env.Current.Upstream.ExpectContinueTimeout,
+		ResponseHeaderTimeout: env.Current.Upstream.ResponseHeaderTimeout,
 	},
 }
 
@@ -187,16 +187,12 @@ func writeCreateVBucketError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrVBucketAccessDenied):
 		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 	default:
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create bucket")
+		writeResolverError(w, err, false)
 	}
 }
 
 func writeListVBucketsError(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrVBucketAccessDenied) {
-		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-		return
-	}
-	writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to list buckets")
+	writeResolverError(w, err, false)
 }
 
 func proxyS3Request(w http.ResponseWriter, r *http.Request) {
@@ -299,6 +295,10 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 
 	if err := writeVirtualizedUpstreamResponse(w, r, resp, plan, vbConfig, normalizedPrefix); err != nil {
 		logger.Error().Err(err).Msg("failed to virtualize upstream response")
+		// Returning normally would turn a failed chunked stream into clean EOF.
+		if errors.Is(err, http.ErrAbortHandler) {
+			panic(http.ErrAbortHandler)
+		}
 	}
 }
 

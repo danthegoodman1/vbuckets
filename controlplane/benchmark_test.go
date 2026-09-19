@@ -46,3 +46,20 @@ func BenchmarkBaseDomainLongestSuffix(b *testing.B) {
 		}
 	}
 }
+
+// Measures the real ready-state locks added around request resolution, separate
+// from the HTTP benchmark's stub resolver and without a concurrent writer.
+func BenchmarkReadyResolutionStamp(b *testing.B) {
+	c := newTestClientWithFake(&fakeControlPlaneClient{})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		stamp, err := c.BeginResolution()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := c.ValidateResolution(stamp); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

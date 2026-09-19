@@ -513,6 +513,15 @@ func validateOperationHeaders(r *http.Request) error {
 }
 
 func validateHeadersForOperation(r *http.Request, kind S3OperationKind) error {
+	for _, connection := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(connection, ",") {
+			name := http.CanonicalHeaderKey(strings.TrimSpace(token))
+			if safeOutboundRequestHeader(name, kind) || name == "Authorization" || name == "Host" || name == "Content-Length" {
+				return fmt.Errorf("Connection must not nominate end-to-end header %q", name)
+			}
+		}
+	}
+
 	allowPutHeaders := kind == operationPutObject || kind == operationCopyObject || kind == operationCreateMultipartUpload
 	allowACL := allowPutHeaders || kind == operationPutObjectACL
 	if err := validateChecksumHeadersForOperation(r.Header, kind); err != nil {

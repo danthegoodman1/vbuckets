@@ -45,11 +45,26 @@ func mustParseTestPolicy(policyJSON string) *iam.Policy {
 }
 
 type testResolver struct {
+	begin       func() (ResolutionStamp, error)
+	validate    func(ResolutionStamp) error
 	credentials func(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
 	baseHost    func(ctx context.Context, hostname string) (string, bool, error)
 	vbucket     func(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
 	create      func(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error
 	list        func(ctx context.Context, accessKeyID string) ([]ListedVBucket, error)
+}
+
+func (r *testResolver) BeginResolution() (ResolutionStamp, error) {
+	if r.begin != nil {
+		return r.begin()
+	}
+	return ResolutionStamp{}, nil
+}
+func (r *testResolver) ValidateResolution(stamp ResolutionStamp) error {
+	if r.validate != nil {
+		return r.validate(stamp)
+	}
+	return nil
 }
 
 func (r *testResolver) LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error) {
@@ -76,7 +91,7 @@ func newTestResolver() *testResolver {
 	return &testResolver{
 		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
 			if accessKeyID != testAccessKey {
-				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+				return nil, ErrResolverNotFound
 			}
 			return &VirtualCredentials{SecretKey: testSecretKey, IAMPolicy: testAllowAllPolicy}, nil
 		},
@@ -546,10 +561,10 @@ func TestSigV4_RawSigner_UnknownAccessKey(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_RequestTimeTooSkewed(t *testing.T) {
-	oldSkew := env.SigV4MaxClockSkew
-	env.SigV4MaxClockSkew = 15 * time.Minute
+	oldSkew := env.Current.S3.SigV4MaxClockSkew
+	env.Current.S3.SigV4MaxClockSkew = 15 * time.Minute
 	t.Cleanup(func() {
-		env.SigV4MaxClockSkew = oldSkew
+		env.Current.S3.SigV4MaxClockSkew = oldSkew
 	})
 
 	resolver := newTestResolver()
@@ -569,10 +584,10 @@ func TestSigV4_RawSigner_RequestTimeTooSkewed(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_ConfigurableClockSkew(t *testing.T) {
-	oldSkew := env.SigV4MaxClockSkew
-	env.SigV4MaxClockSkew = time.Hour
+	oldSkew := env.Current.S3.SigV4MaxClockSkew
+	env.Current.S3.SigV4MaxClockSkew = time.Hour
 	t.Cleanup(func() {
-		env.SigV4MaxClockSkew = oldSkew
+		env.Current.S3.SigV4MaxClockSkew = oldSkew
 	})
 
 	resolver := newTestResolver()

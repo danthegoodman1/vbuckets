@@ -25,9 +25,15 @@ var (
 	ErrVBucketAccessDenied      = errors.New("vbucket access denied")
 )
 
-// Resolver provides the three lookups the proxy needs. Implemented by
-// controlplane.Client; tests can supply a lightweight stub.
+// ResolutionStamp identifies one ready control-plane view. It owns no resources.
+type ResolutionStamp struct{ Revision, Epoch uint64 }
+
+// Resolver provides a ready-state stamp, lookups, and control-plane operations.
+// ValidateResolution must reject a stamp after any observed revision or ready
+// epoch change. A successful validation is the request authorization boundary.
 type Resolver interface {
+	BeginResolution() (ResolutionStamp, error)
+	ValidateResolution(ResolutionStamp) error
 	LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
 	LookupBaseHost(ctx context.Context, hostname string) (string, bool, error)
 	LookupVBucket(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)

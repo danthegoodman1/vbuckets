@@ -25,7 +25,14 @@ type controlPlaneDialConfig struct {
 }
 
 func controlPlaneDialConfigFromEnv() controlPlaneDialConfig {
-	return controlPlaneDialConfig{SecurityMode: env.ControlPlaneSecurityMode, TLSCAFile: env.ControlPlaneTLSCAFile, TLSServerName: env.ControlPlaneTLSServerName, TLSCertFile: env.ControlPlaneTLSCertFile, TLSKeyFile: env.ControlPlaneTLSKeyFile, BearerToken: env.ControlPlaneAuthBearerToken}
+	return controlPlaneDialConfig{SecurityMode: env.Current.ControlPlane.SecurityMode, TLSCAFile: env.Current.ControlPlane.TLSCAFile, TLSServerName: env.Current.ControlPlane.TLSServerName, TLSCertFile: env.Current.ControlPlane.TLSCertFile, TLSKeyFile: env.Current.ControlPlane.TLSKeyFile, BearerToken: env.Current.ControlPlane.AuthBearerToken}
+}
+
+// ValidateTransportConfig checks certificate files before the binary starts its
+// listeners. Reconnects still reload them to allow credential rotation.
+func ValidateTransportConfig() error {
+	_, err := buildDialOptions(controlPlaneDialConfigFromEnv())
+	return err
 }
 
 func normalizeSecurityMode(mode string) string {

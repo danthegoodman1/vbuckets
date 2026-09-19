@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/danthegoodman1/vbuckets/iam"
 	"github.com/rs/zerolog"
 )
 
@@ -69,12 +68,13 @@ func getS3OperationPlan(ctx context.Context) *S3OperationPlan {
 }
 
 // S3Auth returns middleware that handles AWS SigV4 verification and virtual
-// bucket resolution. On success it stores the resolved VBucketConfig, AuthInfo,
-// bucket name, object key, and buffered body in the request context.
+// bucket resolution. On success it stores the mapping, identity, and validated
+// operation plan in the request context.
 //
 // The ordering is intentional: credentials are looked up and the signature is
 // verified before any bucket resolution or config lookup. This keeps the two
-// concerns independent so they can be cached with different strategies later.
+// concerns independent. The final revision/epoch check completes authorization
+// immediately before dispatch; later invalidations do not cancel active streams.
 func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,14 +101,21 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				return
 			}
 
+			stamp, err := resolver.BeginResolution()
+			if err != nil {
+				writeResolverError(w, err, false)
+				return
+			}
+
 			virtualCreds, err := resolver.LookupCredentials(r.Context(), authInfo.AccessKeyID)
 			if err != nil {
 				logger.Warn().Msg("credential lookup failed")
-				if errors.Is(err, iam.ErrInvalidPolicy) {
-					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-					return
-				}
-				writeS3Error(w, http.StatusForbidden, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
+				writeResolverError(w, err, true)
+				return
+			}
+
+			if virtualCreds == nil {
+				writeResolverError(w, ErrResolverInvalidResponse, true)
 				return
 			}
 
@@ -139,7 +146,7 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 			bucket, objectKey, isVHost, err := resolveBucket(resolver, r)
 			if err != nil {
 				logger.Warn().Err(err).Msg("bucket resolution failed")
-				writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to resolve bucket")
+				writeResolverError(w, err, false)
 				return
 			}
 			if bucket != "" && !isValidBucketName(bucket) {
@@ -162,52 +169,29 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 				}
 			}
 
-			if plan.kind == operationListBuckets {
-				plan = plan.withAuthorizationContext("", time.Now().UTC())
-				if err := AuthorizeS3Plan(virtualCreds.IAMPolicy, plan); err != nil {
-					logger.Warn().Err(err).Msg("IAM permission check failed")
-					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-					return
-				}
-
-				ctx := withS3RequestContext(r.Context(), nil, authInfo, plan)
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
-
-			if bucket == "" {
-				writeS3Error(w, http.StatusBadRequest, "InvalidBucketName", "Could not determine bucket name")
-				return
-			}
-
-			if plan.kind == operationCreateBucket {
-				locationConstraint, err := parseCreateBucketLocationConstraint(r.Body)
+			var vbConfig *VBucketConfig
+			locationConstraint := ""
+			switch plan.kind {
+			case operationListBuckets:
+				// The control-plane list needs no bucket mapping.
+			case operationCreateBucket:
+				locationConstraint, err = parseCreateBucketLocationConstraint(r.Body)
 				if err != nil {
 					logger.Warn().Err(err).Msg("failed to parse CreateBucketConfiguration")
 					writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid CreateBucketConfiguration")
 					return
 				}
 				plan = plan.withRequestMetadata(isVHost, locationConstraint)
-				plan = plan.withAuthorizationContext(locationConstraint, time.Now().UTC())
-				if err := AuthorizeS3Plan(virtualCreds.IAMPolicy, plan); err != nil {
-					logger.Warn().Err(err).Msg("IAM permission check failed")
-					writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+			default:
+				vbConfig, err = resolver.LookupVBucket(r.Context(), authInfo.AccessKeyID, bucket)
+				if err != nil {
+					logger.Warn().Msg("vbucket lookup failed")
+					writeResolverError(w, err, false)
 					return
 				}
-
-				ctx := withS3RequestContext(r.Context(), nil, authInfo, plan)
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
 			}
 
-			vbConfig, err := resolver.LookupVBucket(r.Context(), authInfo.AccessKeyID, bucket)
-			if err != nil {
-				logger.Warn().Msg("vbucket lookup failed")
-				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-				return
-			}
-
-			plan = plan.withAuthorizationContext("", time.Now().UTC())
+			plan = plan.withAuthorizationContext(locationConstraint, time.Now().UTC())
 			if err := AuthorizeS3Plan(virtualCreds.IAMPolicy, plan); err != nil {
 				logger.Warn().Err(err).Msg("IAM permission check failed")
 				writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
@@ -215,6 +199,10 @@ func S3Auth(resolver Resolver) func(http.Handler) http.Handler {
 			}
 
 			ctx := withS3RequestContext(r.Context(), vbConfig, authInfo, plan)
+			if err := resolver.ValidateResolution(stamp); err != nil {
+				writeResolverError(w, err, false)
+				return
+			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

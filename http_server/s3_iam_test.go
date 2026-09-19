@@ -1029,7 +1029,7 @@ func TestS3Client_CopyObjectAllowedSameBucketCallsHandler(t *testing.T) {
 	assert.True(t, called)
 }
 
-func TestS3Auth_InvalidCredentialPolicyReturnsAccessDenied(t *testing.T) {
+func TestS3Auth_InvalidCredentialPolicyReturnsBadGateway(t *testing.T) {
 	resolver := newTestResolver()
 	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
 		return nil, fmt.Errorf("%w: cached policy is invalid", iam.ErrInvalidPolicy)
@@ -1044,15 +1044,15 @@ func TestS3Auth_InvalidCredentialPolicyReturnsAccessDenied(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	assert.Contains(t, string(body), "<Code>AccessDenied</Code>")
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Contains(t, string(body), "<Code>InternalError</Code>")
 	assert.NotContains(t, string(body), "InvalidAccessKeyId")
 }
 
 func TestS3Auth_UnknownAccessKeyStillReturnsInvalidAccessKey(t *testing.T) {
 	resolver := newTestResolver()
 	resolver.credentials = func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
-		return nil, errors.New("unknown access key")
+		return nil, ErrResolverNotFound
 	}
 
 	ts := newTestServer(t, resolver)

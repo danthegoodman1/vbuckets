@@ -1,0 +1,20 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/danthegoodman1/vbuckets/http_server
+cpu: Apple M3 Max
+BenchmarkS3AuthenticatedRequest//bucket/key         	  146397	      7872 ns/op	    6568 B/op	     111 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	  154472	      7797 ns/op	    6568 B/op	     111 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	  156250	      7833 ns/op	    6568 B/op	     111 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	  155254	      7754 ns/op	    6568 B/op	     111 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	  164060	      7492 ns/op	    6568 B/op	     111 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	  155786	      8323 ns/op	    6568 B/op	     110 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket/key         	  159208	      7804 ns/op	    6568 B/op	     111 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  132054	      8979 ns/op	    7832 B/op	     125 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  135290	      8808 ns/op	    7832 B/op	     124 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  140448	      8540 ns/op	    7832 B/op	     125 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  132511	      9017 ns/op	    7832 B/op	     125 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  134038	      8770 ns/op	    7832 B/op	     125 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  137354	      8837 ns/op	    7832 B/op	     125 allocs/op
+BenchmarkS3AuthenticatedRequest//bucket?list-type=2 	  135908	      8579 ns/op	    7832 B/op	     125 allocs/op
+PASS
+ok  	github.com/danthegoodman1/vbuckets/http_server	18.493s

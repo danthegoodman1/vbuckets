@@ -196,7 +196,7 @@ func NewClientWithOptions(url string, logger zerolog.Logger, opts ClientOptions)
 	c := &Client{
 		url: url, logger: logger.With().Str("component", "controlplane").Logger(), opts: opts,
 		state: StateStartup, lastTransition: now().UTC(), randFloat: rand.Float64, now: now,
-		baseHosts: make(map[string]uint64), baseHostMax: env.CacheMaxBaseHosts,
+		baseHosts: make(map[string]uint64), baseHostMax: env.Current.Cache.MaxBaseHosts,
 		barrierRequired: true,
 		resync:          make(chan struct{}, 1),
 		stateChanged:    make(chan struct{}, 1),

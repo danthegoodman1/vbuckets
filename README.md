@@ -76,7 +76,8 @@ every row. Ordinary HTTP content, range, and conditional headers are allowed
 where their HTTP method uses them, as are signed `x-amz-meta-*` object metadata
 headers. ACL/grant, tagging, copy, storage-class, and server-side-encryption
 headers affect an operation and are accepted only where called out below.
-Session tokens, KMS-specific and object-lock request forms, signed/checksummed
+`Connection` cannot nominate a forwarded end-to-end header: the origin must
+receive the header semantics that IAM approved. Session tokens, KMS-specific and object-lock request forms, signed/checksummed
 trailers, and SigV4 streaming chunks are rejected as unsupported.
 
 An empty-body row requires a zero content length and rejects chunked or
@@ -271,25 +272,63 @@ The enforced synchronization contract is:
   silence timeout bounds detection for *new* resolver decisions. Requests whose
   authorization already completed are not cancelled; because streaming HTTP
   read/write timeouts default to zero, their lifetime is not yet a hard-bounded
-  revocation interval. Healthy-control-plane resynchronization latency is
-  measured separately. Phase 4 must add request lifetime/cancellation policy
-  before claiming an end-to-end hard revocation bound.
+  revocation interval. There is no end-to-end hard revocation bound for an
+  already-authorized transfer.
 - Negative lookup results are revisioned and cached separately from service
   failures. Unavailable/internal responses are never converted into negatives.
 
-The watch must emit heartbeats more frequently than the 10-second silence
-timeout. A snapshot/replay or post-create catch-up must reach a valid barrier
-within the separate 30-second synchronization timeout; traffic cannot extend
-that absolute bound. Unary RPCs have a 2-second proxy-owned deadline. Reconnects
-use jittered exponential backoff from 250 ms to 30 seconds. These defaults are
-currently client options; Phase 4 moves them into validated process config.
+A request captures the ready global revision and epoch before resolving its
+credentials. After signature verification, bounded control-body parsing, mapping
+resolution, and IAM evaluation, it validates that same pair immediately before
+dispatch. This final check completes authorization for origin operations,
+CreateBucket, and ListBuckets. A change during resolution returns retryable 503;
+there is no automatic request replay. Reconnects retire the epoch even when the
+revision is unchanged. Changes observed after that boundary do not cancel the
+request or undo a confirmed CreateBucket success.
 
-`/hc` is process liveness. `/ready` returns 200 only in `ready` and otherwise
+A unary response ahead of the watch records the highest required revision and
+makes the proxy temporarily unready while the existing healthy stream catches
+up. The current lookup receives 503; the future payload is not cached. Even a
+malformed future payload retains its revision evidence. Exact global revision
+checks remain conservative: unrelated concurrent updates can also cause 503s,
+and sustained churn may exhaust a cold lookup's single retry. Per-key validity
+tracking is deferred until workload evidence justifies its complexity.
+
+The watch must emit heartbeats more frequently than the 10-second silence
+timeout. Snapshot/replay must reach its synchronization barrier, and live
+post-create or future-unary catch-up must reach its required revision, within
+the separate 30-second synchronization timeout; traffic cannot extend that
+absolute bound. Unary RPCs have a 2-second proxy-owned deadline. Reconnects use
+jittered exponential backoff from 250 ms to 30 seconds. These are `ClientOptions`
+defaults; the binary does not expose additional environment settings for them.
+
+Resolver not-found/permission results remain 403. Outages, synchronization
+changes, and deadlines return 503 `ServiceUnavailable`; miss admission rejection
+returns 503 `SlowDown`. Malformed control-plane data returns sanitized 502
+`InternalError`. Service errors are never negatively cached.
+
+Health endpoints use the separate administrative listener at `ADMIN_ADDRESS`
+(default `127.0.0.1:8081`); point deployment probes there. `/hc` is process
+liveness. `/ready` returns 200 only in `ready` and otherwise
 503 with one atomic JSON snapshot containing state, revision, cursor presence,
 `barrier_required`, required catch-up revision, last gap/disconnect reason,
 transition time, cache counts, last RPC status/latency, watch reconnects/gaps, cache
 hits/misses/negatives/evictions/coalescing, and separate rejected credential and
-vbucket misses.
+vbucket misses. The S3 listener reserves no administrative paths: virtual-hosted
+objects named `hc` and `ready` are ordinary signed S3 requests. Both listeners
+shut down on SIGINT/SIGTERM with one shared 30-second drain deadline.
+
+The supplied binary serves ordinary HTTP and has no inbound gRPC/h2c upgrade
+path or native TLS mode. `aws:SecureTransport` reflects the proxy's actual
+`r.TLS` connection state; it is false behind a TLS-terminating proxy forwarding
+plain HTTP. Forwarded transport headers remain unsupported and cannot assert
+that condition. Control-plane TLS settings below protect the outbound gRPC
+connection only.
+
+Object bodies retain bounded streaming copies. Origin read failures or late
+list-XML validation failures abort the downstream HTTP/1.1 connection or HTTP/2
+stream, so a truncated response cannot become a successful clean EOF. Failures
+detected before response headers commit still return sanitized 502 errors.
 
 ### Pre-release control-plane migration
 
@@ -318,9 +357,12 @@ misses have separate token-bucket and in-flight admission bounds (defaults:
 
 Production control-plane lookup/create/delta insertion validates and
 defensively clones mappings; the proxy revalidates values returned through the
-public `Resolver` interface as a fail-closed adapter boundary. A future domain
-API can replace this mutable DTO with an immutable validated mapping and remove
-the redundant hot-path parsing/cloning without weakening custom Resolver safety.
+public `Resolver` interface as a fail-closed adapter boundary. The active mapping
+validator, IAM schema, and token codec remain their single implementations;
+there is no parallel domain model. Custom resolvers must implement
+`BeginResolution` and `ValidateResolution` against their ready revision/epoch
+state and return the shared resolver error categories for correct HTTP retry
+semantics.
 
 ## Development toolchain
 
@@ -336,13 +378,24 @@ results.
 - `make proto-breaking` compares the API with `main` (override with
   `PROTO_BASELINE=<branch>`).
 - `make check` runs protobuf lint/drift/breaking gates and the full Go suite.
+  The pre-release migration above intentionally fails the breaking check against
+  legacy main; review that migration explicitly rather than treating the check
+  as passing.
+- See [PERFORMANCE.md](./PERFORMANCE.md) for measured main/branch deltas and scope.
 
 ### Configuration
+
+The binary loads supported settings once and validates them before starting any
+listener. Invalid duration/integer values, nonpositive capacities or mandatory
+timeouts, invalid listen addresses, contradictory TLS options, and unreadable
+TLS material stop startup. Only HTTP read/write timeouts may be zero to leave
+stream durations uncapped. There is no runtime environment reload.
 
 | Variable | Default | Description |
 |---|---|---|
 | `CONTROL_PLANE_URL` | (required) | gRPC address of the control plane (e.g. `localhost:9090`) |
 | `HTTP_ADDRESS` | `:8080` | Listen address for the HTTP/S3 proxy |
+| `ADMIN_ADDRESS` | `127.0.0.1:8081` | Separate health/readiness listener; use a reachable bind address for remote deployment probes |
 | `SIGV4_MAX_CLOCK_SKEW` | `15m` | Max allowed absolute skew for `X-Amz-Date` before returning `RequestTimeTooSkewed` |
 | `CACHE_MAX_CREDENTIALS` | `10000` | Max entries in the credentials cache |
 | `CACHE_MAX_BASE_HOSTS` | `10000` | Max entries in the watch-owned base-domain registry |
