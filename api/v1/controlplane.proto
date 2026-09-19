@@ -43,6 +43,9 @@ message LookupCredentialsRequest {
 message LookupCredentialsResponse {
   string secret_key = 1;
   // Required AWS IAM JSON identity policy for this virtual access key.
+  // Resources name virtual buckets/objects. All keys sharing a virtual bucket
+  // retain independent policies. Policy updates advance the global revision
+  // and emit a CredentialsDelta invalidation for this access key.
   string iam_policy_json = 2;
   google.protobuf.Duration ttl = 3;
   bool found = 4;
@@ -66,9 +69,11 @@ message LookupVBucketResponse {
   string real_access_key = 3;
   string real_secret_key = 4;
   string real_region = 5;
-  // The control plane owns namespace allocation. For mappings sharing a real
-  // endpoint and bucket, path_prefix values must be normalized and pairwise
+  // The control plane owns namespace allocation. Distinct virtual buckets
+  // sharing a real endpoint/bucket need normalized path_prefix values, pairwise
   // non-overlapping; an empty prefix reserves the whole real bucket exclusively.
+  // Multiple access keys for the SAME virtual bucket share its namespace and
+  // routing_token_key; each key's IAM policy is enforced independently.
   string path_prefix = 6;
   bool real_use_path_style = 7;
   google.protobuf.Duration ttl = 8;

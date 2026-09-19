@@ -200,6 +200,18 @@ the incoming request:
   resource policies, session policies, object-tag condition keys, and KMS
   enforcement are rejected or denied.
 
+One effective policy belongs to each virtual access key. The same key can have
+different permissions on different virtual buckets, and multiple keys can share
+one virtual bucket with different permissions. Bucket inventory and storage
+mapping remain control-plane responsibilities. `ListAllMyBuckets` authorizes the
+listing operation; its results come from the control plane's per-key inventory,
+not from guessing which bucket names might match arbitrary IAM statements.
+
+See the [per-key provisioning guide and executable policy examples](examples/iam/README.md).
+`TestPerKeyIAMConformance` exercises both example policies through the real
+HTTP/gRPC/watch/cache path, including warmed-cache updates and origin-call
+assertions for denied requests. It runs in the short and race suites.
+
 ## Control plane
 
 vbuckets connects to a user-provided gRPC control plane service to resolve credentials, bucket mappings, and base hosts. The proto definition is in `api/v1/controlplane.proto`.
@@ -225,9 +237,11 @@ positive `ttl`; `found=false` forbids positive fields and requires a positive
 request minimum; routing is loaded later through `LookupVBucket` after the watch
 catches up.
 
-The control plane owns real namespace allocation. Mappings that share a real
-endpoint and real bucket MUST use normalized, pairwise non-overlapping path
-prefixes; an empty prefix reserves that real bucket exclusively. Each mapping
+The control plane owns real namespace allocation. Distinct virtual buckets that
+share a real endpoint and real bucket MUST use normalized, pairwise
+non-overlapping path prefixes; an empty prefix reserves that real bucket
+exclusively. Multiple access keys for the same virtual bucket share that bucket's
+namespace and routing-token key while keeping independent IAM policies. Each mapping
 also carries a required persisted 32-byte random `routing_token_key`. Replicas
 must return the same key across lookups, restarts, and upstream credential
 rotation while the real endpoint/bucket/prefix namespace is unchanged. The

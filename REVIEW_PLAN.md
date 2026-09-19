@@ -188,3 +188,40 @@ Status ledger:
 | Complete | Work | 5D: Post-implementation simplification pass | `S3Auth` now has one authorization/freshness/dispatch path; unused custom request-ID middleware removed; `go mod tidy` only demotes UUID to indirect. Full and race suites pass before and after this pass. |
 | Complete | Test | 5T: Full suite, race checks, and vet | After simplification: `go test ./... -count=1` (including Garage Docker integration), `go test -race ./... -short -count=1`, `go vet ./...`, and `make proto-check` pass. `make proto-breaking` intentionally reports the documented legacy v1 migration against main. |
 | Complete | Gate | 5G: Scoped fixes verified; deferred work remains explicit | F1–F5/F7/F8 corrected regressions pass; same-stream F6 catch-up passes; remaining churn limitation documented. Final measurements and qualification are in `PERFORMANCE.md`. |
+
+## Phase 6: Prove Per-Key IAM and Document Provisioning
+
+Goal:
+Make the existing per-access-key enforcement explicit and verifiable for shared
+vbuckets, without adding another policy engine or authorization RPC.
+
+Scope:
+- Reuse the existing credential policy field, compiled evaluator, caches, and
+  revisioned invalidation. Give the integration fixture separate identities and
+  bucket inventories, and share its production HTTP/gRPC harness with Garage.
+- Add executable policy examples and a control-plane provisioning/update
+  contract. The production policy store and issuer are external to this repo;
+  the in-memory single-watch fixture is not a production control-plane service.
+- Prove independent key permissions, virtual resource scope, compound actions,
+  and replacement of a warmed policy through the real watch.
+
+Completion gate:
+Denials occur before any origin call; keys sharing a vbucket retain independent
+policies; an observed update retires the old policy; documentation explains
+atomic persistence/publication and the existing revocation limits. No new
+runtime authorization machinery or wire API is introduced.
+
+Testing plan:
+Run the conformance test in the short/race suites, retain Garage coverage, and
+verify generated-code consistency and compatibility with the previous PR head.
+Deliberately bypass IAM in an isolated copy to confirm the tests detect it.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 6A: Multi-key and multi-bucket enforcement proof | `TestPerKeyIAMConformance` exercises two policies from `examples/iam/*.json`, initial/warm credentials, explicit deny, prefixes, copy source/destination, multipart, ACL/tagging, and per-key bucket inventory. Denied requests assert zero origin calls. |
+| Complete | Work | 6B: Live policy replacement | The conformance test updates the fixture policy and revision atomically, observes the real watch invalidation, asserts exactly one credential reload for the changed key, retains the other key's cache, and restores access. Invalid updates preserve the old policy and revision. |
+| Complete | Doc | 6C: Provisioning and shared namespace contract | `examples/iam/README.md`, main README, and proto comments explain one effective policy per key, virtual resource names, shared mappings for keys of one vbucket, durable publication, separate bucket inventory, and revocation limits. Production storage remains external. |
+| Complete | Test | 6T: Regression, race, and protocol gates | `go test ./... -count=1` (Garage included), `go test -race ./... -short -count=1`, `go vet ./...`, and `make proto-check` pass. Compatibility against the prior `architecture-hardening` commit (`efeaea2`) passes; generated changes are comments only. |
+| Complete | Gate | 6G: Existing enforcement verified without another runtime layer | Runtime request code and protobuf fields/RPCs are unchanged. A temporary copy with the IAM check bypassed fails the new conformance test because forbidden requests return 200, demonstrating that origin behavior cannot conceal missing proxy enforcement. |

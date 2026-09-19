@@ -85,6 +85,9 @@ type LookupCredentialsResponse struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	SecretKey string                 `protobuf:"bytes,1,opt,name=secret_key,json=secretKey,proto3" json:"secret_key,omitempty"`
 	// Required AWS IAM JSON identity policy for this virtual access key.
+	// Resources name virtual buckets/objects. All keys sharing a virtual bucket
+	// retain independent policies. Policy updates advance the global revision
+	// and emit a CredentialsDelta invalidation for this access key.
 	IamPolicyJson string               `protobuf:"bytes,2,opt,name=iam_policy_json,json=iamPolicyJson,proto3" json:"iam_policy_json,omitempty"`
 	Ttl           *durationpb.Duration `protobuf:"bytes,3,opt,name=ttl,proto3" json:"ttl,omitempty"`
 	Found         bool                 `protobuf:"varint,4,opt,name=found,proto3" json:"found,omitempty"`
@@ -237,9 +240,11 @@ type LookupVBucketResponse struct {
 	RealAccessKey string                 `protobuf:"bytes,3,opt,name=real_access_key,json=realAccessKey,proto3" json:"real_access_key,omitempty"`
 	RealSecretKey string                 `protobuf:"bytes,4,opt,name=real_secret_key,json=realSecretKey,proto3" json:"real_secret_key,omitempty"`
 	RealRegion    string                 `protobuf:"bytes,5,opt,name=real_region,json=realRegion,proto3" json:"real_region,omitempty"`
-	// The control plane owns namespace allocation. For mappings sharing a real
-	// endpoint and bucket, path_prefix values must be normalized and pairwise
+	// The control plane owns namespace allocation. Distinct virtual buckets
+	// sharing a real endpoint/bucket need normalized path_prefix values, pairwise
 	// non-overlapping; an empty prefix reserves the whole real bucket exclusively.
+	// Multiple access keys for the SAME virtual bucket share its namespace and
+	// routing_token_key; each key's IAM policy is enforced independently.
 	PathPrefix       string               `protobuf:"bytes,6,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"`
 	RealUsePathStyle bool                 `protobuf:"varint,7,opt,name=real_use_path_style,json=realUsePathStyle,proto3" json:"real_use_path_style,omitempty"`
 	Ttl              *durationpb.Duration `protobuf:"bytes,8,opt,name=ttl,proto3" json:"ttl,omitempty"`
