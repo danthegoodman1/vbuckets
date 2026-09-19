@@ -1,8 +1,10 @@
 package http_server
 
 import (
+	"bytes"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -23,16 +25,17 @@ var proxyClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   env.UpstreamDialTimeout,
+			Timeout:   env.Current.Upstream.DialTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          env.UpstreamMaxIdleConns,
-		MaxIdleConnsPerHost:   env.UpstreamMaxIdleConnsPerHost,
-		IdleConnTimeout:       env.UpstreamIdleConnTimeout,
-		TLSHandshakeTimeout:   env.UpstreamTLSHandshakeTimeout,
-		ExpectContinueTimeout: env.UpstreamExpectContinueTimeout,
-		ResponseHeaderTimeout: env.UpstreamResponseHeaderTimeout,
+		DisableCompression:    true,
+		MaxIdleConns:          env.Current.Upstream.MaxIdleConns,
+		MaxIdleConnsPerHost:   env.Current.Upstream.MaxIdleConnsPerHost,
+		IdleConnTimeout:       env.Current.Upstream.IdleConnTimeout,
+		TLSHandshakeTimeout:   env.Current.Upstream.TLSHandshakeTimeout,
+		ExpectContinueTimeout: env.Current.Upstream.ExpectContinueTimeout,
+		ResponseHeaderTimeout: env.Current.Upstream.ResponseHeaderTimeout,
 	},
 }
 
@@ -47,10 +50,15 @@ func RegisterS3Routes(resolver Resolver) RegisterRoutes {
 
 func handleS3Request(resolver Resolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		switch getS3Operation(r.Context()) {
-		case s3OperationCreateBucket:
+		plan := getS3OperationPlan(r.Context())
+		if plan == nil {
+			writeS3Error(w, http.StatusInternalServerError, "InternalError", "Missing validated S3 operation plan")
+			return
+		}
+		switch plan.kind {
+		case operationCreateBucket:
 			handleCreateVBucket(resolver, w, r)
-		case s3OperationListBuckets:
+		case operationListBuckets:
 			handleListVBuckets(resolver, w, r)
 		default:
 			proxyS3Request(w, r)
@@ -63,7 +71,7 @@ func handleCreateVBucket(resolver Resolver, w http.ResponseWriter, r *http.Reque
 	bucket := getBucketName(r.Context())
 	locationConstraint := getCreateLocationConstraint(r.Context())
 
-	if _, err := resolver.CreateVBucket(r.Context(), authInfo.AccessKeyID, bucket, locationConstraint); err != nil {
+	if err := resolver.CreateVBucket(r.Context(), authInfo.AccessKeyID, bucket, locationConstraint); err != nil {
 		writeCreateVBucketError(w, err)
 		return
 	}
@@ -78,6 +86,7 @@ func handleCreateVBucket(resolver Resolver, w http.ResponseWriter, r *http.Reque
 }
 
 func handleListVBuckets(resolver Resolver, w http.ResponseWriter, r *http.Request) {
+	logger := zerolog.Ctx(r.Context())
 	authInfo := getAuthInfo(r.Context())
 	buckets, err := resolver.ListVBuckets(r.Context(), authInfo.AccessKeyID)
 	if err != nil {
@@ -92,16 +101,41 @@ func handleListVBuckets(resolver Resolver, w http.ResponseWriter, r *http.Reques
 			DisplayName: authInfo.AccessKeyID,
 		},
 	}
+	seen := make(map[string]struct{}, len(buckets))
 	for _, bucket := range buckets {
+		if !isValidBucketName(bucket.Name) {
+			logger.Error().Msg("control plane returned an invalid virtual bucket name")
+			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket listing")
+			return
+		}
+		if bucket.CreationDate.IsZero() {
+			logger.Error().Msg("control plane returned a missing virtual bucket creation date")
+			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket listing")
+			return
+		}
+		if _, duplicate := seen[bucket.Name]; duplicate {
+			logger.Error().Msg("control plane returned a duplicate virtual bucket name")
+			writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid control-plane bucket listing")
+			return
+		}
+		seen[bucket.Name] = struct{}{}
 		result.Buckets.Buckets = append(result.Buckets.Buckets, listBucketEntry{
 			Name:         bucket.Name,
 			CreationDate: formatS3CreationDate(bucket.CreationDate),
 		})
 	}
 
+	var payload bytes.Buffer
+	if err := xml.NewEncoder(&payload).Encode(result); err != nil {
+		logger.Error().Err(err).Msg("failed to encode virtual bucket listing")
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to list buckets")
+		return
+	}
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
-	_ = xml.NewEncoder(w).Encode(result)
+	if _, err := w.Write(payload.Bytes()); err != nil {
+		logger.Warn().Err(err).Msg("client disconnected while writing virtual bucket listing")
+	}
 }
 
 const s3XMLNamespace = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -153,61 +187,83 @@ func writeCreateVBucketError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrVBucketAccessDenied):
 		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 	default:
-		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to create bucket")
+		writeResolverError(w, err, false)
 	}
 }
 
 func writeListVBucketsError(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrVBucketAccessDenied) {
-		writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-		return
-	}
-	writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to list buckets")
+	writeResolverError(w, err, false)
 }
 
 func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 	logger := zerolog.Ctx(r.Context())
 
 	vbConfig := getVBucketConfig(r.Context())
-	objectKey := getObjectKey(r.Context())
+	plan := getS3OperationPlan(r.Context())
+	if plan == nil {
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Missing validated S3 operation plan")
+		return
+	}
+	var err error
+	vbConfig, err = NormalizeVBucketConfig(vbConfig)
+	if err != nil {
+		logger.Error().Err(err).Msg("invalid upstream mapping")
+		writeS3Error(w, http.StatusBadGateway, "InternalError", "Invalid upstream S3 mapping")
+		return
+	}
+	objectKey := plan.objectKey
+	requestTransform, err := classifyS3RequestTransform(plan.kind)
+	if err != nil {
+		logger.Error().Err(err).Msg("missing S3 request transform")
+		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Unsupported upstream request transform")
+		return
+	}
 
 	var normalizedPrefix string
 	if vbConfig.PathPrefix != "" {
 		normalizedPrefix = strings.TrimSuffix(vbConfig.PathPrefix, "/") + "/"
 	}
 
-	listRewrite := normalizedPrefix != "" && isListObjectsRequest(r.Method, objectKey, r.URL.RawQuery)
-
-	// For non-list requests, prepend the prefix to the object key in the path.
-	// For list requests, the prefix goes into the query parameters instead.
-	if normalizedPrefix != "" && !listRewrite {
+	// Bucket operations always stay at the real bucket root. Object operations
+	// put the tenant prefix in the path; list operations put it only in the
+	// operation's key-bearing query fields.
+	if normalizedPrefix != "" && requestTransform == requestTransformObjectPath {
 		objectKey = normalizedPrefix + objectKey
 	}
 
-	rawQuery := r.URL.RawQuery
-	if listRewrite {
-		rawQuery = rewriteListQueryForPrefix(rawQuery, normalizedPrefix)
+	rawQuery, err := rewriteOutboundQuery(plan.kind, plan.rawQuery, normalizedPrefix, requestTransform == requestTransformListQuery, vbConfig)
+	if err != nil {
+		logger.Warn().Err(err).Msg("invalid virtual continuation token")
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid continuation token")
+		return
 	}
 
 	outboundURL := buildOutboundURL(vbConfig, objectKey, rawQuery)
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outboundURL, r.Body)
+	body := r.Body
+	if plan.bodyKind == bodyCompleteMultipartXML {
+		body = io.NopCloser(bytes.NewReader(plan.controlBody))
+	}
+	outReq, err := http.NewRequestWithContext(r.Context(), plan.method, outboundURL, body)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create outbound request")
 		writeS3Error(w, http.StatusInternalServerError, "InternalError", "Failed to construct upstream request")
 		return
 	}
-	outReq.ContentLength = r.ContentLength
+	outReq.ContentLength = plan.contentLength
 
-	copyHeaders(r.Header, outReq.Header)
-	if isCopyObjectRequest(r) {
-		copySource, err := rewriteCopySource(r.Header.Get(copySourceHeader), getBucketName(r.Context()), vbConfig, normalizedPrefix)
-		if err != nil {
-			logger.Warn().Err(err).Msg("failed to rewrite copy source")
-			writeS3Error(w, http.StatusForbidden, "AccessDenied", "Access Denied")
-			return
+	copyOutboundRequestHeaders(plan.forwardHeaders, outReq.Header, plan.kind)
+	if plan.kind == operationCopyObject {
+		source := plan.copySource
+		versionID := source.VersionID
+		if versionID != "" {
+			versionID, err = decodeOpaqueToken(vbConfig, "version", versionID)
+			if err != nil {
+				writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "Invalid source version token")
+				return
+			}
 		}
-		outReq.Header.Set(copySourceHeader, copySource)
+		outReq.Header.Set(copySourceHeader, buildCopySource(vbConfig.RealBucket, normalizedPrefix+source.Key, versionID))
 	}
 
 	endpointHost := parseEndpoint(vbConfig.RealEndpoint).Host
@@ -224,9 +280,9 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 	signRequest(outReq, vbConfig.RealAccessKey, vbConfig.RealSecretKey, vbConfig.RealRegion)
 
 	logger.Debug().
-		Str("method", outReq.Method).
-		Str("url", outReq.URL.String()).
+		Str("operation", string(plan.kind)).
 		Str("host", outReq.Host).
+		Bool("pathStyle", vbConfig.RealUsePathStyle).
 		Msg("forwarding request to real S3")
 
 	resp, err := proxyClient.Do(outReq)
@@ -237,22 +293,38 @@ func proxyS3Request(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// For list responses, rewrite the XML body to strip the path prefix
-	// from keys and replace the real bucket name with the virtual one.
-	if listRewrite && resp.StatusCode == http.StatusOK {
-		copyHeaders(resp.Header, w.Header())
-		w.Header().Del("Content-Length")
-		w.WriteHeader(resp.StatusCode)
-		if err := rewriteListResponse(resp.Body, w, normalizedPrefix, getBucketName(r.Context()), listResponseUsesURLEncoding(r.URL.RawQuery)); err != nil {
-			logger.Error().Err(err).Msg("failed to rewrite list response")
+	if err := writeVirtualizedUpstreamResponse(w, r, resp, plan, vbConfig, normalizedPrefix); err != nil {
+		logger.Error().Err(err).Msg("failed to virtualize upstream response")
+		// Returning normally would turn a failed chunked stream into clean EOF.
+		if errors.Is(err, http.ErrAbortHandler) {
+			panic(http.ErrAbortHandler)
 		}
-		return
 	}
+}
 
-	copyHeaders(resp.Header, w.Header())
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		logger.Error().Err(err).Msg("failed to stream upstream response body")
+type s3RequestTransform uint8
+
+const (
+	requestTransformBucketRoot s3RequestTransform = iota + 1
+	requestTransformListQuery
+	requestTransformObjectPath
+)
+
+func classifyS3RequestTransform(kind S3OperationKind) (s3RequestTransform, error) {
+	switch kind {
+	case operationListBuckets, operationCreateBucket, operationHeadBucket:
+		return requestTransformBucketRoot, nil
+	case operationListObjects, operationListObjectsV2, operationListMultipartUploads:
+		return requestTransformListQuery, nil
+	case operationGetObject, operationHeadObject, operationGetObjectVersion,
+		operationHeadObjectVersion, operationPutObject, operationPutObjectACL,
+		operationPutObjectTagging, operationCopyObject, operationDeleteObject,
+		operationDeleteObjectVersion, operationCreateMultipartUpload,
+		operationUploadPart, operationListParts, operationCompleteMultipartUpload,
+		operationAbortMultipartUpload:
+		return requestTransformObjectPath, nil
+	default:
+		return 0, fmt.Errorf("no request transform for operation %q", kind)
 	}
 }
 
@@ -287,25 +359,48 @@ func buildOutboundURL(cfg *VBucketConfig, objectKey string, rawQuery string) str
 	return u.String()
 }
 
-// copyHeaders copies all headers from src to dst, excluding hop-by-hop headers.
-func copyHeaders(src, dst http.Header) {
-	hopByHop := map[string]bool{
-		"Connection":          true,
-		"Keep-Alive":          true,
-		"Proxy-Authenticate":  true,
-		"Proxy-Authorization": true,
-		"Te":                  true,
-		"Trailer":             true,
-		"Transfer-Encoding":   true,
-		"Upgrade":             true,
-	}
-
-	for key, vals := range src {
-		if hopByHop[key] {
+func copyOutboundRequestHeaders(src, dst http.Header, kind S3OperationKind) {
+	hopByHop := hopByHopHeaderSet(src)
+	for name, values := range src {
+		canonical := http.CanonicalHeaderKey(name)
+		if hopByHop[canonical] || !safeOutboundRequestHeader(canonical, kind) {
 			continue
 		}
-		for _, v := range vals {
-			dst.Add(key, v)
+		for _, value := range values {
+			dst.Add(canonical, value)
 		}
 	}
+}
+
+func safeOutboundRequestHeader(name string, kind S3OperationKind) bool {
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, "x-amz-") {
+		// The operation planner has already applied the exact per-operation
+		// x-amz-* allowlist before the immutable header snapshot is created.
+		return true
+	}
+	switch name {
+	case "Accept", "User-Agent":
+		return true
+	case "Accept-Encoding":
+		return operationReadsObject(kind)
+	default:
+		return objectReadHeaderAllowed(kind, name) || objectBodyHeaderAllowed(kind, name)
+	}
+}
+
+func hopByHopHeaderSet(headers http.Header) map[string]bool {
+	hopByHop := map[string]bool{
+		"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
+		"Proxy-Authorization": true, "Te": true, "Trailer": true,
+		"Transfer-Encoding": true, "Upgrade": true,
+	}
+	for _, connection := range headers.Values("Connection") {
+		for _, name := range strings.Split(connection, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				hopByHop[http.CanonicalHeaderKey(name)] = true
+			}
+		}
+	}
+	return hopByHop
 }

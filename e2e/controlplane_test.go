@@ -2,11 +2,10 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http/httptest"
-	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -18,54 +17,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/middleware"
-	"github.com/go-chi/chi/v5"
+	"github.com/danthegoodman1/vbuckets/internal/s3test"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	tcexec "github.com/testcontainers/testcontainers-go/exec"
-	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
 	"github.com/danthegoodman1/vbuckets/controlplane"
 	"github.com/danthegoodman1/vbuckets/http_server"
-	apiv1 "github.com/danthegoodman1/vbuckets/v1"
 )
 
-const garageToml = `
-rpc_bind_addr = "[::]:3901"
-rpc_public_addr = "127.0.0.1:3901"
-rpc_secret = "0000000000000000000000000000000000000000000000000000000000000000"
-
-metadata_dir = "/var/lib/garage/meta"
-data_dir = "/var/lib/garage/data"
-db_engine = "lmdb"
-
-replication_factor = 1
-compression_level = 2
-
-[s3_api]
-api_bind_addr = "[::]:3900"
-s3_region = "us-east-1"
-
-[s3_web]
-bind_addr = "[::]:3902"
-root_domain = ".s3-web.local"
-
-[admin]
-api_bind_addr = "[::]:3903"
-admin_token = "admin_token"
-`
-
 const (
-	garageAccessKey = "GK000000000000000000000001"
-	garageSecretKey = "dceca21654db35d95f9e8392b7abb2612a2814b11a733a1f0d904fdd585e7534"
-	garageBucket    = "e2e-bucket"
-
 	e2eVirtualAccessKey = "AKIAE2ETEST00000001"
 	e2eVirtualSecretKey = "e2e-test-secret-key-00000000000000000000"
 	e2eVirtualBucket    = "my-virtual-bucket"
@@ -73,134 +40,151 @@ const (
 
 const e2eAllowAllPolicyJSON = `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}`
 
-var hexIDPattern = regexp.MustCompile(`[0-9a-f]{16,}`)
+type testIdentity struct {
+	secret, policyJSON string
+	buckets            map[string]string // virtual name -> physical prefix; independent of IAM
+}
 
 type testControlPlane struct {
 	apiv1.UnimplementedControlPlaneServer
-	garageEndpoint string
-	policyJSON     string
-	mu             sync.Mutex
-	createdBuckets map[string]time.Time
+	originEndpoint    string
+	identities        map[string]*testIdentity
+	credentialLookups map[string]int
+	mu                sync.Mutex
+	createdBuckets    map[string]time.Time
+	revision          uint64
+	changes           chan *apiv1.WatchEvent
 }
 
 func (s *testControlPlane) LookupCredentials(_ context.Context, req *apiv1.LookupCredentialsRequest) (*apiv1.LookupCredentialsResponse, error) {
-	if req.AccessKeyId != e2eVirtualAccessKey {
-		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.credentialLookups == nil {
+		s.credentialLookups = make(map[string]int)
 	}
-	return &apiv1.LookupCredentialsResponse{
-		SecretKey:     e2eVirtualSecretKey,
-		IamPolicyJson: s.policyJSON,
-		Ttl:           durationpb.New(5 * time.Minute),
-	}, nil
-}
-
-func (s *testControlPlane) LookupBaseHost(_ context.Context, _ *apiv1.LookupBaseHostRequest) (*apiv1.LookupBaseHostResponse, error) {
-	return &apiv1.LookupBaseHostResponse{
-		Found: false,
-		Ttl:   durationpb.New(5 * time.Minute),
-	}, nil
+	s.credentialLookups[req.AccessKeyId]++
+	identity, found := s.identities[req.AccessKeyId]
+	if !found {
+		return &apiv1.LookupCredentialsResponse{Revision: s.revision, NegativeTtl: durationpb.New(time.Minute)}, nil
+	}
+	return &apiv1.LookupCredentialsResponse{SecretKey: identity.secret, IamPolicyJson: identity.policyJSON, Ttl: durationpb.New(5 * time.Minute), Found: true, Revision: s.revision}, nil
 }
 
 func (s *testControlPlane) LookupVBucket(_ context.Context, req *apiv1.LookupVBucketRequest) (*apiv1.LookupVBucketResponse, error) {
-	if req.AccessKeyId != e2eVirtualAccessKey {
-		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
-	}
-	if req.BucketName == e2eVirtualBucket {
-		return s.vbucketResponse("tenant-abc"), nil
-	}
-
 	s.mu.Lock()
-	_, found := s.createdBuckets[req.BucketName]
-	s.mu.Unlock()
-	if !found {
-		return nil, status.Errorf(codes.NotFound, "unknown bucket: %s", req.BucketName)
+	defer s.mu.Unlock()
+	if identity := s.identities[req.AccessKeyId]; identity != nil {
+		if prefix, found := identity.buckets[req.BucketName]; found {
+			return s.vbucketResponse(prefix, s.revision), nil
+		}
 	}
-	return s.vbucketResponse("created/" + req.BucketName), nil
+	return &apiv1.LookupVBucketResponse{Revision: s.revision, NegativeTtl: durationpb.New(time.Minute)}, nil
 }
 
 func (s *testControlPlane) CreateVBucket(_ context.Context, req *apiv1.CreateVBucketRequest) (*apiv1.CreateVBucketResponse, error) {
-	if req.AccessKeyId != e2eVirtualAccessKey {
-		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if req.BucketName == e2eVirtualBucket {
-		return nil, status.Errorf(codes.AlreadyExists, "bucket already owned: %s", req.BucketName)
+	identity := s.identities[req.AccessKeyId]
+	if identity == nil {
+		return nil, status.Error(codes.NotFound, "unknown access key")
 	}
-	if _, exists := s.createdBuckets[req.BucketName]; exists {
-		return nil, status.Errorf(codes.AlreadyExists, "bucket already owned: %s", req.BucketName)
+	for _, other := range s.identities {
+		if _, found := other.buckets[req.BucketName]; found {
+			return nil, status.Error(codes.AlreadyExists, "bucket already exists")
+		}
 	}
 	s.createdBuckets[req.BucketName] = time.Now().UTC()
-
-	resp := s.vbucketResponse("created/" + req.BucketName)
-	return &apiv1.CreateVBucketResponse{
-		RealEndpoint:     resp.RealEndpoint,
-		RealBucket:       resp.RealBucket,
-		RealAccessKey:    resp.RealAccessKey,
-		RealSecretKey:    resp.RealSecretKey,
-		RealRegion:       resp.RealRegion,
-		PathPrefix:       resp.PathPrefix,
-		RealUsePathStyle: resp.RealUsePathStyle,
-		Ttl:              resp.Ttl,
-	}, nil
+	identity.buckets[req.BucketName] = "created/" + req.BucketName
+	s.revision++
+	s.changes <- &apiv1.WatchEvent{Revision: s.revision, Cursor: fmt.Sprintf("cursor-%d", s.revision), Event: &apiv1.WatchEvent_Vbucket{Vbucket: &apiv1.VBucketDelta{AccessKeyId: req.AccessKeyId, BucketName: req.BucketName}}}
+	return &apiv1.CreateVBucketResponse{Revision: s.revision}, nil
 }
 
 func (s *testControlPlane) ListVBuckets(_ context.Context, req *apiv1.ListVBucketsRequest) (*apiv1.ListVBucketsResponse, error) {
-	if req.AccessKeyId != e2eVirtualAccessKey {
-		return nil, status.Errorf(codes.NotFound, "unknown access key: %s", req.AccessKeyId)
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	resp := &apiv1.ListVBucketsResponse{
-		Buckets: []*apiv1.VBucketSummary{{
-			BucketName:   e2eVirtualBucket,
-			CreationDate: timestamppb.New(time.Unix(0, 0).UTC()),
-		}},
+	identity := s.identities[req.AccessKeyId]
+	if identity == nil {
+		return nil, status.Error(codes.NotFound, "unknown access key")
 	}
+	resp := &apiv1.ListVBucketsResponse{Revision: s.revision}
 	var names []string
-	for name := range s.createdBuckets {
+	for name := range identity.buckets {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		resp.Buckets = append(resp.Buckets, &apiv1.VBucketSummary{
-			BucketName:   name,
-			CreationDate: timestamppb.New(s.createdBuckets[name]),
-		})
+		created, found := s.createdBuckets[name]
+		if !found {
+			created = time.Unix(0, 0).UTC()
+		}
+		resp.Buckets = append(resp.Buckets, &apiv1.VBucketSummary{BucketName: name, CreationDate: timestamppb.New(created)})
 	}
 	return resp, nil
 }
 
-func (s *testControlPlane) vbucketResponse(pathPrefix string) *apiv1.LookupVBucketResponse {
+// Single-proxy test fixture only: the buffered channel stands in for the
+// production control plane's durable, broadcast revision log.
+func (s *testControlPlane) setPolicy(accessKey, policyJSON string) (uint64, error) {
+	if _, err := http_server.ParseS3IAMPolicyJSON(policyJSON); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity := s.identities[accessKey]
+	if identity == nil {
+		return 0, fmt.Errorf("unknown test access key")
+	}
+	identity.policyJSON = policyJSON
+	s.revision++
+	s.changes <- &apiv1.WatchEvent{Revision: s.revision, Cursor: fmt.Sprintf("cursor-%d", s.revision), Event: &apiv1.WatchEvent_Credentials{Credentials: &apiv1.CredentialsDelta{AccessKeyId: accessKey}}}
+	return s.revision, nil
+}
+
+func (s *testControlPlane) vbucketResponse(pathPrefix string, revision uint64) *apiv1.LookupVBucketResponse {
 	return &apiv1.LookupVBucketResponse{
-		RealEndpoint:     s.garageEndpoint,
-		RealBucket:       garageBucket,
-		RealAccessKey:    garageAccessKey,
-		RealSecretKey:    garageSecretKey,
-		RealRegion:       "us-east-1",
+		RealEndpoint:     s.originEndpoint,
+		RealBucket:       s3test.Bucket,
+		RealAccessKey:    s3test.AccessKey,
+		RealSecretKey:    s3test.SecretKey,
+		RealRegion:       s3test.Region,
 		PathPrefix:       pathPrefix,
 		RealUsePathStyle: true,
+		RoutingTokenKey:  []byte("0123456789abcdef0123456789abcdef"),
 		Ttl:              durationpb.New(5 * time.Minute),
+		Found:            true,
+		Revision:         revision,
 	}
 }
 
-func (s *testControlPlane) ListenForDeltas(_ *apiv1.ListenForDeltasRequest, stream apiv1.ControlPlane_ListenForDeltasServer) error {
-	<-stream.Context().Done()
-	return stream.Context().Err()
-}
-
-func garageCmd(t *testing.T, ctx context.Context, ctr testcontainers.Container, args ...string) string {
-	t.Helper()
-	cmd := append([]string{"/garage"}, args...)
-	code, reader, err := ctr.Exec(ctx, cmd, tcexec.Multiplexed())
-	require.NoError(t, err)
-	out, err := io.ReadAll(reader)
-	require.NoError(t, err)
-	require.Equalf(t, 0, code, "garage %v failed (exit %d): %s", args, code, string(out))
-	return string(out)
+func (s *testControlPlane) WatchState(_ *apiv1.WatchStateRequest, stream apiv1.ControlPlane_WatchStateServer) error {
+	s.mu.Lock()
+	revision := s.revision
+	s.mu.Unlock()
+	if err := stream.Send(&apiv1.WatchEvent{Revision: revision, Event: &apiv1.WatchEvent_SnapshotBegin{SnapshotBegin: &apiv1.SnapshotBegin{}}}); err != nil {
+		return err
+	}
+	cursor := fmt.Sprintf("cursor-%d", revision)
+	if err := stream.Send(&apiv1.WatchEvent{Revision: revision, Cursor: cursor, Event: &apiv1.WatchEvent_SynchronizationBarrier{SynchronizationBarrier: &apiv1.SynchronizationBarrier{}}}); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case event := <-s.changes:
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+			revision, cursor = event.Revision, event.Cursor
+		case <-ticker.C:
+			if err := stream.Send(&apiv1.WatchEvent{Revision: revision, Cursor: cursor, Event: &apiv1.WatchEvent_Heartbeat{Heartbeat: &apiv1.Heartbeat{}}}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 type e2eEnv struct {
@@ -208,7 +192,7 @@ type e2eEnv struct {
 	DirectClient *s3.Client
 }
 
-// setupE2E starts a Garage container, a gRPC control plane server, a real
+// setupE2E starts a S3Proxy container, a gRPC control plane server, a real
 // controlplane.Client, and the proxy HTTP server -- exercising the full
 // production code path.
 func setupE2E(t *testing.T) *e2eEnv {
@@ -218,71 +202,13 @@ func setupE2E(t *testing.T) *e2eEnv {
 func setupE2EWithPolicyJSON(t *testing.T, policyJSON string) *e2eEnv {
 	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	originEndpoint, directClient := s3test.Start(t)
 
-	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "dxflrs/garage:v2.1.0",
-			ExposedPorts: []string{"3900/tcp"},
-			Env:          map[string]string{"GARAGE_ALLOW_WORLD_READABLE_SECRETS": "true"},
-			Files: []testcontainers.ContainerFile{{
-				Reader:            strings.NewReader(garageToml),
-				ContainerFilePath: "/etc/garage.toml",
-				FileMode:          0o644,
-			}},
-			WaitingFor: wait.ForListeningPort("3900/tcp").WithStartupTimeout(60 * time.Second),
-		},
-		Started: true,
+	_, ts := setupControlPlaneProxy(t, &testControlPlane{
+		originEndpoint: originEndpoint,
+		identities:     map[string]*testIdentity{e2eVirtualAccessKey: {secret: e2eVirtualSecretKey, policyJSON: policyJSON, buckets: map[string]string{e2eVirtualBucket: "tenant-abc"}}},
+		createdBuckets: make(map[string]time.Time), revision: 1, changes: make(chan *apiv1.WatchEvent, 16),
 	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ctr.Terminate(context.Background())) })
-
-	statusOut := garageCmd(t, ctx, ctr, "status")
-	nodeID := hexIDPattern.FindString(statusOut)
-	require.NotEmpty(t, nodeID, "could not find node ID in garage status output:\n%s", statusOut)
-
-	garageCmd(t, ctx, ctr, "layout", "assign", nodeID, "--capacity", "100G", "-z", "local")
-	garageCmd(t, ctx, ctr, "layout", "apply", "--version", "1")
-	garageCmd(t, ctx, ctr, "key", "import", "--yes", "-n", "e2e-key", garageAccessKey, garageSecretKey)
-	garageCmd(t, ctx, ctr, "bucket", "create", garageBucket)
-	garageCmd(t, ctx, ctr, "bucket", "allow", garageBucket, "--key", "e2e-key", "--read", "--write", "--owner")
-
-	host, err := ctr.Host(ctx)
-	require.NoError(t, err)
-	mappedPort, err := ctr.MappedPort(ctx, "3900")
-	require.NoError(t, err)
-	garageEndpoint := "http://" + host + ":" + mappedPort.Port()
-
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	grpcServer := grpc.NewServer()
-	apiv1.RegisterControlPlaneServer(grpcServer, &testControlPlane{
-		garageEndpoint: garageEndpoint,
-		policyJSON:     policyJSON,
-		createdBuckets: make(map[string]time.Time),
-	})
-	go grpcServer.Serve(lis)
-	t.Cleanup(func() {
-		// Cancel context first so the ListenForDeltas stream unblocks,
-		// then GracefulStop can drain cleanly.
-		cancel()
-		grpcServer.GracefulStop()
-	})
-
-	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr})
-	cpClient := controlplane.NewClient(lis.Addr().String(), logger)
-	go cpClient.Run(ctx)
-
-	require.Eventually(t, func() bool {
-		_, err := cpClient.LookupCredentials(ctx, e2eVirtualAccessKey)
-		return err == nil
-	}, 10*time.Second, 100*time.Millisecond, "control plane client failed to connect")
-
-	r := chi.NewRouter()
-	http_server.RegisterS3Routes(cpClient)(r)
-	ts := httptest.NewServer(r)
-	t.Cleanup(ts.Close)
 
 	return &e2eEnv{
 		ProxyClient: s3.New(s3.Options{
@@ -296,15 +222,28 @@ func setupE2EWithPolicyJSON(t *testing.T, policyJSON string) *e2eEnv {
 				awsv4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
 			},
 		}),
-		DirectClient: s3.New(s3.Options{
-			Region: "us-east-1",
-			Credentials: credentials.NewStaticCredentialsProvider(
-				garageAccessKey, garageSecretKey, "",
-			),
-			BaseEndpoint: aws.String(garageEndpoint),
-			UsePathStyle: true,
-		}),
+		DirectClient: directClient,
 	}
+}
+
+// Shared by S3Proxy tests and the fast per-key conformance tests. The actual
+// Client, watch, caches, production HTTP wrapper, IAM, and proxy all run here.
+func setupControlPlaneProxy(t *testing.T, implementation *testControlPlane) (*controlplane.Client, *httptest.Server) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	apiv1.RegisterControlPlaneServer(server, implementation)
+	go server.Serve(lis)
+	ctx, cancel := context.WithCancel(t.Context())
+	cp := controlplane.NewClient(lis.Addr().String(), zerolog.Nop())
+	done := make(chan struct{})
+	go func() { defer close(done); cp.Run(ctx) }()
+	t.Cleanup(func() { cancel(); server.Stop(); <-done })
+	require.Eventually(t, cp.Ready, 5*time.Second, time.Millisecond, "control plane failed to synchronize")
+	proxy := httptest.NewServer(http_server.NewServer(":0", http_server.RegisterS3Routes(cp)).Handler)
+	t.Cleanup(proxy.Close)
+	return cp, proxy
 }
 
 func TestE2E_ControlPlane_PutAndGetObject(t *testing.T) {
@@ -338,7 +277,7 @@ func TestE2E_ControlPlane_PutAndGetObject(t *testing.T) {
 	assert.Equal(t, testBody, string(body))
 
 	directResult, err := e.DirectClient.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("tenant-abc/" + testKey),
 	})
 	require.NoError(t, err)
@@ -388,7 +327,7 @@ func TestE2E_ControlPlane_CopyObjectSameVirtualBucket(t *testing.T) {
 	assert.Equal(t, testBody, string(body))
 
 	directResult, err := e.DirectClient.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("tenant-abc/" + destKey),
 	})
 	require.NoError(t, err)
@@ -404,7 +343,7 @@ func TestE2E_ControlPlane_CopyObjectSameVirtualBucket(t *testing.T) {
 		CopySource: aws.String("other-virtual-bucket/" + sourceKey),
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "AccessDenied")
+	assert.Contains(t, err.Error(), "InvalidRequest")
 }
 
 func TestE2E_ControlPlane_ListObjectsPrefixIsolation(t *testing.T) {
@@ -429,14 +368,14 @@ func TestE2E_ControlPlane_ListObjectsPrefixIsolation(t *testing.T) {
 	}
 
 	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("other-tenant/secret.txt"),
 		Body:   strings.NewReader("should not be visible"),
 	})
 	require.NoError(t, err)
 
 	directList, err := e.DirectClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 	})
 	require.NoError(t, err)
 
@@ -507,7 +446,7 @@ func TestE2E_ControlPlane_IAMPolicyEnforcedBeforeProxy(t *testing.T) {
 	e := setupE2EWithPolicyJSON(t, policyJSON)
 
 	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("tenant-abc/read/existing.txt"),
 		Body:   strings.NewReader("readable"),
 	})

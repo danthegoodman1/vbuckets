@@ -20,11 +20,10 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	ControlPlane_LookupCredentials_FullMethodName = "/vbuckets.v1.ControlPlane/LookupCredentials"
-	ControlPlane_LookupBaseHost_FullMethodName    = "/vbuckets.v1.ControlPlane/LookupBaseHost"
 	ControlPlane_LookupVBucket_FullMethodName     = "/vbuckets.v1.ControlPlane/LookupVBucket"
 	ControlPlane_CreateVBucket_FullMethodName     = "/vbuckets.v1.ControlPlane/CreateVBucket"
 	ControlPlane_ListVBuckets_FullMethodName      = "/vbuckets.v1.ControlPlane/ListVBuckets"
-	ControlPlane_ListenForDeltas_FullMethodName   = "/vbuckets.v1.ControlPlane/ListenForDeltas"
+	ControlPlane_WatchState_FullMethodName        = "/vbuckets.v1.ControlPlane/WatchState"
 )
 
 // ControlPlaneClient is the client API for ControlPlane service.
@@ -36,15 +35,20 @@ const (
 // credentials and bucket mappings.
 type ControlPlaneClient interface {
 	LookupCredentials(ctx context.Context, in *LookupCredentialsRequest, opts ...grpc.CallOption) (*LookupCredentialsResponse, error)
-	LookupBaseHost(ctx context.Context, in *LookupBaseHostRequest, opts ...grpc.CallOption) (*LookupBaseHostResponse, error)
 	LookupVBucket(ctx context.Context, in *LookupVBucketRequest, opts ...grpc.CallOption) (*LookupVBucketResponse, error)
 	CreateVBucket(ctx context.Context, in *CreateVBucketRequest, opts ...grpc.CallOption) (*CreateVBucketResponse, error)
 	ListVBuckets(ctx context.Context, in *ListVBucketsRequest, opts ...grpc.CallOption) (*ListVBucketsResponse, error)
-	// ListenForDeltas opens a server-streaming RPC that pushes cache updates
-	// to the proxy. The control plane sends deltas whenever credentials, base
-	// hosts, or vbucket mappings change, allowing the proxy to maintain
-	// long-lived caches with fast invalidation.
-	ListenForDeltas(ctx context.Context, in *ListenForDeltasRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Delta], error)
+	// WatchState opens a revisioned synchronization stream. With an empty
+	// resume_cursor, or when a cursor can no longer be resumed, the server MUST
+	// send SnapshotBegin, the complete current base-host set, and
+	// SynchronizationBarrier before live changes. Credential and vbucket caches
+	// are bounded, cleared at SnapshotBegin, and repopulated on demand at or
+	// after the barrier revision; their complete contents are never snapshotted.
+	// With a valid cursor the server may replay contiguous changes followed by a
+	// SynchronizationBarrier. The proxy fails closed until the barrier is
+	// observed. The server MUST send Heartbeat frames often enough to satisfy
+	// the proxy's documented watch-silence timeout.
+	WatchState(ctx context.Context, in *WatchStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchEvent], error)
 }
 
 type controlPlaneClient struct {
@@ -59,16 +63,6 @@ func (c *controlPlaneClient) LookupCredentials(ctx context.Context, in *LookupCr
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LookupCredentialsResponse)
 	err := c.cc.Invoke(ctx, ControlPlane_LookupCredentials_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *controlPlaneClient) LookupBaseHost(ctx context.Context, in *LookupBaseHostRequest, opts ...grpc.CallOption) (*LookupBaseHostResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(LookupBaseHostResponse)
-	err := c.cc.Invoke(ctx, ControlPlane_LookupBaseHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -105,13 +99,13 @@ func (c *controlPlaneClient) ListVBuckets(ctx context.Context, in *ListVBucketsR
 	return out, nil
 }
 
-func (c *controlPlaneClient) ListenForDeltas(ctx context.Context, in *ListenForDeltasRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Delta], error) {
+func (c *controlPlaneClient) WatchState(ctx context.Context, in *WatchStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ControlPlane_ServiceDesc.Streams[0], ControlPlane_ListenForDeltas_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &ControlPlane_ServiceDesc.Streams[0], ControlPlane_WatchState_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[ListenForDeltasRequest, Delta]{ClientStream: stream}
+	x := &grpc.GenericClientStream[WatchStateRequest, WatchEvent]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -122,7 +116,7 @@ func (c *controlPlaneClient) ListenForDeltas(ctx context.Context, in *ListenForD
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ControlPlane_ListenForDeltasClient = grpc.ServerStreamingClient[Delta]
+type ControlPlane_WatchStateClient = grpc.ServerStreamingClient[WatchEvent]
 
 // ControlPlaneServer is the server API for ControlPlane service.
 // All implementations must embed UnimplementedControlPlaneServer
@@ -133,15 +127,20 @@ type ControlPlane_ListenForDeltasClient = grpc.ServerStreamingClient[Delta]
 // credentials and bucket mappings.
 type ControlPlaneServer interface {
 	LookupCredentials(context.Context, *LookupCredentialsRequest) (*LookupCredentialsResponse, error)
-	LookupBaseHost(context.Context, *LookupBaseHostRequest) (*LookupBaseHostResponse, error)
 	LookupVBucket(context.Context, *LookupVBucketRequest) (*LookupVBucketResponse, error)
 	CreateVBucket(context.Context, *CreateVBucketRequest) (*CreateVBucketResponse, error)
 	ListVBuckets(context.Context, *ListVBucketsRequest) (*ListVBucketsResponse, error)
-	// ListenForDeltas opens a server-streaming RPC that pushes cache updates
-	// to the proxy. The control plane sends deltas whenever credentials, base
-	// hosts, or vbucket mappings change, allowing the proxy to maintain
-	// long-lived caches with fast invalidation.
-	ListenForDeltas(*ListenForDeltasRequest, grpc.ServerStreamingServer[Delta]) error
+	// WatchState opens a revisioned synchronization stream. With an empty
+	// resume_cursor, or when a cursor can no longer be resumed, the server MUST
+	// send SnapshotBegin, the complete current base-host set, and
+	// SynchronizationBarrier before live changes. Credential and vbucket caches
+	// are bounded, cleared at SnapshotBegin, and repopulated on demand at or
+	// after the barrier revision; their complete contents are never snapshotted.
+	// With a valid cursor the server may replay contiguous changes followed by a
+	// SynchronizationBarrier. The proxy fails closed until the barrier is
+	// observed. The server MUST send Heartbeat frames often enough to satisfy
+	// the proxy's documented watch-silence timeout.
+	WatchState(*WatchStateRequest, grpc.ServerStreamingServer[WatchEvent]) error
 	mustEmbedUnimplementedControlPlaneServer()
 }
 
@@ -155,9 +154,6 @@ type UnimplementedControlPlaneServer struct{}
 func (UnimplementedControlPlaneServer) LookupCredentials(context.Context, *LookupCredentialsRequest) (*LookupCredentialsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupCredentials not implemented")
 }
-func (UnimplementedControlPlaneServer) LookupBaseHost(context.Context, *LookupBaseHostRequest) (*LookupBaseHostResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method LookupBaseHost not implemented")
-}
 func (UnimplementedControlPlaneServer) LookupVBucket(context.Context, *LookupVBucketRequest) (*LookupVBucketResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupVBucket not implemented")
 }
@@ -167,8 +163,8 @@ func (UnimplementedControlPlaneServer) CreateVBucket(context.Context, *CreateVBu
 func (UnimplementedControlPlaneServer) ListVBuckets(context.Context, *ListVBucketsRequest) (*ListVBucketsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListVBuckets not implemented")
 }
-func (UnimplementedControlPlaneServer) ListenForDeltas(*ListenForDeltasRequest, grpc.ServerStreamingServer[Delta]) error {
-	return status.Error(codes.Unimplemented, "method ListenForDeltas not implemented")
+func (UnimplementedControlPlaneServer) WatchState(*WatchStateRequest, grpc.ServerStreamingServer[WatchEvent]) error {
+	return status.Error(codes.Unimplemented, "method WatchState not implemented")
 }
 func (UnimplementedControlPlaneServer) mustEmbedUnimplementedControlPlaneServer() {}
 func (UnimplementedControlPlaneServer) testEmbeddedByValue()                      {}
@@ -205,24 +201,6 @@ func _ControlPlane_LookupCredentials_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ControlPlaneServer).LookupCredentials(ctx, req.(*LookupCredentialsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _ControlPlane_LookupBaseHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(LookupBaseHostRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ControlPlaneServer).LookupBaseHost(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: ControlPlane_LookupBaseHost_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ControlPlaneServer).LookupBaseHost(ctx, req.(*LookupBaseHostRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -281,16 +259,16 @@ func _ControlPlane_ListVBuckets_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ControlPlane_ListenForDeltas_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(ListenForDeltasRequest)
+func _ControlPlane_WatchState_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchStateRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(ControlPlaneServer).ListenForDeltas(m, &grpc.GenericServerStream[ListenForDeltasRequest, Delta]{ServerStream: stream})
+	return srv.(ControlPlaneServer).WatchState(m, &grpc.GenericServerStream[WatchStateRequest, WatchEvent]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ControlPlane_ListenForDeltasServer = grpc.ServerStreamingServer[Delta]
+type ControlPlane_WatchStateServer = grpc.ServerStreamingServer[WatchEvent]
 
 // ControlPlane_ServiceDesc is the grpc.ServiceDesc for ControlPlane service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -302,10 +280,6 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "LookupCredentials",
 			Handler:    _ControlPlane_LookupCredentials_Handler,
-		},
-		{
-			MethodName: "LookupBaseHost",
-			Handler:    _ControlPlane_LookupBaseHost_Handler,
 		},
 		{
 			MethodName: "LookupVBucket",
@@ -322,8 +296,8 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 	},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "ListenForDeltas",
-			Handler:       _ControlPlane_ListenForDeltas_Handler,
+			StreamName:    "WatchState",
+			Handler:       _ControlPlane_WatchState_Handler,
 			ServerStreams: true,
 		},
 	},

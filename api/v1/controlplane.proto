@@ -12,74 +12,105 @@ import "google/protobuf/timestamp.proto";
 // credentials and bucket mappings.
 service ControlPlane {
   rpc LookupCredentials(LookupCredentialsRequest) returns (LookupCredentialsResponse);
-  rpc LookupBaseHost(LookupBaseHostRequest) returns (LookupBaseHostResponse);
   rpc LookupVBucket(LookupVBucketRequest) returns (LookupVBucketResponse);
   rpc CreateVBucket(CreateVBucketRequest) returns (CreateVBucketResponse);
   rpc ListVBuckets(ListVBucketsRequest) returns (ListVBucketsResponse);
 
-  // ListenForDeltas opens a server-streaming RPC that pushes cache updates
-  // to the proxy. The control plane sends deltas whenever credentials, base
-  // hosts, or vbucket mappings change, allowing the proxy to maintain
-  // long-lived caches with fast invalidation.
-  rpc ListenForDeltas(ListenForDeltasRequest) returns (stream Delta);
+  // WatchState opens a revisioned synchronization stream. With an empty
+  // resume_cursor, or when a cursor can no longer be resumed, the server MUST
+  // send SnapshotBegin, the complete current base-host set, and
+  // SynchronizationBarrier before live changes. Credential and vbucket caches
+  // are bounded, cleared at SnapshotBegin, and repopulated on demand at or
+  // after the barrier revision; their complete contents are never snapshotted.
+  // With a valid cursor the server may replay contiguous changes followed by a
+  // SynchronizationBarrier. The proxy fails closed until the barrier is
+  // observed. The server MUST send Heartbeat frames often enough to satisfy
+  // the proxy's documented watch-silence timeout.
+  rpc WatchState(WatchStateRequest) returns (stream WatchEvent);
 }
 
 message LookupCredentialsRequest {
   string access_key_id = 1;
+  // The response revision MUST be at least this revision. This lets a unary
+  // lookup race safely with a newer watch event.
+  uint64 minimum_revision = 2;
 }
 
+// Exactly one result shape is valid. found=true requires secret_key,
+// iam_policy_json, and a positive ttl and forbids negative_ttl. found=false
+// requires a positive negative_ttl and forbids all positive-result fields.
+// revision MUST be at least the request minimum_revision.
 message LookupCredentialsResponse {
   string secret_key = 1;
   // Required AWS IAM JSON identity policy for this virtual access key.
+  // Resources name virtual buckets/objects. All keys sharing a virtual bucket
+  // retain independent policies. Policy updates advance the global revision
+  // and emit a CredentialsDelta invalidation for this access key.
   string iam_policy_json = 2;
   google.protobuf.Duration ttl = 3;
-}
-
-message LookupBaseHostRequest {
-  string hostname = 1;
-}
-
-message LookupBaseHostResponse {
-  string base_host = 1;
-  bool found = 2;
-  google.protobuf.Duration ttl = 3;
+  bool found = 4;
+  google.protobuf.Duration negative_ttl = 5;
+  uint64 revision = 6;
 }
 
 message LookupVBucketRequest {
   string access_key_id = 1;
   string bucket_name = 2;
+  uint64 minimum_revision = 3;
 }
 
+// Exactly one result shape is valid. found=true requires a complete valid
+// mapping and positive ttl and forbids negative_ttl. found=false requires a
+// positive negative_ttl and forbids every positive-result field. revision
+// MUST be at least the request minimum_revision.
 message LookupVBucketResponse {
   string real_endpoint = 1;
   string real_bucket = 2;
   string real_access_key = 3;
   string real_secret_key = 4;
   string real_region = 5;
+  // The control plane owns namespace allocation. Distinct virtual buckets
+  // sharing a real endpoint/bucket need normalized path_prefix values, pairwise
+  // non-overlapping; an empty prefix reserves the whole real bucket exclusively.
+  // Multiple access keys for the SAME virtual bucket share its namespace and
+  // routing_token_key; each key's IAM policy is enforced independently.
   string path_prefix = 6;
   bool real_use_path_style = 7;
   google.protobuf.Duration ttl = 8;
+  // Required stable 32-byte random key used only to encrypt mapping-scoped
+  // routing tokens. The control plane must keep it unchanged across proxy
+  // replicas, restarts, and upstream credential rotation while the real
+  // storage namespace is unchanged. The control plane MUST generate a new key
+  // whenever real_endpoint, real_bucket, or path_prefix changes. Rotating it
+  // invalidates outstanding virtual continuation, upload, and version IDs and
+  // therefore requires an explicit drain window.
+  bytes routing_token_key = 9;
+  bool found = 10;
+  google.protobuf.Duration negative_ttl = 11;
+  uint64 revision = 12;
 }
 
 message CreateVBucketRequest {
   string access_key_id = 1;
   string bucket_name = 2;
   string location_constraint = 3;
+  uint64 minimum_revision = 4;
 }
 
 message CreateVBucketResponse {
-  string real_endpoint = 1;
-  string real_bucket = 2;
-  string real_access_key = 3;
-  string real_secret_key = 4;
-  string real_region = 5;
-  string path_prefix = 6;
-  bool real_use_path_style = 7;
-  google.protobuf.Duration ttl = 8;
+  reserved 1 to 9;
+  reserved "real_endpoint", "real_bucket", "real_access_key", "real_secret_key", "real_region", "path_prefix", "real_use_path_style", "ttl", "routing_token_key";
+  // Committed global revision of the create. It MUST be strictly greater than
+  // the request minimum_revision. A value ahead of the proxy watch
+  // is a successful mutation, not an ambiguous failure: the proxy returns the
+  // create success and fails subsequent authorization/routing closed until the
+  // watch catches up contiguously to this revision.
+  uint64 revision = 10;
 }
 
 message ListVBucketsRequest {
   string access_key_id = 1;
+  uint64 minimum_revision = 2;
 }
 
 message VBucketSummary {
@@ -89,56 +120,86 @@ message VBucketSummary {
 
 message ListVBucketsResponse {
   repeated VBucketSummary buckets = 1;
+  // Exact global revision at which the list was evaluated. It MUST be at least
+  // the request minimum_revision.
+  uint64 revision = 2;
 }
 
-message ListenForDeltasRequest {}
+message WatchStateRequest {
+  // Opaque cursor from the most recently accepted synchronization barrier or
+  // live event. Empty requests a complete snapshot.
+  string resume_cursor = 1;
+  uint64 after_revision = 2;
+}
 
-message Delta {
-  oneof delta {
+message WatchEvent {
+  oneof event {
     CredentialsDelta credentials = 1;
     BaseHostDelta base_host = 2;
     VBucketDelta vbucket = 3;
+    SnapshotBegin snapshot_begin = 6;
+    SynchronizationBarrier synchronization_barrier = 7;
+    Heartbeat heartbeat = 8;
   }
+  // Global control-plane revision represented by this event. Live mutations are
+  // contiguous. Snapshot entry revisions may be sparse and no greater than the
+  // following barrier revision.
+  uint64 revision = 4;
+  // Opaque resume cursor. Required on live events, barriers, and heartbeats.
+  // Each persisted revision has exactly one canonical cursor, and each cursor
+  // identifies exactly one revision. Restarts and same-cut reset snapshots MUST
+  // reproduce that cursor or advance the revision. A live mutation advances both;
+  // a barrier or heartbeat repeats the current pair. Duplicate/reordered
+  // mutations and forward revision gaps are fatal. A missing/invalid/too-old
+  // requested cursor is answered with SnapshotBegin, never a partial replay.
+  string cursor = 5;
 }
 
-// CredentialsDelta pushes a credential cache update.
-// If remove is true, the entry should be evicted. Otherwise it is an upsert.
+// SnapshotBegin retires all credential/vbucket cache state and the base-domain
+// registry. It is followed by the complete base-domain snapshot and a
+// SynchronizationBarrier at exactly this revision. Credential and vbucket
+// snapshot entries are invalid protocol.
+message SnapshotBegin {}
+
+// SynchronizationBarrier proves that replay or snapshot state covers exactly
+// the envelope revision/cursor pair.
+message SynchronizationBarrier {}
+
+// Heartbeat proves the stream is live without mutating state. Its envelope
+// repeats the last accepted revision/cursor pair.
+message Heartbeat {}
+
+// CredentialsDelta never contains a secret or policy. An update invalidates an
+// existing hot entry so the next request reloads it at this event's revision;
+// it does not populate a cold key. A removal may replace an existing hot entry
+// with a negative tombstone for negative_ttl.
 message CredentialsDelta {
   string access_key_id = 1;
   bool remove = 2;
-
-  // Fields below are only set on upsert (remove == false).
-  string secret_key = 3;
-  string iam_policy_json = 4;
-  google.protobuf.Duration ttl = 5;
+  reserved 3 to 5;
+  reserved "secret_key", "iam_policy_json", "ttl";
+  google.protobuf.Duration negative_ttl = 6;
 }
 
-// BaseHostDelta pushes a base host cache update.
+// BaseHostDelta pushes a base-domain registry update.
 // If remove is true, the entry should be evicted. Otherwise it is an upsert.
 message BaseHostDelta {
-  string hostname = 1;
+  reserved 1, 4, 5;
+  reserved "hostname", "found", "ttl";
   bool remove = 2;
-
-  // Fields below are only set on upsert (remove == false).
+  // A normalized base domain, not an observed request hostname. Registry
+  // entries live until a watch removal or replacement snapshot; they do not
+  // expire independently while the client is synchronized.
   string base_host = 3;
-  bool found = 4;
-  google.protobuf.Duration ttl = 5;
 }
 
-// VBucketDelta pushes a vbucket mapping cache update.
-// If remove is true, the entry should be evicted. Otherwise it is an upsert.
+// VBucketDelta never contains backend credentials or mappings. Update/removal
+// behavior matches CredentialsDelta.
 message VBucketDelta {
   string access_key_id = 1;
   string bucket_name = 2;
   bool remove = 3;
-
-  // Fields below are only set on upsert (remove == false).
-  string real_endpoint = 4;
-  string real_bucket = 5;
-  string real_access_key = 6;
-  string real_secret_key = 7;
-  string real_region = 8;
-  string path_prefix = 9;
-  bool real_use_path_style = 10;
-  google.protobuf.Duration ttl = 11;
+  reserved 4 to 12;
+  reserved "real_endpoint", "real_bucket", "real_access_key", "real_secret_key", "real_region", "path_prefix", "real_use_path_style", "ttl", "routing_token_key";
+  google.protobuf.Duration negative_ttl = 13;
 }

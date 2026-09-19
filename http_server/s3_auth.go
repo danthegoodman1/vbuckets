@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -16,10 +17,13 @@ import (
 
 const unsignedPayload = "UNSIGNED-PAYLOAD"
 
+var accessKeyIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
 var (
 	errRequestTimeTooSkewed   = errors.New("request time too skewed")
 	errUnsupportedPayloadHash = errors.New("unsupported payload hash")
 	errUnsignedAmzHeader      = errors.New("unsigned x-amz header")
+	errUnsupportedAuthMode    = errors.New("unsupported authentication mode")
 )
 
 type AuthInfo struct {
@@ -48,16 +52,26 @@ func parseAuthorizationHeader(header string) (*AuthInfo, error) {
 
 	info := &AuthInfo{}
 
-	for _, part := range parts {
+	expectedParts := [...]string{"Credential", "SignedHeaders", "Signature"}
+	for i, part := range parts {
 		k, v, ok := strings.Cut(part, "=")
 		if !ok {
 			return nil, fmt.Errorf("malformed authorization part: %s", part)
 		}
+		if k != expectedParts[i] {
+			return nil, fmt.Errorf("authorization fields must be %s in canonical order", strings.Join(expectedParts[:], ", "))
+		}
 		switch k {
 		case "Credential":
 			credParts := strings.SplitN(v, "/", 5)
-			if len(credParts) != 5 || credParts[4] != "aws4_request" {
+			if len(credParts) != 5 || credParts[0] == "" || credParts[1] == "" || credParts[2] == "" || credParts[3] != "s3" || credParts[4] != "aws4_request" {
 				return nil, fmt.Errorf("malformed credential: %s", v)
+			}
+			if _, err := time.Parse("20060102", credParts[1]); err != nil {
+				return nil, fmt.Errorf("malformed credential date: %s", credParts[1])
+			}
+			if !accessKeyIDPattern.MatchString(credParts[0]) {
+				return nil, fmt.Errorf("access key ID must contain 1 to 128 letters, digits, dots, underscores, or hyphens")
 			}
 			info.AccessKeyID = credParts[0]
 			info.Date = credParts[1]
@@ -66,8 +80,13 @@ func parseAuthorizationHeader(header string) (*AuthInfo, error) {
 			info.Scope = strings.Join(credParts[1:], "/")
 		case "SignedHeaders":
 			info.SignedHeaders = strings.Split(v, ";")
-			sort.Strings(info.SignedHeaders)
+			if err := validateSignedHeaders(info.SignedHeaders); err != nil {
+				return nil, err
+			}
 		case "Signature":
+			if len(v) != sha256.Size*2 || strings.Trim(v, "0123456789abcdef") != "" {
+				return nil, fmt.Errorf("signature must be 64 lowercase hexadecimal characters")
+			}
 			info.Signature = v
 		default:
 			return nil, fmt.Errorf("unknown authorization part: %s", k)
@@ -81,6 +100,31 @@ func parseAuthorizationHeader(header string) (*AuthInfo, error) {
 	return info, nil
 }
 
+func validateSignedHeaders(headers []string) error {
+	if len(headers) == 0 {
+		return fmt.Errorf("SignedHeaders must not be empty")
+	}
+	hasHost := false
+	hasDate := false
+	for i, header := range headers {
+		if header == "" || header != strings.ToLower(header) {
+			return fmt.Errorf("SignedHeaders must contain lowercase header names")
+		}
+		if i > 0 && headers[i-1] >= header {
+			return fmt.Errorf("SignedHeaders must be sorted and unique")
+		}
+		hasHost = hasHost || header == "host"
+		hasDate = hasDate || header == "x-amz-date"
+	}
+	if !hasHost {
+		return fmt.Errorf("SignedHeaders must include host")
+	}
+	if !hasDate {
+		return fmt.Errorf("SignedHeaders must include x-amz-date")
+	}
+	return nil
+}
+
 // buildCanonicalRequest constructs the canonical request string per the AWS SigV4 spec.
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#create-canonical-request
 //
@@ -92,7 +136,7 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string) string {
 	b.WriteString(r.Method)
 	b.WriteByte('\n')
 
-	// S3 uses raw path (no double-encoding of path segments)
+	// S3 uses the wire-escaped path without generic SigV4 double escaping.
 	path := r.URL.EscapedPath()
 	if path == "" {
 		path = "/"
@@ -103,31 +147,45 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string) string {
 	b.WriteString(canonicalQueryString(r.URL.Query()))
 	b.WriteByte('\n')
 
-	// Canonical headers must be sorted and lowercased
-	sorted := make([]string, len(signedHeaders))
-	copy(sorted, signedHeaders)
-	sort.Strings(sorted)
-
-	for _, h := range sorted {
-		var val string
+	for _, h := range signedHeaders {
+		var values []string
 		if h == "host" {
-			val = r.Host
+			host := r.Host
+			if host == "" {
+				host = r.URL.Host
+			}
+			values = []string{host}
+		} else if h == "content-length" && len(r.Header.Values(h)) == 0 && r.ContentLength > 0 {
+			values = []string{fmt.Sprintf("%d", r.ContentLength)}
 		} else {
-			val = r.Header.Get(h)
+			values = r.Header.Values(h)
 		}
-		b.WriteString(strings.ToLower(h))
+		b.WriteString(h)
 		b.WriteByte(':')
-		b.WriteString(strings.TrimSpace(val))
+		for i, value := range values {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(canonicalHeaderValue(value))
+		}
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n') // blank line after headers
 
-	b.WriteString(strings.Join(sorted, ";"))
+	b.WriteString(strings.Join(signedHeaders, ";"))
 	b.WriteByte('\n')
 
 	b.WriteString(r.Header.Get("x-amz-content-sha256"))
 
 	return b.String()
+}
+
+func canonicalHeaderValue(value string) string {
+	value = strings.TrimSpace(value)
+	for strings.Contains(value, "  ") {
+		value = strings.ReplaceAll(value, "  ", " ")
+	}
+	return value
 }
 
 func canonicalQueryString(query url.Values) string {
@@ -184,10 +242,31 @@ func computeSigningKey(secret, date, region, service string) []byte {
 // signature derived from the provided secret key. The request body is never
 // read; clients must use UNSIGNED-PAYLOAD so streaming remains possible.
 func verifySignature(r *http.Request, authInfo *AuthInfo, secretKey string) error {
-	return verifySignatureAtTime(r, authInfo, secretKey, time.Now().UTC(), env.SigV4MaxClockSkew)
+	return verifySignatureAtTime(r, authInfo, secretKey, time.Now().UTC(), env.Current.S3.SigV4MaxClockSkew)
 }
 
 func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string, now time.Time, maxSkew time.Duration) error {
+	if authInfo == nil {
+		return fmt.Errorf("missing authentication information")
+	}
+	if err := validateSignedHeaders(authInfo.SignedHeaders); err != nil {
+		return err
+	}
+	if authInfo.Service != "s3" {
+		return fmt.Errorf("credential scope service must be s3")
+	}
+	if len(r.Header.Values("x-amz-security-token")) != 0 {
+		return fmt.Errorf("%w: session tokens are not supported", errUnsupportedAuthMode)
+	}
+	if len(r.Header.Values("x-amz-trailer")) != 0 || len(r.Trailer) != 0 {
+		return fmt.Errorf("%w: signed trailers are not supported", errUnsupportedAuthMode)
+	}
+	if err := requireSingletonHeader(r, "x-amz-content-sha256"); err != nil {
+		return err
+	}
+	if err := requireSingletonHeader(r, "x-amz-date"); err != nil {
+		return err
+	}
 	payloadHash := r.Header.Get("x-amz-content-sha256")
 	if payloadHash == "" {
 		return fmt.Errorf("missing x-amz-content-sha256 header")
@@ -207,6 +286,13 @@ func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string
 	if err != nil {
 		return fmt.Errorf("invalid X-Amz-Date header: %w", err)
 	}
+	if authInfo.Date != requestTime.UTC().Format("20060102") {
+		return fmt.Errorf("credential scope date does not match X-Amz-Date")
+	}
+	expectedScope := authInfo.Date + "/" + authInfo.Region + "/s3/aws4_request"
+	if authInfo.Scope != expectedScope {
+		return fmt.Errorf("credential scope is inconsistent")
+	}
 	if maxSkew > 0 {
 		skew := now.Sub(requestTime)
 		if skew < 0 {
@@ -218,15 +304,25 @@ func verifySignatureAtTime(r *http.Request, authInfo *AuthInfo, secretKey string
 	}
 
 	canonicalRequest := buildCanonicalRequest(r, authInfo.SignedHeaders)
-
-	stringToSign := buildStringToSign(datetime, authInfo.Scope, canonicalRequest)
 	signingKey := computeSigningKey(secretKey, authInfo.Date, authInfo.Region, authInfo.Service)
-	expectedSig := fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
+	expectedSig := signatureForCanonicalRequest(datetime, authInfo.Scope, canonicalRequest, signingKey)
 
 	if !hmac.Equal([]byte(expectedSig), []byte(authInfo.Signature)) {
 		return fmt.Errorf("signature mismatch")
 	}
 
+	return nil
+}
+
+func signatureForCanonicalRequest(datetime, scope, canonicalRequest string, signingKey []byte) string {
+	stringToSign := buildStringToSign(datetime, scope, canonicalRequest)
+	return fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
+}
+
+func requireSingletonHeader(r *http.Request, name string) error {
+	if len(r.Header.Values(name)) != 1 {
+		return fmt.Errorf("%s header must occur exactly once", name)
+	}
 	return nil
 }
 

@@ -50,7 +50,7 @@ func TestBearerAuthStreamInterceptor_AddsAuthorizationMetadata(t *testing.T) {
 	interceptor := bearerAuthStreamInterceptor("stream-token")
 
 	var called bool
-	_, err := interceptor(context.Background(), &grpc.StreamDesc{}, nil, "/vbuckets.v1.ControlPlane/ListenForDeltas", func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	_, err := interceptor(context.Background(), &grpc.StreamDesc{}, nil, "/vbuckets.v1.ControlPlane/WatchState", func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 		called = true
 		md, ok := metadata.FromOutgoingContext(ctx)
 		require.True(t, ok)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ const (
 const allowAllS3PolicyJSON = `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}`
 
 var testAllowAllPolicy = mustParseTestPolicy(allowAllS3PolicyJSON)
+var testRoutingTokenKey = []byte("0123456789abcdef0123456789abcdef")
 
 func mustParseTestPolicy(policyJSON string) *iam.Policy {
 	policy, err := ParseS3IAMPolicyJSON(policyJSON)
@@ -43,11 +45,26 @@ func mustParseTestPolicy(policyJSON string) *iam.Policy {
 }
 
 type testResolver struct {
+	begin       func() (ResolutionStamp, error)
+	validate    func(ResolutionStamp) error
 	credentials func(ctx context.Context, accessKeyID string) (*VirtualCredentials, error)
 	baseHost    func(ctx context.Context, hostname string) (string, bool, error)
 	vbucket     func(ctx context.Context, accessKeyID, bucketName string) (*VBucketConfig, error)
-	create      func(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error)
+	create      func(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error
 	list        func(ctx context.Context, accessKeyID string) ([]ListedVBucket, error)
+}
+
+func (r *testResolver) BeginResolution() (ResolutionStamp, error) {
+	if r.begin != nil {
+		return r.begin()
+	}
+	return ResolutionStamp{}, nil
+}
+func (r *testResolver) ValidateResolution(stamp ResolutionStamp) error {
+	if r.validate != nil {
+		return r.validate(stamp)
+	}
+	return nil
 }
 
 func (r *testResolver) LookupCredentials(ctx context.Context, accessKeyID string) (*VirtualCredentials, error) {
@@ -62,7 +79,7 @@ func (r *testResolver) LookupVBucket(ctx context.Context, accessKeyID, bucketNam
 	return r.vbucket(ctx, accessKeyID, bucketName)
 }
 
-func (r *testResolver) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
+func (r *testResolver) CreateVBucket(ctx context.Context, accessKeyID, bucketName, locationConstraint string) error {
 	return r.create(ctx, accessKeyID, bucketName, locationConstraint)
 }
 
@@ -74,7 +91,7 @@ func newTestResolver() *testResolver {
 	return &testResolver{
 		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
 			if accessKeyID != testAccessKey {
-				return nil, fmt.Errorf("unknown access key ID: %s", accessKeyID)
+				return nil, ErrResolverNotFound
 			}
 			return &VirtualCredentials{SecretKey: testSecretKey, IAMPolicy: testAllowAllPolicy}, nil
 		},
@@ -84,8 +101,8 @@ func newTestResolver() *testResolver {
 		vbucket: func(_ context.Context, accessKeyID, bucketName string) (*VBucketConfig, error) {
 			return &VBucketConfig{}, nil
 		},
-		create: func(_ context.Context, accessKeyID, bucketName, locationConstraint string) (*VBucketConfig, error) {
-			return &VBucketConfig{}, nil
+		create: func(_ context.Context, accessKeyID, bucketName, locationConstraint string) error {
+			return nil
 		},
 		list: func(_ context.Context, accessKeyID string) ([]ListedVBucket, error) {
 			return nil, nil
@@ -160,10 +177,26 @@ func signedRequestAtTimeWithHeaders(t *testing.T, method, url string, body []byt
 		req.Header.Set(key, value)
 	}
 
-	signer := awsv4.NewSigner()
+	signer := awsv4.NewSigner(func(options *awsv4.SignerOptions) {
+		options.DisableURIPathEscaping = true
+	})
 	require.NoError(t, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", testRegion, signedAt))
 
 	return req
+}
+
+func parsedAuthInfo(t *testing.T, req *http.Request) *AuthInfo {
+	t.Helper()
+	info, err := parseAuthorizationHeader(req.Header.Get("Authorization"))
+	require.NoError(t, err)
+	return info
+}
+
+func recomputeTestSignature(req *http.Request, info *AuthInfo, secret string) {
+	canonicalRequest := buildCanonicalRequest(req, info.SignedHeaders)
+	stringToSign := buildStringToSign(req.Header.Get("X-Amz-Date"), info.Scope, canonicalRequest)
+	signingKey := computeSigningKey(secret, info.Date, info.Region, info.Service)
+	info.Signature = fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
 }
 
 var validCreds = aws.Credentials{
@@ -248,6 +281,238 @@ func TestSigV4_RawSigner_ConcretePayloadHashRejected(t *testing.T) {
 	assert.Contains(t, string(respBody), "UNSIGNED-PAYLOAD")
 }
 
+func TestSigV4_RejectsMissingHostCoverageEvenWithMatchingSignature(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/key", nil, unsignedPayload, validCreds, signedAt)
+	info := parsedAuthInfo(t, req)
+
+	withoutHost := info.SignedHeaders[:0]
+	for _, header := range info.SignedHeaders {
+		if header != "host" {
+			withoutHost = append(withoutHost, header)
+		}
+	}
+	info.SignedHeaders = withoutHost
+	recomputeTestSignature(req, info, testSecretKey)
+
+	require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+}
+
+func TestSigV4_RejectsCredentialScopeMismatchEvenWithMatchingSignature(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		mutate func(*AuthInfo)
+	}{
+		{
+			name: "scope date",
+			mutate: func(info *AuthInfo) {
+				info.Date = "20260805"
+				info.Scope = "20260805/" + info.Region + "/s3/aws4_request"
+			},
+		},
+		{
+			name: "service",
+			mutate: func(info *AuthInfo) {
+				info.Service = "execute-api"
+				info.Scope = info.Date + "/" + info.Region + "/execute-api/aws4_request"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/key", nil, unsignedPayload, validCreds, signedAt)
+			info := parsedAuthInfo(t, req)
+			tt.mutate(info)
+			recomputeTestSignature(req, info, testSecretKey)
+
+			require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+		})
+	}
+}
+
+func TestSigV4_AcceptsAWSCanonicalMultiValueHeaderWhitespace(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	req, err := http.NewRequest(http.MethodGet, "https://s3.example.com/test-bucket/key", nil)
+	require.NoError(t, err)
+	req.Header.Set("x-amz-content-sha256", unsignedPayload)
+	req.Header.Add("X-Test-Values", "  alpha   beta  ")
+	req.Header.Add("X-Test-Values", "gamma\t\tdelta")
+	require.NoError(t, awsv4.NewSigner().SignHTTP(context.Background(), validCreds, req, unsignedPayload, "s3", testRegion, signedAt))
+
+	info := parsedAuthInfo(t, req)
+	require.NoError(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+}
+
+func TestParseAuthorizationHeaderRejectsNonCanonicalSignedHeaderList(t *testing.T) {
+	for _, signedHeaders := range []string{
+		"x-amz-date;host",
+		"host;x-amz-date;host",
+		"Host;x-amz-date",
+	} {
+		t.Run(signedHeaders, func(t *testing.T) {
+			header := "AWS4-HMAC-SHA256 Credential=AKID/20260806/us-east-1/s3/aws4_request, SignedHeaders=" + signedHeaders + ", Signature=" + strings.Repeat("a", 64)
+			_, err := parseAuthorizationHeader(header)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestParseAuthorizationHeaderRejectsInvalidCredentialScopeAndSignature(t *testing.T) {
+	tests := []struct {
+		name       string
+		credential string
+		signature  string
+	}{
+		{name: "invalid date", credential: "AKID/not-a-date/us-east-1/s3/aws4_request", signature: strings.Repeat("a", 64)},
+		{name: "empty region", credential: "AKID/20260806//s3/aws4_request", signature: strings.Repeat("a", 64)},
+		{name: "wrong service", credential: "AKID/20260806/us-east-1/execute-api/aws4_request", signature: strings.Repeat("a", 64)},
+		{name: "wrong terminator", credential: "AKID/20260806/us-east-1/s3/not-aws4-request", signature: strings.Repeat("a", 64)},
+		{name: "uppercase signature", credential: "AKID/20260806/us-east-1/s3/aws4_request", signature: strings.Repeat("A", 64)},
+		{name: "short signature", credential: "AKID/20260806/us-east-1/s3/aws4_request", signature: strings.Repeat("a", 63)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := "AWS4-HMAC-SHA256 Credential=" + tt.credential + ", SignedHeaders=host;x-amz-date, Signature=" + tt.signature
+			_, err := parseAuthorizationHeader(header)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestParseAuthorizationHeaderRejectsUnsafeAccessKeyIDs(t *testing.T) {
+	for name, accessKeyID := range map[string]string{
+		"oversized": strings.Repeat("a", 129),
+		"control":   "AKID\nINJECTED",
+		"comma":     "AKID,INJECTED",
+		"equals":    "AKID=INJECTED",
+		"space":     "AKID INJECTED",
+	} {
+		t.Run(name, func(t *testing.T) {
+			header := "AWS4-HMAC-SHA256 Credential=" + accessKeyID + "/20260806/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=" + strings.Repeat("a", 64)
+			_, err := parseAuthorizationHeader(header)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestSigV4S3CanonicalPathBindsEscapedWireIdentity(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	for name, target := range map[string]string{
+		"encoded slash":   "https://s3.example.com/test-bucket/a%2Fb",
+		"literal percent": "https://s3.example.com/test-bucket/a%25b",
+		"unicode":         "https://s3.example.com/test-bucket/snowman-\u2603",
+	} {
+		t.Run(name+" accepted", func(t *testing.T) {
+			req := signedRequestAtTime(t, http.MethodGet, target, nil, unsignedPayload, validCreds, signedAt)
+			require.NoError(t, verifySignatureAtTime(req, parsedAuthInfo(t, req), testSecretKey, signedAt, time.Minute))
+		})
+	}
+
+	t.Run("encoded slash cannot become a path separator", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/a%2Fb", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		req.URL.RawPath = ""
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+
+	t.Run("percent escape case is signed", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/a%2Fb", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		req.URL.RawPath = strings.Replace(req.URL.RawPath, "%2F", "%2f", 1)
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+
+	t.Run("literal percent identity cannot change", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/a%25b", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		changed, err := url.Parse("https://s3.example.com/test-bucket/a%2525b")
+		require.NoError(t, err)
+		req.URL = changed
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+}
+
+func TestSigV4_RejectsUnsupportedSessionTokenAndTrailerModes(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		creds   aws.Credentials
+		headers map[string]string
+	}{
+		{
+			name:  "session token",
+			creds: aws.Credentials{AccessKeyID: testAccessKey, SecretAccessKey: testSecretKey, SessionToken: "session-token"},
+		},
+		{
+			name:    "signed trailer",
+			creds:   validCreds,
+			headers: map[string]string{"x-amz-trailer": "x-amz-checksum-crc32"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := signedRequestAtTimeWithHeaders(t, http.MethodPut, "https://s3.example.com/test-bucket/key", nil, unsignedPayload, tt.creds, signedAt, tt.headers)
+			info := parsedAuthInfo(t, req)
+			require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+		})
+	}
+}
+
+func TestSigV4_RejectsStreamingPayloadMode(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	req := signedRequestAtTime(t, http.MethodPut, "https://s3.example.com/test-bucket/key", nil, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", validCreds, signedAt)
+	info := parsedAuthInfo(t, req)
+	require.ErrorIs(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute), errUnsupportedPayloadHash)
+}
+
+func TestSigV4_RejectsUnsignedDateAndAlteredHost(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+
+	t.Run("x-amz-date not signed", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/key", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		filtered := info.SignedHeaders[:0]
+		for _, header := range info.SignedHeaders {
+			if header != "x-amz-date" {
+				filtered = append(filtered, header)
+			}
+		}
+		info.SignedHeaders = filtered
+		recomputeTestSignature(req, info, testSecretKey)
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+
+	t.Run("host altered after signing", func(t *testing.T) {
+		req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/key", nil, unsignedPayload, validCreds, signedAt)
+		info := parsedAuthInfo(t, req)
+		req.Host = "attacker.example.com"
+		require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+	})
+}
+
+func TestSigV4_RejectsDuplicateAuthenticationHeaders(t *testing.T) {
+	signedAt := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	for _, header := range []string{"x-amz-date", "x-amz-content-sha256"} {
+		t.Run(header, func(t *testing.T) {
+			req := signedRequestAtTime(t, http.MethodGet, "https://s3.example.com/test-bucket/key", nil, unsignedPayload, validCreds, signedAt)
+			info := parsedAuthInfo(t, req)
+			req.Header.Add(header, req.Header.Get(header))
+			require.Error(t, verifySignatureAtTime(req, info, testSecretKey, signedAt, time.Minute))
+		})
+	}
+}
+
+func FuzzParseAuthorizationHeader(f *testing.F) {
+	f.Add("AWS4-HMAC-SHA256 Credential=AKID/20260806/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=" + strings.Repeat("a", 64))
+	f.Add("not-an-authorization-header")
+	f.Fuzz(func(t *testing.T, header string) {
+		_, _ = parseAuthorizationHeader(header)
+	})
+}
+
 func TestSigV4_RawSigner_WithQueryParams(t *testing.T) {
 	resolver := newTestResolver()
 	ts := newTestServer(t, resolver)
@@ -296,10 +561,10 @@ func TestSigV4_RawSigner_UnknownAccessKey(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_RequestTimeTooSkewed(t *testing.T) {
-	oldSkew := env.SigV4MaxClockSkew
-	env.SigV4MaxClockSkew = 15 * time.Minute
+	oldSkew := env.Current.S3.SigV4MaxClockSkew
+	env.Current.S3.SigV4MaxClockSkew = 15 * time.Minute
 	t.Cleanup(func() {
-		env.SigV4MaxClockSkew = oldSkew
+		env.Current.S3.SigV4MaxClockSkew = oldSkew
 	})
 
 	resolver := newTestResolver()
@@ -319,10 +584,10 @@ func TestSigV4_RawSigner_RequestTimeTooSkewed(t *testing.T) {
 }
 
 func TestSigV4_RawSigner_ConfigurableClockSkew(t *testing.T) {
-	oldSkew := env.SigV4MaxClockSkew
-	env.SigV4MaxClockSkew = time.Hour
+	oldSkew := env.Current.S3.SigV4MaxClockSkew
+	env.Current.S3.SigV4MaxClockSkew = time.Hour
 	t.Cleanup(func() {
-		env.SigV4MaxClockSkew = oldSkew
+		env.Current.S3.SigV4MaxClockSkew = oldSkew
 	})
 
 	resolver := newTestResolver()

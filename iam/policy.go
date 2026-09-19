@@ -30,7 +30,18 @@ type Request struct {
 
 type Options struct {
 	AllowedConditionKeys map[string]bool
+	ConditionKeyTypes    map[string]ConditionValueType
 }
+
+type ConditionValueType int
+
+const (
+	ConditionValueAny ConditionValueType = iota
+	ConditionValueString
+	ConditionValueBool
+	ConditionValueNumeric
+	ConditionValueDate
+)
 
 type Policy struct {
 	statements []statement
@@ -155,11 +166,12 @@ func ParsePolicyJSON(policyJSON string, opts Options) (*Policy, error) {
 	}
 
 	allowedConditionKeys := canonicalConditionKeySet(opts.AllowedConditionKeys)
+	conditionKeyTypes := canonicalConditionKeyTypes(opts.ConditionKeyTypes)
 	policy := &Policy{
 		statements: make([]statement, 0, len(rawStatements)),
 	}
 	for i, rawStatement := range rawStatements {
-		stmt, err := compileStatement(rawStatement, allowedConditionKeys)
+		stmt, err := compileStatement(rawStatement, allowedConditionKeys, conditionKeyTypes)
 		if err != nil {
 			return nil, invalidPolicy("statement %d: %w", i, err)
 		}
@@ -380,7 +392,7 @@ func parseStatementList(raw json.RawMessage) ([]map[string]json.RawMessage, erro
 	return many, nil
 }
 
-func compileStatement(raw map[string]json.RawMessage, allowedConditionKeys map[string]bool) (statement, error) {
+func compileStatement(raw map[string]json.RawMessage, allowedConditionKeys map[string]bool, conditionKeyTypes map[string]ConditionValueType) (statement, error) {
 	if raw == nil {
 		return statement{}, invalidPolicy("statement must be an object")
 	}
@@ -455,7 +467,7 @@ func compileStatement(raw map[string]json.RawMessage, allowedConditionKeys map[s
 	}
 
 	if conditionRaw, ok := raw["Condition"]; ok {
-		stmt.conditions, err = parseConditions(conditionRaw, allowedConditionKeys)
+		stmt.conditions, err = parseConditions(conditionRaw, allowedConditionKeys, conditionKeyTypes)
 		if err != nil {
 			return statement{}, err
 		}
@@ -554,7 +566,7 @@ func wildcardToRegex(pattern string) string {
 	return b.String()
 }
 
-func parseConditions(raw json.RawMessage, allowedConditionKeys map[string]bool) ([]condition, error) {
+func parseConditions(raw json.RawMessage, allowedConditionKeys map[string]bool, conditionKeyTypes map[string]ConditionValueType) ([]condition, error) {
 	var byOperator map[string]map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &byOperator); err != nil {
 		return nil, invalidPolicy("Condition must be an object")
@@ -581,6 +593,9 @@ func parseConditions(raw json.RawMessage, allowedConditionKeys map[string]bool) 
 			if err != nil {
 				return nil, invalidPolicy("condition key %q: %w", key, err)
 			}
+			if err := validateConditionOperands(operator, conditionKeyTypes[canonicalKey], values); err != nil {
+				return nil, invalidPolicy("condition key %q: %w", key, err)
+			}
 			patterns, err := compileConditionPatterns(operator, values)
 			if err != nil {
 				return nil, invalidPolicy("condition key %q: %w", key, err)
@@ -594,6 +609,50 @@ func parseConditions(raw json.RawMessage, allowedConditionKeys map[string]bool) 
 		}
 	}
 	return conditions, nil
+}
+
+func validateConditionOperands(operator conditionOperator, keyType ConditionValueType, values []string) error {
+	if operator.family != conditionNull && keyType != ConditionValueAny && !operatorMatchesKeyType(operator.family, keyType) {
+		return invalidPolicy("operator %s is not valid for this condition key", operator.name)
+	}
+
+	for _, value := range values {
+		switch operator.family {
+		case conditionBool, conditionNull:
+			if value != "true" && value != "false" {
+				return invalidPolicy("operator %s requires true or false, got %q", operator.name, value)
+			}
+		case conditionNumericEquals, conditionNumericLessThan, conditionNumericLessThanEquals,
+			conditionNumericGreaterThan, conditionNumericGreaterThanEquals:
+			number, err := strconv.ParseFloat(value, 64)
+			if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+				return invalidPolicy("operator %s requires a finite number, got %q", operator.name, value)
+			}
+		case conditionDateEquals, conditionDateLessThan, conditionDateLessThanEquals,
+			conditionDateGreaterThan, conditionDateGreaterThanEquals:
+			if _, err := parseIAMTime(value); err != nil {
+				return invalidPolicy("operator %s requires an IAM date, got %q", operator.name, value)
+			}
+		}
+	}
+	return nil
+}
+
+func operatorMatchesKeyType(family conditionFamily, keyType ConditionValueType) bool {
+	switch family {
+	case conditionStringEquals, conditionStringLike:
+		return keyType == ConditionValueString
+	case conditionBool:
+		return keyType == ConditionValueBool
+	case conditionNumericEquals, conditionNumericLessThan, conditionNumericLessThanEquals,
+		conditionNumericGreaterThan, conditionNumericGreaterThanEquals:
+		return keyType == ConditionValueNumeric
+	case conditionDateEquals, conditionDateLessThan, conditionDateLessThanEquals,
+		conditionDateGreaterThan, conditionDateGreaterThanEquals:
+		return keyType == ConditionValueDate
+	default:
+		return false
+	}
 }
 
 func compileConditionPatterns(operator conditionOperator, values []string) ([]wildcard, error) {
@@ -704,6 +763,14 @@ func canonicalConditionKeySet(keys map[string]bool) map[string]bool {
 		if allowed {
 			out[canonicalConditionKey(key)] = true
 		}
+	}
+	return out
+}
+
+func canonicalConditionKeyTypes(types map[string]ConditionValueType) map[string]ConditionValueType {
+	out := make(map[string]ConditionValueType, len(types))
+	for key, valueType := range types {
+		out[canonicalConditionKey(key)] = valueType
 	}
 	return out
 }

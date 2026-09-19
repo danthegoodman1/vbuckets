@@ -1,0 +1,13 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/danthegoodman1/vbuckets/controlplane
+cpu: Apple M3 Max
+BenchmarkReadyResolutionStamp 	100000000	        11.68 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyResolutionStamp 	95225496	        11.59 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyResolutionStamp 	100000000	        11.48 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyResolutionStamp 	96296593	        11.63 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyResolutionStamp 	100000000	        11.65 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyResolutionStamp 	100000000	        11.56 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReadyResolutionStamp 	100000000	        11.65 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/danthegoodman1/vbuckets/controlplane	8.446s

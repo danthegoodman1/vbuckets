@@ -4,6 +4,13 @@ modules:
 lint:
   use:
     - STANDARD
+  # Preserve the established vbuckets.v1 wire names while retaining the rest
+  # of STANDARD. The Go filesystem/package alignment is enforced separately by
+  # TestGeneratedGoPackageMatchesCanonicalImportPath and make proto-check.
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+    - RPC_RESPONSE_STANDARD_NAME
+    - SERVICE_SUFFIX
 breaking:
   use:
     - FILE

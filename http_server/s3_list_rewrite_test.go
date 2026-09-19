@@ -23,7 +23,7 @@ func TestRewriteListResponse_StreamRewritesExpectedFields(t *testing.T) {
 </ListBucketResult>`
 
 	var output bytes.Buffer
-	err := rewriteListResponse(strings.NewReader(input), &output, "tenant-abc/", "virtual-bucket", false)
+	err := rewriteListResponseForTest(strings.NewReader(input), &output, false)
 	require.NoError(t, err)
 
 	got := output.String()
@@ -46,7 +46,7 @@ func TestRewriteListResponse_StreamHandlesLargeBody(t *testing.T) {
 	input.WriteString(`</ListBucketResult>`)
 
 	var output bytes.Buffer
-	err := rewriteListResponse(strings.NewReader(input.String()), &output, "tenant-abc/", "virtual-bucket", false)
+	err := rewriteListResponseForTest(strings.NewReader(input.String()), &output, false)
 	require.NoError(t, err)
 
 	got := output.String()
@@ -69,7 +69,7 @@ func TestRewriteListResponse_StreamRewritesURLEncodedFields(t *testing.T) {
 </ListBucketResult>`
 
 	var output bytes.Buffer
-	err := rewriteListResponse(strings.NewReader(input), &output, "tenant-abc/", "virtual-bucket", true)
+	err := rewriteListResponseForTest(strings.NewReader(input), &output, true)
 	require.NoError(t, err)
 
 	got := output.String()
@@ -82,4 +82,22 @@ func TestRewriteListResponse_StreamRewritesURLEncodedFields(t *testing.T) {
 	assert.Contains(t, got, "<Key>dir%2Fa%20file.txt</Key>")
 	assert.Contains(t, got, "<Prefix>dir%2Fsub%2F</Prefix>")
 	assert.NotContains(t, got, "tenant-abc")
+}
+
+func rewriteListResponseForTest(input *strings.Reader, output *bytes.Buffer, urlEncoded bool) error {
+	plan := &S3OperationPlan{
+		bucket: "virtual-bucket", responseProfile: responseListObjects,
+		query: make(map[string][]string), forwardHeaders: make(map[string][]string),
+	}
+	plan.query.Set("prefix", "dir/")
+	plan.query.Set("start-after", "aa")
+	plan.query.Set("marker", "mm")
+	if urlEncoded {
+		plan.rawQuery = "encoding-type=url"
+		plan.query.Set("encoding-type", "url")
+		plan.query.Set("start-after", "aa one")
+		plan.query.Set("marker", "mm+plus")
+	}
+	config := &VBucketConfig{RealBucket: "real-bucket", PathPrefix: "tenant-abc", RoutingTokenKey: testRoutingTokenKey}
+	return rewriteStreamingNamespaceResponse(input, output, plan, config, "tenant-abc/")
 }
