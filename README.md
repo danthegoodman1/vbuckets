@@ -397,6 +397,18 @@ results.
   as passing.
 - See [PERFORMANCE.md](./PERFORMANCE.md) for measured main/branch deltas and scope.
 
+Run `go test ./... -count=1` with Docker available for the full suite. Both
+Docker integration suites share the [S3Proxy fixture](./internal/s3test/s3proxy.go),
+which pins [S3Proxy 4.0.0](https://github.com/gaul/s3proxy/tree/s3proxy-4.0.0)
+by its multi-platform image digest. Each test gets an isolated filesystem
+backend and a bucket created through the S3 SDK, with SigV4 authentication
+required. `TestE2E_PutAndGetObject` also verifies rejection of a wrong secret.
+No cluster or storage-service administration is needed.
+
+For a Docker-free run, use `go test -race ./... -short -count=1`. The per-key
+IAM conformance and adversarial protocol tests run in this suite; S3Proxy
+covers ordinary SDK interoperability and does not replace those checks.
+
 ### Configuration
 
 The binary loads supported settings once and validates them before starting any

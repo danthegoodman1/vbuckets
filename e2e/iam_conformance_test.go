@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	apiv1 "github.com/danthegoodman1/vbuckets/api/v1"
+	"github.com/danthegoodman1/vbuckets/internal/s3test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,22 +27,22 @@ func TestPerKeyIAMConformance(t *testing.T) {
 	var originCalls atomic.Int64
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		originCalls.Add(1)
-		assert.Contains(t, r.Header.Get("Authorization"), garageAccessKey)
-		assert.True(t, strings.HasPrefix(r.URL.Path, "/"+garageBucket))
-		physicalKey := strings.TrimPrefix(r.URL.Path, "/"+garageBucket+"/")
+		assert.Contains(t, r.Header.Get("Authorization"), s3test.AccessKey)
+		assert.True(t, strings.HasPrefix(r.URL.Path, "/"+s3test.Bucket))
+		physicalKey := strings.TrimPrefix(r.URL.Path, "/"+s3test.Bucket+"/")
 		w.Header().Set("Content-Type", "application/xml")
 		switch {
 		case r.Header.Get("X-Amz-Copy-Source") != "":
-			assert.Equal(t, garageBucket+"/shared/copy-source/item", r.Header.Get("X-Amz-Copy-Source"))
+			assert.Equal(t, s3test.Bucket+"/shared/copy-source/item", r.Header.Get("X-Amz-Copy-Source"))
 			_, _ = io.WriteString(w, `<CopyObjectResult><ETag>"copied"</ETag><LastModified>2026-09-19T00:00:00Z</LastModified></CopyObjectResult>`)
 		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
-			_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>origin-upload</UploadId></InitiateMultipartUploadResult>`, garageBucket, physicalKey)
+			_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>origin-upload</UploadId></InitiateMultipartUploadResult>`, s3test.Bucket, physicalKey)
 		case r.Method == http.MethodPost && r.URL.Query().Has("uploadId"):
 			assert.Equal(t, "origin-upload", r.URL.Query().Get("uploadId"))
-			_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Location>origin</Location><Bucket>%s</Bucket><Key>%s</Key><ETag>"complete"</ETag></CompleteMultipartUploadResult>`, garageBucket, physicalKey)
+			_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Location>origin</Location><Bucket>%s</Bucket><Key>%s</Key><ETag>"complete"</ETag></CompleteMultipartUploadResult>`, s3test.Bucket, physicalKey)
 		case r.Method == http.MethodGet && r.URL.Query().Has("list-type"):
 			assert.Equal(t, "shared/public/", r.URL.Query().Get("prefix"))
-			_, _ = fmt.Fprintf(w, `<ListBucketResult><Name>%s</Name><Prefix>shared/public/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>`, garageBucket)
+			_, _ = fmt.Fprintf(w, `<ListBucketResult><Name>%s</Name><Prefix>shared/public/</Prefix><IsTruncated>false</IsTruncated></ListBucketResult>`, s3test.Bucket)
 		case r.Method == http.MethodPut:
 			if r.URL.Query().Has("uploadId") {
 				assert.Equal(t, "origin-upload", r.URL.Query().Get("uploadId"))
@@ -65,7 +66,7 @@ func TestPerKeyIAMConformance(t *testing.T) {
 	}
 	readerPolicy, writerPolicy := readPolicy("scoped-reader"), readPolicy("writer")
 	implementation := &testControlPlane{
-		garageEndpoint: origin.URL, revision: 1, changes: make(chan *apiv1.WatchEvent, 16), createdBuckets: make(map[string]time.Time),
+		originEndpoint: origin.URL, revision: 1, changes: make(chan *apiv1.WatchEvent, 16), createdBuckets: make(map[string]time.Time),
 		identities: map[string]*testIdentity{
 			"reader": {secret: "reader-secret", policyJSON: readerPolicy, buckets: map[string]string{"photos": "shared", "archive": "archive"}},
 			"writer": {secret: "writer-secret", policyJSON: writerPolicy, buckets: map[string]string{"photos": "shared"}},

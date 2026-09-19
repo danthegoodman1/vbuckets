@@ -96,6 +96,10 @@ Passed after implementation and the simplification pass:
   authentication/liveness/readiness responses; SIGTERM exits successfully and
   closes both listening ports.
 
+The integration fixture subsequently moved from Garage to digest-pinned
+S3Proxy 4.0.0. This changes only test setup; the production request path and
+the benchmarks above are unchanged.
+
 `make proto-breaking` **fails intentionally against main**: this branch replaces
 legacy `ListenForDeltas` / `LookupBaseHost`, removes sensitive pushed mapping and
 credential fields, and makes CreateVBucket revision-only. No protocol changes

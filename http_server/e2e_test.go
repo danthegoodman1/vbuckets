@@ -5,86 +5,36 @@ import (
 	"fmt"
 	"io"
 	"net/http/httptest"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	"github.com/danthegoodman1/vbuckets/iam"
+	"github.com/danthegoodman1/vbuckets/internal/s3test"
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	tcexec "github.com/testcontainers/testcontainers-go/exec"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-const garageToml = `
-rpc_bind_addr = "[::]:3901"
-rpc_public_addr = "127.0.0.1:3901"
-rpc_secret = "0000000000000000000000000000000000000000000000000000000000000000"
-
-metadata_dir = "/var/lib/garage/meta"
-data_dir = "/var/lib/garage/data"
-db_engine = "lmdb"
-
-replication_factor = 1
-compression_level = 2
-
-[s3_api]
-api_bind_addr = "[::]:3900"
-s3_region = "us-east-1"
-
-[s3_web]
-bind_addr = "[::]:3902"
-root_domain = ".s3-web.local"
-
-[admin]
-api_bind_addr = "[::]:3903"
-admin_token = "admin_token"
-`
-
 const (
-	garageAccessKey = "GK000000000000000000000001"
-	garageSecretKey = "dceca21654db35d95f9e8392b7abb2612a2814b11a733a1f0d904fdd585e7534"
-	garageBucket    = "e2e-bucket"
-
 	e2eVirtualAccessKey = "AKIAE2ETEST00000001"
 	e2eVirtualSecretKey = "e2e-test-secret-key-00000000000000000000"
 	e2eVirtualBucket    = "my-virtual-bucket"
 )
-
-func garageCmd(t *testing.T, ctx context.Context, ctr testcontainers.Container, args ...string) string {
-	t.Helper()
-	cmd := append([]string{"/garage"}, args...)
-	code, reader, err := ctr.Exec(ctx, cmd, tcexec.Multiplexed())
-	require.NoError(t, err)
-	out, err := io.ReadAll(reader)
-	require.NoError(t, err)
-	require.Equalf(t, 0, code, "garage %v failed (exit %d): %s", args, code, string(out))
-	return string(out)
-}
-
-var hexIDPattern = regexp.MustCompile(`[0-9a-f]{16,}`)
-
-func nodeIDFromStatus(status string) string {
-	return hexIDPattern.FindString(status)
-}
 
 type e2eEnv struct {
 	ProxyClient  *s3.Client
 	DirectClient *s3.Client
 }
 
-// setupE2E starts a Garage container, configures the vbuckets env vars, starts
-// the proxy httptest server, and returns S3 clients for both the proxy and
-// the real backend. Registers all cleanup on t.
+// setupE2E starts S3Proxy and the proxy HTTP server, returning clients for both.
+// Registers all cleanup on t.
 func setupE2E(t *testing.T) *e2eEnv {
 	return setupE2EWithPolicy(t, testAllowAllPolicy)
 }
@@ -92,41 +42,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 func setupE2EWithPolicy(t *testing.T, policy *iam.Policy) *e2eEnv {
 	t.Helper()
 
-	ctx := context.Background()
-
-	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "dxflrs/garage:v2.1.0",
-			ExposedPorts: []string{"3900/tcp"},
-			Env:          map[string]string{"GARAGE_ALLOW_WORLD_READABLE_SECRETS": "true"},
-			Files: []testcontainers.ContainerFile{{
-				Reader:            strings.NewReader(garageToml),
-				ContainerFilePath: "/etc/garage.toml",
-				FileMode:          0o644,
-			}},
-			WaitingFor: wait.ForListeningPort("3900/tcp").WithStartupTimeout(60 * time.Second),
-		},
-		Started: true,
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ctr.Terminate(ctx)) })
-
-	status := garageCmd(t, ctx, ctr, "status")
-	nodeID := nodeIDFromStatus(status)
-	require.NotEmpty(t, nodeID, "could not find node ID in garage status output:\n%s", status)
-
-	garageCmd(t, ctx, ctr, "layout", "assign", nodeID, "--capacity", "100G", "-z", "local")
-	garageCmd(t, ctx, ctr, "layout", "apply", "--version", "1")
-	garageCmd(t, ctx, ctr, "key", "import", "--yes", "-n", "e2e-key", garageAccessKey, garageSecretKey)
-	garageCmd(t, ctx, ctr, "bucket", "create", garageBucket)
-	garageCmd(t, ctx, ctr, "bucket", "allow", garageBucket, "--key", "e2e-key", "--read", "--write", "--owner")
-
-	host, err := ctr.Host(ctx)
-	require.NoError(t, err)
-	mappedPort, err := ctr.MappedPort(ctx, "3900")
-	require.NoError(t, err)
-
-	garageEndpoint := "http://" + host + ":" + mappedPort.Port()
+	originEndpoint, directClient := s3test.Start(t)
 
 	resolver := &testResolver{
 		credentials: func(_ context.Context, accessKeyID string) (*VirtualCredentials, error) {
@@ -143,11 +59,11 @@ func setupE2EWithPolicy(t *testing.T, policy *iam.Policy) *e2eEnv {
 				return nil, fmt.Errorf("unknown bucket: %s", bucketName)
 			}
 			return &VBucketConfig{
-				RealEndpoint:     garageEndpoint,
-				RealBucket:       garageBucket,
-				RealAccessKey:    garageAccessKey,
-				RealSecretKey:    garageSecretKey,
-				RealRegion:       "us-east-1",
+				RealEndpoint:     originEndpoint,
+				RealBucket:       s3test.Bucket,
+				RealAccessKey:    s3test.AccessKey,
+				RealSecretKey:    s3test.SecretKey,
+				RealRegion:       s3test.Region,
 				PathPrefix:       "tenant-abc",
 				RealUsePathStyle: true,
 				RoutingTokenKey:  testRoutingTokenKey,
@@ -172,14 +88,7 @@ func setupE2EWithPolicy(t *testing.T, policy *iam.Policy) *e2eEnv {
 				awsv4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
 			},
 		}),
-		DirectClient: s3.New(s3.Options{
-			Region: "us-east-1",
-			Credentials: credentials.NewStaticCredentialsProvider(
-				garageAccessKey, garageSecretKey, "",
-			),
-			BaseEndpoint: aws.String(garageEndpoint),
-			UsePathStyle: true,
-		}),
+		DirectClient: directClient,
 	}
 }
 
@@ -214,7 +123,7 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	assert.Equal(t, testBody, string(body))
 
 	directResult, err := e.DirectClient.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("tenant-abc/" + testKey),
 	})
 	require.NoError(t, err)
@@ -223,6 +132,26 @@ func TestE2E_PutAndGetObject(t *testing.T) {
 	directBody, err := io.ReadAll(directResult.Body)
 	require.NoError(t, err)
 	assert.Equal(t, testBody, string(directBody))
+
+	// A permissive origin would hide regressions in outbound re-signing.
+	t.Run("origin rejects invalid signature", func(t *testing.T) {
+		badClient := s3.New(s3.Options{
+			Region:       s3test.Region,
+			Credentials:  credentials.NewStaticCredentialsProvider(s3test.AccessKey, "wrong-secret", ""),
+			BaseEndpoint: e.DirectClient.Options().BaseEndpoint,
+			UsePathStyle: true,
+		})
+		result, err := badClient.GetObject(t.Context(), &s3.GetObjectInput{
+			Bucket: aws.String(s3test.Bucket),
+			Key:    aws.String("tenant-abc/" + testKey),
+		})
+		if result != nil {
+			defer result.Body.Close()
+		}
+		var apiErr smithy.APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, "SignatureDoesNotMatch", apiErr.ErrorCode())
+	})
 }
 
 func TestE2E_CopyObjectSameVirtualBucket(t *testing.T) {
@@ -265,7 +194,7 @@ func TestE2E_CopyObjectSameVirtualBucket(t *testing.T) {
 
 	for _, key := range []string{"tenant-abc/" + sourceKey, "tenant-abc/" + destKey} {
 		directResult, err := e.DirectClient.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(garageBucket),
+			Bucket: aws.String(s3test.Bucket),
 			Key:    aws.String(key),
 		})
 		require.NoError(t, err)
@@ -319,7 +248,7 @@ func TestE2E_ListObjectsPrefixIsolation(t *testing.T) {
 
 	// Put a foreign object directly in the real bucket (outside the tenant prefix)
 	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("other-tenant/secret.txt"),
 		Body:   strings.NewReader("should not be visible"),
 	})
@@ -329,7 +258,7 @@ func TestE2E_ListObjectsPrefixIsolation(t *testing.T) {
 	// objects. This proves the foreign object exists and the proxy is the thing
 	// providing isolation, not an accident of test setup.
 	directList, err := e.DirectClient.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 	})
 	require.NoError(t, err)
 
@@ -404,7 +333,7 @@ func TestE2E_IAMPolicyEnforcedBeforeProxy(t *testing.T) {
 	e := setupE2EWithPolicy(t, policy)
 
 	_, err := e.DirectClient.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(garageBucket),
+		Bucket: aws.String(s3test.Bucket),
 		Key:    aws.String("tenant-abc/read/existing.txt"),
 		Body:   strings.NewReader("readable"),
 	})

@@ -50,7 +50,7 @@ An isolated `git archive HEAD` copy at `/private/tmp/vbuckets-review.980255` was
 
 - Convert the demonstrated bugs into focused regressions. Use the production server wrapper for listener/routing cases and real HTTP clients for transfer-abort cases.
 - Test invalidation, disconnect, and credential rotation at the request's final freshness boundary, including a delayed bounded XML body. Existing watch-state tests cover the underlying state machine.
-- Keep the existing contract, IAM, namespace, token, and Garage tests. Final gates are `go test ./... -count=1`, `go test -race ./... -short -count=1`, and `go vet ./...`.
+- Keep the existing contract, IAM, namespace, token, and S3 SDK integration tests, now backed by S3Proxy. Final gates are `go test ./... -count=1`, `go test -race ./... -short -count=1`, and `go vet ./...`.
 - No protobuf changes are planned. Run protocol checks if implementation actually changes those files.
 - Use the existing request microbenchmark and one focused streaming check to catch regressions. A performance redesign requires evidence of a bottleneck; a comprehensive benchmark campaign is not part of this plan.
 
@@ -198,12 +198,14 @@ vbuckets, without adding another policy engine or authorization RPC.
 Scope:
 - Reuse the existing credential policy field, compiled evaluator, caches, and
   revisioned invalidation. Give the integration fixture separate identities and
-  bucket inventories, and share its production HTTP/gRPC harness with Garage.
+  bucket inventories, and share its production HTTP/gRPC harness with S3Proxy.
 - Add executable policy examples and a control-plane provisioning/update
   contract. The production policy store and issuer are external to this repo;
   the in-memory single-watch fixture is not a production control-plane service.
 - Prove independent key permissions, virtual resource scope, compound actions,
   and replacement of a warmed policy through the real watch.
+- Replace the duplicated Garage startup with one digest-pinned S3Proxy fixture,
+  keeping isolated storage and proving origin signature validation remains active.
 
 Completion gate:
 Denials occur before any origin call; keys sharing a vbucket retain independent
@@ -212,7 +214,7 @@ atomic persistence/publication and the existing revocation limits. No new
 runtime authorization machinery or wire API is introduced.
 
 Testing plan:
-Run the conformance test in the short/race suites, retain Garage coverage, and
+Run the conformance test in the short/race suites, retain S3 SDK coverage, and
 verify generated-code consistency and compatibility with the previous PR head.
 Deliberately bypass IAM in an isolated copy to confirm the tests detect it.
 
@@ -223,5 +225,6 @@ Status ledger:
 | Complete | Work | 6A: Multi-key and multi-bucket enforcement proof | `TestPerKeyIAMConformance` exercises two policies from `examples/iam/*.json`, initial/warm credentials, explicit deny, prefixes, copy source/destination, multipart, ACL/tagging, and per-key bucket inventory. Denied requests assert zero origin calls. |
 | Complete | Work | 6B: Live policy replacement | The conformance test updates the fixture policy and revision atomically, observes the real watch invalidation, asserts exactly one credential reload for the changed key, retains the other key's cache, and restores access. Invalid updates preserve the old policy and revision. |
 | Complete | Doc | 6C: Provisioning and shared namespace contract | `examples/iam/README.md`, main README, and proto comments explain one effective policy per key, virtual resource names, shared mappings for keys of one vbucket, durable publication, separate bucket inventory, and revocation limits. Production storage remains external. |
-| Complete | Test | 6T: Regression, race, and protocol gates | `go test ./... -count=1` (Garage included), `go test -race ./... -short -count=1`, `go vet ./...`, and `make proto-check` pass. Compatibility against the prior `architecture-hardening` commit (`efeaea2`) passes; generated changes are comments only. |
+| Complete | Work | 6D: Shared S3Proxy integration origin | `internal/s3test/s3proxy.go` replaces both Garage setups with S3Proxy 4.0.0 pinned by the arm64/amd64 image-index digest. Each test creates its own bucket through the SDK, uses SigV4, and removes its container. `TestE2E_PutAndGetObject/origin_rejects_invalid_signature` proves a wrong secret fails with `SignatureDoesNotMatch`. No runtime changes or dependency additions. |
+| Complete | Test | 6T: Regression, race, and protocol gates | Final S3Proxy tree passes `go test ./... -count=1`, `go test -race ./... -short -count=1`, and `go vet ./...`. The IAM documentation changes passed `make proto-check` and compatibility against the prior PR head (`efeaea2`); S3Proxy introduces no further protobuf changes. |
 | Complete | Gate | 6G: Existing enforcement verified without another runtime layer | Runtime request code and protobuf fields/RPCs are unchanged. A temporary copy with the IAM check bypassed fails the new conformance test because forbidden requests return 200, demonstrating that origin behavior cannot conceal missing proxy enforcement. |

@@ -32,7 +32,7 @@ Keep the current strengths—streaming object bodies, bounded/streaming list rew
 ## Testing Strategy
 
 - Add table-driven and fuzz tests for the request grammar, SigV4 canonicalization, IAM parsing, URL/path preservation, and response transforms.
-- Maintain two integration layers: deterministic `httptest` upstream/control-plane fault tests and Garage end-to-end tests for real S3 SDK behavior.
+- Maintain two integration layers: deterministic `httptest` upstream/control-plane fault tests and S3Proxy end-to-end tests for real S3 SDK behavior. Historical Garage results below predate the shared S3Proxy fixture.
 - Model control-plane synchronization as a state machine and test lookup/delta races, disconnects, missed removals, reconnect barriers, and monotonic revisions under `-race`.
 - Add benchmarks/load tests for warm-cache request planning, credential miss storms, large streaming objects, large list responses, and reconnect recovery; record CPU, allocations, memory high-water mark, upstream connection reuse, and control-plane QPS.
 - Pin tool versions and require formatting, vet/static analysis, unit tests, race tests, protobuf lint/breaking checks, generated-code cleanliness, and end-to-end tests in CI.
